@@ -1,0 +1,12 @@
+# Local build artifacts
+bin/
+nanorouter
+
+# Local configuration and runtime data
+config.yaml
+nanorouter.db
+nanorouter.db-*
+
+# Local environment files
+.env
+.env.*
