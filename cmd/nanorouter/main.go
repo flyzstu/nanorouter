@@ -6,17 +6,33 @@ import (
 	"errors"
 	"flag"
 	"net/http"
+	"os"
 	"time"
 
 	"github.com/nanorouter/nanorouter/internal/router"
 	_ "github.com/ncruces/go-sqlite3/driver"
 	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
 )
 
 func main() {
 	configPath := flag.String("config", "config.yaml", "path to YAML configuration")
+	debug := flag.Bool("debug", false, "enable colored console debug logs")
 	flag.Parse()
-	logger, err := zap.NewProduction()
+	logConfig := zap.NewProductionConfig()
+	logConfig.EncoderConfig.TimeKey = "time"
+	logConfig.EncoderConfig.EncodeTime = zapcore.ISO8601TimeEncoder
+	logConfig.EncoderConfig.LevelKey = "level"
+	logConfig.EncoderConfig.EncodeLevel = zapcore.CapitalLevelEncoder
+	logConfig.DisableCaller = true
+	logConfig.DisableStacktrace = true
+	var logger *zap.Logger
+	var err error
+	if *debug {
+		logger = zap.New(zapcore.NewCore(newTextEncoder(true), zapcore.Lock(os.Stderr), zap.DebugLevel))
+	} else {
+		logger, err = logConfig.Build()
+	}
 	if err != nil {
 		panic(err)
 	}

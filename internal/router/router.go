@@ -11,6 +11,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -23,6 +24,8 @@ import (
 )
 
 const maxRequestBody = 16 << 20
+const maxUpstreamErrorBody = 8 << 10
+const maxUpstreamErrorMessage = 512
 
 type Router struct {
 	cfg       Config
@@ -87,12 +90,21 @@ func (r *Router) auth(next http.Handler) http.Handler {
 	})
 }
 func (r *Router) models(w http.ResponseWriter, q *http.Request) {
-	data := make([]map[string]any, 0, len(r.cfg.Routes))
+	modelIDs := make([]string, 0, len(r.cfg.Routes))
 	for name, route := range r.cfg.Routes {
-		if !hasEnabledCandidate(route) {
-			continue
+		if hasEnabledCandidate(route) {
+			modelIDs = append(modelIDs, name)
 		}
-		data = append(data, map[string]any{"id": name, "object": "model", "owned_by": "nanorouter"})
+		for _, candidate := range route.Candidates {
+			if candidate.ExposeAs != "" && candidate.IsEnabled() {
+				modelIDs = append(modelIDs, candidate.ExposeAs)
+			}
+		}
+	}
+	sort.Strings(modelIDs)
+	data := make([]map[string]any, 0, len(modelIDs))
+	for _, id := range modelIDs {
+		data = append(data, map[string]any{"id": id, "object": "model", "owned_by": "nanorouter"})
 	}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]any{"object": "list", "data": data})
@@ -110,11 +122,13 @@ func (r *Router) proxy(endpoint string) http.HandlerFunc {
 			return
 		}
 		routeName, _ := payload["model"].(string)
-		route, ok := r.cfg.Routes[routeName]
+		route, ok := r.routeForModel(routeName)
 		if !ok {
 			http.Error(w, `{"error":{"message":"unknown model route"}}`, 400)
 			return
 		}
+		requestID := requestID(q)
+		w.Header().Set("X-Request-ID", requestID)
 		streamed, _ := payload["stream"].(bool)
 		// 只修改 model 字段，其他 OpenAI/Responses 字段透明保留，
 		// 因而 tools、图片、response_format 等新字段不需要网关逐一适配。
@@ -136,7 +150,7 @@ func (r *Router) proxy(endpoint string) http.HandlerFunc {
 			}
 			p, dropped := sanitizeRequest(p, u)
 			if len(dropped) > 0 {
-				r.logger.Debug("removed unsupported upstream request fields", zap.String("route", routeName), zap.String("upstream", u.ID), zap.Strings("fields", dropped))
+				r.logger.Debug("Unsupported upstream request fields removed", zap.String("request_id", requestID), zap.String("route", routeName), zap.String("upstream", u.ID), zap.Strings("fields", dropped))
 			}
 			p["model"] = u.Model
 			encoded, _ := json.Marshal(p)
@@ -149,7 +163,9 @@ func (r *Router) proxy(endpoint string) http.HandlerFunc {
 				r.record(q.Context(), routeName, u, endpoint, 0, latency, streamed, attempt, Usage{Source: "unavailable"}, "network")
 				r.fail(routeName, u, 30*time.Second)
 				r.failovers.WithLabelValues(routeName, "network").Inc()
-				r.logger.Warn("upstream network failure; failing over", logFields(routeName, u, endpoint, attempt, latency, streamed, 0, "network")...)
+				fields := failureLogFields(requestID, routeName, u, endpoint, attempt, latency, streamed, 0, "network_error", true)
+				fields = append(fields, zap.Error(err))
+				r.logger.Warn("Upstream request failed; failing over", fields...)
 				continue
 			}
 			if retryable(resp.StatusCode) {
@@ -159,14 +175,16 @@ func (r *Router) proxy(endpoint string) http.HandlerFunc {
 				r.record(q.Context(), routeName, u, endpoint, resp.StatusCode, latency, streamed, attempt, Usage{Source: "unavailable"}, "upstream")
 				r.fail(routeName, u, cooldown(resp))
 				r.failovers.WithLabelValues(routeName, http.StatusText(resp.StatusCode)).Inc()
-				r.logger.Warn("upstream returned retryable status; failing over", logFields(routeName, u, endpoint, attempt, latency, streamed, resp.StatusCode, "upstream")...)
+				r.logger.Warn("Upstream request failed; failing over", failureLogFields(requestID, routeName, u, endpoint, attempt, latency, streamed, resp.StatusCode, "upstream_unavailable", true)...)
 				continue
 			}
 			if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-				r.copyResponse(w, resp)
+				upstreamError := r.copyErrorResponse(w, resp)
 				cancel()
 				r.record(q.Context(), routeName, u, endpoint, resp.StatusCode, latency, streamed, attempt, Usage{Source: "unavailable"}, "client")
-				r.logger.Warn("upstream rejected request", logFields(routeName, u, endpoint, attempt, latency, streamed, resp.StatusCode, "client")...)
+				fields := failureLogFields(requestID, routeName, u, endpoint, attempt, latency, streamed, resp.StatusCode, "upstream_rejected", false)
+				fields = append(fields, upstreamError.logFields(r.logger.Core().Enabled(zap.DebugLevel))...)
+				r.logger.Warn("Upstream request rejected", fields...)
 				return
 			}
 			r.success(u)
@@ -181,8 +199,9 @@ func (r *Router) proxy(endpoint string) http.HandlerFunc {
 					usage = r.stream(w, resp)
 				}
 				cancel()
-				r.record(q.Context(), routeName, u, endpoint, resp.StatusCode, latency, true, attempt, usage, "")
-				r.logger.Info("upstream request completed", successLogFields(routeName, u, endpoint, attempt, latency, true, usage)...)
+				duration := int(time.Since(start).Milliseconds())
+				r.record(q.Context(), routeName, u, endpoint, resp.StatusCode, duration, true, attempt, usage, "")
+				r.logger.Info("Upstream request completed", successLogFields(requestID, routeName, u, endpoint, attempt, latency, duration, true, resp.StatusCode, usage)...)
 			} else {
 				b, _ := io.ReadAll(resp.Body)
 				resp.Body.Close()
@@ -202,8 +221,9 @@ func (r *Router) proxy(endpoint string) http.HandlerFunc {
 				_, _ = w.Write(b)
 				cancel()
 				usage := usageFromJSON(b)
-				r.record(q.Context(), routeName, u, endpoint, resp.StatusCode, latency, false, attempt, usage, "")
-				r.logger.Info("upstream request completed", successLogFields(routeName, u, endpoint, attempt, latency, false, usage)...)
+				duration := int(time.Since(start).Milliseconds())
+				r.record(q.Context(), routeName, u, endpoint, resp.StatusCode, duration, false, attempt, usage, "")
+				r.logger.Info("Upstream request completed", successLogFields(requestID, routeName, u, endpoint, attempt, latency, duration, false, resp.StatusCode, usage)...)
 			}
 			return
 		}
@@ -211,13 +231,50 @@ func (r *Router) proxy(endpoint string) http.HandlerFunc {
 	}
 }
 
-// 日志字段仅包含运行元数据，禁止将 prompt、模型回复和 Authorization 写入日志。
-func logFields(route string, u Candidate, endpoint string, attempt, latency int, streamed bool, status int, kind string) []zap.Field {
-	return []zap.Field{zap.String("route", route), zap.String("upstream", u.ID), zap.String("model", u.Model), zap.String("endpoint", endpoint), zap.Int("attempt", attempt+1), zap.Int("status", status), zap.Int("latency_ms", latency), zap.Bool("stream", streamed), zap.String("error_kind", kind)}
+// routeForModel 优先解析顶层路由；候选的 expose_as 则创建单候选路由，
+// 让下游可绕过加权/故障切换池，直接选择特定上游。
+func (r *Router) routeForModel(name string) (Route, bool) {
+	if route, ok := r.cfg.Routes[name]; ok {
+		return route, true
+	}
+	for _, route := range r.cfg.Routes {
+		for _, candidate := range route.Candidates {
+			if candidate.ExposeAs == name {
+				return Route{Candidates: []Candidate{candidate}}, true
+			}
+		}
+	}
+	return Route{}, false
 }
-func successLogFields(route string, u Candidate, endpoint string, attempt, latency int, streamed bool, usage Usage) []zap.Field {
-	fields := logFields(route, u, endpoint, attempt, latency, streamed, http.StatusOK, "")
-	return append(fields, zap.Int64("prompt_tokens", usage.Prompt), zap.Int64("completion_tokens", usage.Completion), zap.Int64("total_tokens", usage.Total), zap.String("usage_source", usage.Source))
+
+// 日志字段仅包含运行元数据，禁止将 prompt、模型回复和 Authorization 写入日志。
+func requestLogFields(requestID, route string, u Candidate, endpoint string, attempt, ttfb int, streamed bool, status int) []zap.Field {
+	return []zap.Field{
+		zap.String("request_id", requestID),
+		zap.String("route", route),
+		zap.String("upstream", u.ID),
+		zap.String("upstream_model", u.Model),
+		zap.String("endpoint", endpoint),
+		zap.Int("attempt", attempt+1),
+		zap.Int("status", status),
+		zap.Int("ttfb_ms", ttfb),
+		zap.Bool("stream", streamed),
+	}
+}
+func failureLogFields(requestID, route string, u Candidate, endpoint string, attempt, ttfb int, streamed bool, status int, outcome string, retryable bool) []zap.Field {
+	fields := requestLogFields(requestID, route, u, endpoint, attempt, ttfb, streamed, status)
+	return append(fields, zap.String("outcome", outcome), zap.Bool("retryable", retryable))
+}
+func successLogFields(requestID, route string, u Candidate, endpoint string, attempt, ttfb, duration int, streamed bool, status int, usage Usage) []zap.Field {
+	fields := requestLogFields(requestID, route, u, endpoint, attempt, ttfb, streamed, status)
+	return append(fields,
+		zap.String("outcome", "success"),
+		zap.Int("duration_ms", duration),
+		zap.Int64("prompt_tokens", usage.Prompt),
+		zap.Int64("completion_tokens", usage.Completion),
+		zap.Int64("total_tokens", usage.Total),
+		zap.String("usage_source", usage.Source),
+	)
 }
 func (r *Router) do(ctx context.Context, u Candidate, endpoint string, body []byte) (*http.Response, error) {
 	base := strings.TrimRight(u.BaseURL, "/")
@@ -305,6 +362,16 @@ func (r *Router) copyResponse(w http.ResponseWriter, resp *http.Response) {
 	w.WriteHeader(resp.StatusCode)
 	io.Copy(w, resp.Body)
 }
+func (r *Router) copyErrorResponse(w http.ResponseWriter, resp *http.Response) upstreamError {
+	defer resp.Body.Close()
+	// 只缓存有限的错误前缀用于提取诊断字段，剩余响应继续透明转发给下游。
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, maxUpstreamErrorBody+1))
+	r.copyHeaders(w, resp.Header)
+	w.WriteHeader(resp.StatusCode)
+	_, _ = w.Write(body)
+	_, _ = io.Copy(w, resp.Body)
+	return parseUpstreamError(body)
+}
 func (r *Router) copyHeaders(w http.ResponseWriter, h http.Header) {
 	for k, v := range h {
 		if strings.EqualFold(k, "Content-Length") {
@@ -358,7 +425,72 @@ func clone(a map[string]any) map[string]any {
 	}
 	return b
 }
+
+type upstreamError struct {
+	Type    string
+	Code    string
+	Message string
+}
+
+func parseUpstreamError(body []byte) upstreamError {
+	var payload map[string]any
+	if json.Unmarshal(body, &payload) != nil {
+		return upstreamError{}
+	}
+	data := payload
+	if nested, ok := payload["error"].(map[string]any); ok {
+		data = nested
+	}
+	result := upstreamError{Type: stringField(data, "type"), Message: stringField(data, "message")}
+	if result.Type == "" {
+		result.Type = stringField(payload, "type")
+	}
+	if result.Message == "" {
+		result.Message = stringField(payload, "message")
+	}
+	if code, ok := data["code"]; ok {
+		result.Code = fmt.Sprint(code)
+	} else if code, ok := payload["error_code"]; ok {
+		result.Code = fmt.Sprint(code)
+	}
+	return result
+}
+
+func stringField(data map[string]any, key string) string {
+	v, _ := data[key].(string)
+	return v
+}
+
+func (e upstreamError) logFields(includeMessage bool) []zap.Field {
+	fields := []zap.Field{}
+	if e.Type != "" {
+		fields = append(fields, zap.String("upstream_error_type", e.Type))
+	}
+	if e.Code != "" {
+		fields = append(fields, zap.String("upstream_error_code", e.Code))
+	}
+	// 上游消息可能回显请求内容；仅在显式 --debug 时提供，并限制长度。
+	if includeMessage && e.Message != "" {
+		fields = append(fields, zap.String("upstream_error_message", truncateLogMessage(e.Message)))
+	}
+	return fields
+}
+
+func truncateLogMessage(message string) string {
+	message = strings.Join(strings.Fields(message), " ")
+	if len(message) <= maxUpstreamErrorMessage {
+		return message
+	}
+	return message[:maxUpstreamErrorMessage] + "…"
+}
+
 func newID() string { b := make([]byte, 12); _, _ = rand.Read(b); return hex.EncodeToString(b) }
+func requestID(q *http.Request) string {
+	if id := q.Header.Get("X-Request-ID"); id != "" && len(id) <= 128 {
+		return id
+	}
+	return newID()
+}
 func max(a, b int) int {
 	if a > b {
 		return a

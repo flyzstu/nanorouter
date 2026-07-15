@@ -11,6 +11,8 @@ import (
 
 	json "github.com/goccy/go-json"
 	_ "github.com/ncruces/go-sqlite3/driver"
+	"go.uber.org/zap"
+	"go.uber.org/zap/zaptest/observer"
 )
 
 func TestConfigDuration(t *testing.T) {
@@ -24,6 +26,17 @@ func TestConfigDuration(t *testing.T) {
 	}
 	if c.RequestTimeout.Seconds() != 2 {
 		t.Fatalf("timeout=%s", c.RequestTimeout)
+	}
+}
+
+func TestConfigRejectsExposedModelCollision(t *testing.T) {
+	path := t.TempDir() + "/config.yaml"
+	config := "routes:\n  free-fast:\n    candidates:\n      - id: u\n        base_url: http://example.test\n        model: m\n        expose_as: free-fast\n"
+	if err := os.WriteFile(path, []byte(config), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadConfig(path); err == nil || !strings.Contains(err.Error(), "conflicts") {
+		t.Fatalf("error=%v", err)
 	}
 }
 
@@ -63,6 +76,94 @@ func TestFailoverRewritesModelAndRecordsUsage(t *testing.T) {
 	var tokens int
 	if err := db.QueryRow(`SELECT total_tokens FROM llm_requests WHERE upstream_id='good'`).Scan(&tokens); err != nil || tokens != 7 {
 		t.Fatalf("usage: %d %v", tokens, err)
+	}
+}
+
+func TestRequestLogsIncludeCorrelationAndTiming(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"usage":{"prompt_tokens":3,"completion_tokens":4,"total_tokens":7}}`))
+	}))
+	defer upstream.Close()
+	db, err := sql.Open("sqlite3", ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := Migrate(context.Background(), db); err != nil {
+		t.Fatal(err)
+	}
+	core, observed := observer.New(zap.InfoLevel)
+	r, err := NewWithLogger(Config{Routes: map[string]Route{"free": {Candidates: []Candidate{{ID: "u", BaseURL: upstream.URL, Model: "up"}}}}}, db, zap.New(core))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"free","messages":[]}`))
+	req.Header.Set("X-Request-ID", "call-123")
+	rec := httptest.NewRecorder()
+	r.Handler().ServeHTTP(rec, req)
+	if rec.Header().Get("X-Request-ID") != "call-123" {
+		t.Fatalf("request ID header=%q", rec.Header().Get("X-Request-ID"))
+	}
+	entries := observed.All()
+	if len(entries) != 1 || entries[0].Message != "Upstream request completed" {
+		t.Fatalf("logs=%v", entries)
+	}
+	fields := entries[0].ContextMap()
+	if fields["request_id"] != "call-123" || fields["outcome"] != "success" || fields["upstream_model"] != "up" {
+		t.Fatalf("fields=%v", fields)
+	}
+	if _, ok := fields["ttfb_ms"]; !ok {
+		t.Fatalf("ttfb missing: %v", fields)
+	}
+	if _, ok := fields["duration_ms"]; !ok {
+		t.Fatalf("duration missing: %v", fields)
+	}
+}
+
+func TestDebugLogIncludesUpstreamRejectionReason(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = w.Write([]byte(`{"error":{"message":"model access denied","type":"permission_error","code":"model_not_found"}}`))
+	}))
+	defer upstream.Close()
+	db, err := sql.Open("sqlite3", ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := Migrate(context.Background(), db); err != nil {
+		t.Fatal(err)
+	}
+	core, observed := observer.New(zap.DebugLevel)
+	r, err := NewWithLogger(Config{Routes: map[string]Route{"free": {Candidates: []Candidate{{ID: "u", BaseURL: upstream.URL, Model: "up"}}}}}, db, zap.New(core))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"free","messages":[]}`))
+	rec := httptest.NewRecorder()
+	r.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if rec.Body.String() != `{"error":{"message":"model access denied","type":"permission_error","code":"model_not_found"}}` {
+		t.Fatalf("body=%s", rec.Body.String())
+	}
+	entries := observed.All()
+	if len(entries) != 1 || entries[0].Message != "Upstream request rejected" {
+		t.Fatalf("logs=%v", entries)
+	}
+	fields := entries[0].ContextMap()
+	if fields["upstream_error_type"] != "permission_error" || fields["upstream_error_code"] != "model_not_found" || fields["upstream_error_message"] != "model access denied" {
+		t.Fatalf("fields=%v", fields)
+	}
+}
+
+func TestUpstreamErrorMessageIsDebugOnly(t *testing.T) {
+	fields := upstreamError{Type: "permission_error", Message: "model access denied"}.logFields(false)
+	for _, field := range fields {
+		if field.Key == "upstream_error_message" {
+			t.Fatalf("message should not be logged without debug: %v", fields)
+		}
 	}
 }
 
@@ -188,6 +289,75 @@ func TestCandidateSpecificRequestSanitization(t *testing.T) {
 	r.Handler().ServeHTTP(rec, req)
 	if rec.Code != 200 {
 		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestCandidateDropsOpenCodePromptCacheKeys(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var in map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&in)
+		for _, key := range []string{"promptCacheKey", "prompt_cache_key"} {
+			if _, ok := in[key]; ok {
+				t.Fatalf("%s was not removed", key)
+			}
+		}
+		_, _ = w.Write([]byte(`{"id":"ok","usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}`))
+	}))
+	defer upstream.Close()
+	db, _ := sql.Open("sqlite3", ":memory:")
+	defer db.Close()
+	if err := Migrate(context.Background(), db); err != nil {
+		t.Fatal(err)
+	}
+	candidate := Candidate{ID: "zhipu", BaseURL: upstream.URL, Model: "glm-5.1", DropRequestFields: []string{"promptCacheKey", "prompt_cache_key"}}
+	r, err := New(Config{Routes: map[string]Route{"zhipu-agent": {Candidates: []Candidate{candidate}}}}, db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := `{"model":"zhipu-agent","messages":[{"role":"user","content":"hi"}],"promptCacheKey":"session-a","prompt_cache_key":"session-a"}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	rec := httptest.NewRecorder()
+	r.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestExposedCandidateIsListedAndRoutable(t *testing.T) {
+	var gotModel string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var in map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&in)
+		gotModel, _ = in["model"].(string)
+		_, _ = w.Write([]byte(`{"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}`))
+	}))
+	defer upstream.Close()
+	db, _ := sql.Open("sqlite3", ":memory:")
+	defer db.Close()
+	if err := Migrate(context.Background(), db); err != nil {
+		t.Fatal(err)
+	}
+	candidate := Candidate{ID: "agnes", BaseURL: upstream.URL, Model: "agnes-2.0-flash", ExposeAs: "agnes-flash"}
+	r, err := New(Config{Routes: map[string]Route{"free-fast": {Candidates: []Candidate{candidate}}}}, db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	models := httptest.NewRecorder()
+	r.Handler().ServeHTTP(models, httptest.NewRequest(http.MethodGet, "/v1/models", nil))
+	if !strings.Contains(models.Body.String(), `"id":"agnes-flash"`) {
+		t.Fatalf("exposed model missing: %s", models.Body.String())
+	}
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"agnes-flash","messages":[]}`))
+	rec := httptest.NewRecorder()
+	r.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if gotModel != "agnes-2.0-flash" {
+		t.Fatalf("model=%q", gotModel)
+	}
+	if route := rec.Header().Get("X-Nanorouter-Route"); route != "agnes-flash" {
+		t.Fatalf("route=%q", route)
 	}
 }
 

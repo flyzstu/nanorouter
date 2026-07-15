@@ -26,6 +26,9 @@ type Candidate struct {
 	BaseURL   string `yaml:"base_url"`
 	APIKeyEnv string `yaml:"api_key_env"`
 	Model     string `yaml:"model"`
+	// ExposeAs 让候选仍属于父路由的故障切换池，同时以独立模型 ID 对下游暴露。
+	// 例如 free-fast 的候选可设为 groq-qwen；下游指定该 ID 时只会调用此候选。
+	ExposeAs  string `yaml:"expose_as"`
 	Weight    int    `yaml:"weight"`
 	Responses bool   `yaml:"responses"`
 	// ResponsesViaChatCompletions 将下游 Responses 请求适配到仅支持 Chat Completions 的上游。
@@ -67,6 +70,10 @@ func LoadConfig(path string) (Config, error) {
 	if len(c.Routes) == 0 {
 		return c, fmt.Errorf("routes must not be empty")
 	}
+	modelNames := make(map[string]string, len(c.Routes))
+	for name := range c.Routes {
+		modelNames[name] = "route"
+	}
 	for name, r := range c.Routes {
 		if len(r.Candidates) == 0 {
 			return c, fmt.Errorf("route %q has no candidates", name)
@@ -75,6 +82,13 @@ func LoadConfig(path string) (Config, error) {
 			if u.ID == "" || u.BaseURL == "" || u.Model == "" {
 				return c, fmt.Errorf("route %q has an incomplete candidate", name)
 			}
+			if u.ExposeAs == "" {
+				continue
+			}
+			if owner, ok := modelNames[u.ExposeAs]; ok {
+				return c, fmt.Errorf("exposed model %q in route %q conflicts with %s", u.ExposeAs, name, owner)
+			}
+			modelNames[u.ExposeAs] = "another exposed model"
 		}
 	}
 	return c, nil
