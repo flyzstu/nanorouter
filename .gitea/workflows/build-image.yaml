@@ -12,7 +12,7 @@ jobs:
     runs-on: ubuntu-latest
     env:
       REGISTRY: coding.fly97.fun:8443
-      IMAGE: coding.fly97.fun/fly97/nanorouter
+      IMAGE: coding.fly97.fun:8443/fly97/nanorouter
       IMAGE_TAG: ${{ gitea.sha }}
     steps:
       - name: Check out source
