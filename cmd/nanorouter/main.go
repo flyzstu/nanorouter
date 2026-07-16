@@ -53,7 +53,7 @@ func main() {
 	}
 	defer db.Close()
 	if err := router.Migrate(context.Background(), db); err != nil {
-		logger.Fatal("migrate sqlite failed", zap.Error(err))
+		logger.Fatal("migrate database failed", zap.Error(err))
 	}
 
 	srv, err := router.NewWithLogger(cfg, db, logger)
