@@ -24,8 +24,8 @@ jobs:
       - name: Log in to Gitea container registry
         if: gitea.event_name == 'push' || gitea.event_name == 'workflow_dispatch'
         env:
-          REGISTRY_USERNAME: ${{ secrets.GITEA_PACKAGE_USERNAME }}
-          REGISTRY_TOKEN: ${{ secrets.GITEA_PACKAGE_TOKEN }}
+          REGISTRY_USERNAME: ${{ secrets.REGISTRY_USERNAME }}
+          REGISTRY_TOKEN: ${{ secrets.REGISTRY_TOKEN }}
         run: echo "$REGISTRY_TOKEN" | docker login "$REGISTRY" --username "$REGISTRY_USERNAME" --password-stdin
 
       - name: Push image tags
