@@ -9,6 +9,7 @@ import (
 	"os"
 	"time"
 
+	_ "github.com/lib/pq"
 	"github.com/nanorouter/nanorouter/internal/router"
 	_ "github.com/ncruces/go-sqlite3/driver"
 	"go.uber.org/zap"
@@ -42,7 +43,11 @@ func main() {
 	if err != nil {
 		logger.Fatal("load configuration failed", zap.Error(err))
 	}
-	db, err := sql.Open("sqlite3", cfg.Database)
+	dsn, err := cfg.Database.ResolveDSN()
+	if err != nil {
+		logger.Fatal("resolve database DSN failed", zap.Error(err))
+	}
+	db, err := sql.Open(cfg.Database.SQLDriver(), dsn)
 	if err != nil {
 		logger.Fatal("open sqlite failed", zap.Error(err))
 	}
@@ -56,7 +61,7 @@ func main() {
 		logger.Fatal("create router failed", zap.Error(err))
 	}
 	server := &http.Server{Addr: cfg.Listen, Handler: srv.Handler(), ReadHeaderTimeout: 10 * time.Second}
-	logger.Info("nanorouter started", zap.String("listen", cfg.Listen), zap.String("database", cfg.Database))
+	logger.Info("nanorouter started", zap.String("listen", cfg.Listen), zap.String("database_driver", cfg.Database.Driver))
 	if err := server.ListenAndServe(); !errors.Is(err, http.ErrServerClosed) {
 		logger.Fatal("server stopped unexpectedly", zap.Error(err))
 	}

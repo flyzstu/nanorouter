@@ -11,6 +11,7 @@ import (
 	"time"
 
 	json "github.com/goccy/go-json"
+	_ "github.com/lib/pq"
 	_ "github.com/ncruces/go-sqlite3/driver"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zaptest/observer"
@@ -53,6 +54,76 @@ func TestConfigRejectsQueueTimeoutWithoutConcurrencyLimit(t *testing.T) {
 	}
 	if _, err := LoadConfig(path); err == nil || !strings.Contains(err.Error(), "queue_timeout") {
 		t.Fatalf("error=%v", err)
+	}
+}
+
+func TestConfigSupportsPostgresDSNEnvironment(t *testing.T) {
+	path := t.TempDir() + "/config.yaml"
+	config := "database:\n  driver: postgresql\n  dsn_env: NANOROUTER_POSTGRES_DSN\nroutes:\n  r:\n    candidates:\n      - id: u\n        base_url: http://example.test\n        model: m\n"
+	if err := os.WriteFile(path, []byte(config), 0600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("NANOROUTER_POSTGRES_DSN", "postgresql://user:password@postgres:5432/nanorouter?sslmode=disable")
+	c, err := LoadConfig(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Database.Driver != "postgres" || c.Database.SQLDriver() != "postgres" {
+		t.Fatalf("database=%+v sql_driver=%q", c.Database, c.Database.SQLDriver())
+	}
+	dsn, err := c.Database.ResolveDSN()
+	if err != nil || !strings.HasPrefix(dsn, "postgresql://") {
+		t.Fatalf("dsn=%q err=%v", dsn, err)
+	}
+}
+
+func TestConfigSupportsLegacySQLiteDatabasePath(t *testing.T) {
+	path := t.TempDir() + "/config.yaml"
+	config := "database: ./usage.db\nroutes:\n  r:\n    candidates:\n      - id: u\n        base_url: http://example.test\n        model: m\n"
+	if err := os.WriteFile(path, []byte(config), 0600); err != nil {
+		t.Fatal(err)
+	}
+	c, err := LoadConfig(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Database.Driver != "sqlite" || c.Database.DSN != "./usage.db" || c.Database.SQLDriver() != "sqlite3" {
+		t.Fatalf("database=%+v sql_driver=%q", c.Database, c.Database.SQLDriver())
+	}
+}
+
+func TestPostgresPlaceholders(t *testing.T) {
+	query := `INSERT INTO llm_requests VALUES (?, ?, ?)`
+	if got, want := postgresPlaceholders(query), `INSERT INTO llm_requests VALUES ($1, $2, $3)`; got != want {
+		t.Fatalf("query=%q want=%q", got, want)
+	}
+}
+
+func TestPostgresStore(t *testing.T) {
+	dsn := os.Getenv("NANOROUTER_TEST_POSTGRES_DSN")
+	if dsn == "" {
+		t.Skip("set NANOROUTER_TEST_POSTGRES_DSN to run PostgreSQL integration test")
+	}
+	db, err := sql.Open("postgres", dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := db.PingContext(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := Migrate(context.Background(), db); err != nil {
+		t.Fatal(err)
+	}
+	id := "postgres-store-" + time.Now().UTC().Format("20060102150405.000000000")
+	t.Cleanup(func() { _, _ = db.Exec(`DELETE FROM llm_requests WHERE id = $1`, id) })
+	NewStore(db, "postgres").Insert(context.Background(), Record{
+		ID: id, Route: "test", UpstreamID: "postgres", UpstreamModel: "test-model", Endpoint: "chat_completions",
+		Status: http.StatusOK, LatencyMS: 1, Attempt: 0, Usage: Usage{Prompt: 2, Completion: 3, Total: 5, Source: "upstream"},
+	})
+	var total int64
+	if err := db.QueryRow(`SELECT total_tokens FROM llm_requests WHERE id = $1`, id).Scan(&total); err != nil || total != 5 {
+		t.Fatalf("total=%d err=%v", total, err)
 	}
 }
 

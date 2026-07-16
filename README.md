@@ -32,6 +32,34 @@ export GROQ_API_KEY='...'
 go run ./cmd/nanorouter -config config.yaml
 ```
 
+## 数据库
+
+默认使用 SQLite；旧的字符串形式 `database: ./nanorouter.db` 仍兼容。新的对象形式可明确指定
+驱动和连接信息：
+
+```yaml
+database:
+  driver: sqlite
+  dsn: ./nanorouter.db
+```
+
+也支持 PostgreSQL（使用 `github.com/lib/pq`）。连接串应通过环境变量提供，避免数据库凭据写入
+YAML；`lib/pq` 支持 `postgres://` 与 `postgresql://` DSN：
+
+```yaml
+database:
+  driver: postgres
+  dsn_env: NANOROUTER_POSTGRES_DSN
+```
+
+```sh
+export NANOROUTER_POSTGRES_DSN='postgresql://nanorouter:replace-me@postgres:5432/nanorouter?sslmode=require&connect_timeout=5'
+go run ./cmd/nanorouter -config config.yaml
+```
+
+两种数据库共享 `llm_requests` 账本表和迁移逻辑；PostgreSQL 会使用其原生参数占位符，SQLite
+继续使用原有的 `?` 占位符。
+
 ## 容器运行
 
 镜像运行阶段使用 Distroless 静态 Debian 基础镜像，以非 root 用户运行，默认读取

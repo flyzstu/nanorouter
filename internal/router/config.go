@@ -3,6 +3,7 @@ package router
 import (
 	"fmt"
 	"os"
+	"strings"
 	"time"
 
 	"gopkg.in/yaml.v3"
@@ -10,10 +11,81 @@ import (
 
 type Config struct {
 	Listen         string           `yaml:"listen"`
-	Database       string           `yaml:"database"`
+	Database       DatabaseConfig   `yaml:"database"`
 	AuthEnv        string           `yaml:"auth_env"`
 	RequestTimeout time.Duration    `yaml:"request_timeout"`
 	Routes         map[string]Route `yaml:"routes"`
+}
+
+// DatabaseConfig 保持 SQLite 字符串配置的兼容性，也支持 PostgreSQL。
+// PostgreSQL 的连接串应通过 DSNEnv 提供，避免凭据进入 YAML。
+type DatabaseConfig struct {
+	Driver string `yaml:"driver"`
+	DSN    string `yaml:"dsn"`
+	DSNEnv string `yaml:"dsn_env"`
+}
+
+func (d *DatabaseConfig) UnmarshalYAML(value *yaml.Node) error {
+	switch value.Kind {
+	case yaml.ScalarNode:
+		if value.Tag != "!!str" {
+			return fmt.Errorf("database must be a string or mapping")
+		}
+		d.Driver = "sqlite"
+		d.DSN = value.Value
+		d.DSNEnv = ""
+		return nil
+	case yaml.MappingNode:
+		type rawDatabaseConfig DatabaseConfig
+		var raw rawDatabaseConfig
+		if err := value.Decode(&raw); err != nil {
+			return err
+		}
+		*d = DatabaseConfig(raw)
+		return nil
+	default:
+		return fmt.Errorf("database must be a string or mapping")
+	}
+}
+
+func (d *DatabaseConfig) normalize() error {
+	d.Driver = strings.ToLower(strings.TrimSpace(d.Driver))
+	switch d.Driver {
+	case "", "sqlite", "sqlite3":
+		d.Driver = "sqlite"
+		if d.DSN == "" && d.DSNEnv == "" {
+			d.DSN = "nanorouter.db"
+		}
+	case "postgres", "postgresql", "pg":
+		d.Driver = "postgres"
+		if d.DSN == "" && d.DSNEnv == "" {
+			return fmt.Errorf("postgres database requires dsn or dsn_env")
+		}
+	default:
+		return fmt.Errorf("unsupported database driver %q", d.Driver)
+	}
+	if d.DSN != "" && d.DSNEnv != "" {
+		return fmt.Errorf("database may set only one of dsn or dsn_env")
+	}
+	return nil
+}
+
+// SQLDriver 是 database/sql 注册的驱动名称。
+func (d DatabaseConfig) SQLDriver() string {
+	if d.Driver == "postgres" {
+		return "postgres"
+	}
+	return "sqlite3"
+}
+
+func (d DatabaseConfig) ResolveDSN() (string, error) {
+	if d.DSNEnv == "" {
+		return d.DSN, nil
+	}
+	if dsn := os.Getenv(d.DSNEnv); dsn != "" {
+		return dsn, nil
+	}
+	return "", fmt.Errorf("database dsn environment variable %q is empty", d.DSNEnv)
 }
 
 // Route 的名称就是下游填写的 model，例如 free-fast；真实模型 ID 不暴露给下游。
@@ -69,8 +141,8 @@ func LoadConfig(path string) (Config, error) {
 	if c.Listen == "" {
 		c.Listen = ":8080"
 	}
-	if c.Database == "" {
-		c.Database = "nanorouter.db"
+	if err := c.Database.normalize(); err != nil {
+		return c, err
 	}
 	if c.RequestTimeout == 0 {
 		c.RequestTimeout = 90 * time.Second

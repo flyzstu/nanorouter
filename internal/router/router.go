@@ -61,7 +61,7 @@ func NewWithLogger(cfg Config, db *sql.DB, logger *zap.Logger) (*Router, error) 
 	if logger == nil {
 		logger = zap.NewNop()
 	}
-	r := &Router{cfg: cfg, db: &Store{db}, client: &http.Client{}, states: map[string]*state{}, limiters: map[string]chan struct{}{}, next: map[string]int{}, registry: prometheus.NewRegistry(), logger: logger}
+	r := &Router{cfg: cfg, db: NewStore(db, cfg.Database.Driver), client: &http.Client{}, states: map[string]*state{}, limiters: map[string]chan struct{}{}, next: map[string]int{}, registry: prometheus.NewRegistry(), logger: logger}
 	configuredLimits := make(map[string]int)
 	for routeName, route := range cfg.Routes {
 		for _, candidate := range route.Candidates {

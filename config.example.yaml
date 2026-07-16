@@ -1,5 +1,7 @@
 listen: ":8080"
-database: "./nanorouter.db"
+database:
+  driver: sqlite
+  dsn: "./nanorouter.db"
 # 设定后，下游需使用 Authorization: Bearer $NANOROUTER_API_KEY。
 auth_env: NANOROUTER_API_KEY
 request_timeout: 90s
