@@ -2,15 +2,35 @@ name: Build container image
 
 on:
   push:
+    branches:
+      - main
   pull_request:
   workflow_dispatch:
 
 jobs:
   build:
     runs-on: ubuntu-latest
+    env:
+      REGISTRY: coding.fly97.fun
+      IMAGE: coding.fly97.fun/fly97/nanorouter
+      IMAGE_TAG: ${{ gitea.sha }}
     steps:
       - name: Check out source
         uses: actions/checkout@v4
 
       - name: Build image
-        run: docker build --pull --tag nanorouter:${{ gitea.sha }} .
+        run: docker build --pull --tag "$IMAGE:$IMAGE_TAG" .
+
+      - name: Log in to Gitea container registry
+        if: gitea.event_name == 'push' || gitea.event_name == 'workflow_dispatch'
+        env:
+          REGISTRY_USERNAME: ${{ secrets.GITEA_PACKAGE_USERNAME }}
+          REGISTRY_TOKEN: ${{ secrets.GITEA_PACKAGE_TOKEN }}
+        run: echo "$REGISTRY_TOKEN" | docker login "$REGISTRY" --username "$REGISTRY_USERNAME" --password-stdin
+
+      - name: Push image tags
+        if: gitea.event_name == 'push' || gitea.event_name == 'workflow_dispatch'
+        run: |
+          docker tag "$IMAGE:$IMAGE_TAG" "$IMAGE:latest"
+          docker push "$IMAGE:$IMAGE_TAG"
+          docker push "$IMAGE:latest"
