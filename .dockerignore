@@ -1,0 +1,8 @@
+.git
+.gitea
+.mimocode
+bin
+nanorouter.db
+config.yaml
+*.db
+*.log

@@ -26,6 +26,9 @@ type Candidate struct {
 	BaseURL   string `yaml:"base_url"`
 	APIKeyEnv string `yaml:"api_key_env"`
 	Model     string `yaml:"model"`
+	// LlamaServer 表示上游是 llama.cpp 的 llama-server。此时 base_url 可填写服务根地址，
+	// 网关会自动补上其 OpenAI 兼容 API 的 /v1 前缀。
+	LlamaServer bool `yaml:"llama_server"`
 	// ExposeAs 让候选仍属于父路由的故障切换池，同时以独立模型 ID 对下游暴露。
 	// 例如 free-fast 的候选可设为 groq-qwen；下游指定该 ID 时只会调用此候选。
 	ExposeAs  string `yaml:"expose_as"`
@@ -45,6 +48,11 @@ type Candidate struct {
 	DropMessageFields []string `yaml:"drop_message_fields"`
 	// Enabled 未配置时默认为 true；设置为 false 会立即从路由候选中排除。
 	Enabled *bool `yaml:"enabled"`
+	// MaxConcurrency 限制此候选同时在途的请求数；0 表示不限制。
+	MaxConcurrency int `yaml:"max_concurrency"`
+	// QueueTimeout 是候选已满时等待空闲槽位的最长时间；0 表示不排队，立即拒绝。
+	// 仅在 MaxConcurrency 大于 0 时生效。
+	QueueTimeout time.Duration `yaml:"queue_timeout"`
 }
 
 func (c Candidate) IsEnabled() bool { return c.Enabled == nil || *c.Enabled }
@@ -81,6 +89,15 @@ func LoadConfig(path string) (Config, error) {
 		for _, u := range r.Candidates {
 			if u.ID == "" || u.BaseURL == "" || u.Model == "" {
 				return c, fmt.Errorf("route %q has an incomplete candidate", name)
+			}
+			if u.MaxConcurrency < 0 {
+				return c, fmt.Errorf("candidate %q in route %q has negative max_concurrency", u.ID, name)
+			}
+			if u.QueueTimeout < 0 {
+				return c, fmt.Errorf("candidate %q in route %q has negative queue_timeout", u.ID, name)
+			}
+			if u.MaxConcurrency == 0 && u.QueueTimeout > 0 {
+				return c, fmt.Errorf("candidate %q in route %q sets queue_timeout without max_concurrency", u.ID, name)
 			}
 			if u.ExposeAs == "" {
 				continue

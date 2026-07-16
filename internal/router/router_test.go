@@ -8,6 +8,7 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
 
 	json "github.com/goccy/go-json"
 	_ "github.com/ncruces/go-sqlite3/driver"
@@ -17,7 +18,7 @@ import (
 
 func TestConfigDuration(t *testing.T) {
 	path := t.TempDir() + "/config.yaml"
-	if err := os.WriteFile(path, []byte("request_timeout: 2s\nroutes:\n  r:\n    candidates:\n      - id: u\n        base_url: http://example.test\n        model: m\n"), 0600); err != nil {
+	if err := os.WriteFile(path, []byte("request_timeout: 2s\nroutes:\n  r:\n    candidates:\n      - id: u\n        base_url: http://example.test\n        model: m\n        max_concurrency: 2\n        queue_timeout: 3s\n"), 0600); err != nil {
 		t.Fatal(err)
 	}
 	c, err := LoadConfig(path)
@@ -26,6 +27,10 @@ func TestConfigDuration(t *testing.T) {
 	}
 	if c.RequestTimeout.Seconds() != 2 {
 		t.Fatalf("timeout=%s", c.RequestTimeout)
+	}
+	candidate := c.Routes["r"].Candidates[0]
+	if candidate.MaxConcurrency != 2 || candidate.QueueTimeout != 3*time.Second {
+		t.Fatalf("candidate limit=%d queue_timeout=%s", candidate.MaxConcurrency, candidate.QueueTimeout)
 	}
 }
 
@@ -36,6 +41,17 @@ func TestConfigRejectsExposedModelCollision(t *testing.T) {
 		t.Fatal(err)
 	}
 	if _, err := LoadConfig(path); err == nil || !strings.Contains(err.Error(), "conflicts") {
+		t.Fatalf("error=%v", err)
+	}
+}
+
+func TestConfigRejectsQueueTimeoutWithoutConcurrencyLimit(t *testing.T) {
+	path := t.TempDir() + "/config.yaml"
+	config := "routes:\n  r:\n    candidates:\n      - id: u\n        base_url: http://example.test\n        model: m\n        queue_timeout: 1s\n"
+	if err := os.WriteFile(path, []byte(config), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadConfig(path); err == nil || !strings.Contains(err.Error(), "queue_timeout") {
 		t.Fatalf("error=%v", err)
 	}
 }
@@ -76,6 +92,135 @@ func TestFailoverRewritesModelAndRecordsUsage(t *testing.T) {
 	var tokens int
 	if err := db.QueryRow(`SELECT total_tokens FROM llm_requests WHERE upstream_id='good'`).Scan(&tokens); err != nil || tokens != 7 {
 		t.Fatalf("usage: %d %v", tokens, err)
+	}
+}
+
+func TestLlamaServerCandidateUsesV1PrefixWithoutAPIKey(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/chat/completions" {
+			t.Fatalf("path=%s", r.URL.Path)
+		}
+		if authorization := r.Header.Get("Authorization"); authorization != "" {
+			t.Fatalf("authorization=%q", authorization)
+		}
+		var payload map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			t.Fatal(err)
+		}
+		if payload["model"] != "local-llama" {
+			t.Fatalf("model=%v", payload["model"])
+		}
+		_, _ = w.Write([]byte(`{"usage":{"prompt_tokens":1,"completion_tokens":2,"total_tokens":3}}`))
+	}))
+	defer upstream.Close()
+	db, err := sql.Open("sqlite3", ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := Migrate(context.Background(), db); err != nil {
+		t.Fatal(err)
+	}
+	r, err := New(Config{Routes: map[string]Route{"local": {Candidates: []Candidate{{ID: "llama", BaseURL: upstream.URL, Model: "local-llama", LlamaServer: true}}}}}, db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"local","messages":[]}`))
+	rec := httptest.NewRecorder()
+	r.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestCandidateConcurrencyLimitQueuesThenFailsOver(t *testing.T) {
+	started := make(chan struct{})
+	finish := make(chan struct{})
+	busy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		started <- struct{}{}
+		<-finish
+		_, _ = w.Write([]byte(`{"id":"busy"}`))
+	}))
+	defer busy.Close()
+	var spareCalls int
+	spare := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		spareCalls++
+		_, _ = w.Write([]byte(`{"id":"spare"}`))
+	}))
+	defer spare.Close()
+	db, err := sql.Open("sqlite3", ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := Migrate(context.Background(), db); err != nil {
+		t.Fatal(err)
+	}
+	r, err := New(Config{Routes: map[string]Route{"local": {Candidates: []Candidate{
+		{ID: "busy", BaseURL: busy.URL, Model: "busy", Weight: 2, MaxConcurrency: 1, QueueTimeout: 25 * time.Millisecond},
+		{ID: "spare", BaseURL: spare.URL, Model: "spare"},
+	}}}}, db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstDone := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		rec := httptest.NewRecorder()
+		r.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"local","messages":[]}`)))
+		firstDone <- rec
+	}()
+	<-started
+	begin := time.Now()
+	second := httptest.NewRecorder()
+	r.Handler().ServeHTTP(second, httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"local","messages":[]}`)))
+	if elapsed := time.Since(begin); elapsed < 20*time.Millisecond {
+		t.Fatalf("request did not wait for queue timeout: %s", elapsed)
+	}
+	if second.Code != http.StatusOK || spareCalls != 1 || !strings.Contains(second.Body.String(), "spare") {
+		t.Fatalf("status=%d spare_calls=%d body=%s", second.Code, spareCalls, second.Body.String())
+	}
+	close(finish)
+	if first := <-firstDone; first.Code != http.StatusOK {
+		t.Fatalf("first status=%d body=%s", first.Code, first.Body.String())
+	}
+}
+
+func TestCandidateConcurrencyLimitRejectsWhenQueueTimesOut(t *testing.T) {
+	started := make(chan struct{})
+	finish := make(chan struct{})
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		started <- struct{}{}
+		<-finish
+		_, _ = w.Write([]byte(`{"id":"done"}`))
+	}))
+	defer upstream.Close()
+	db, err := sql.Open("sqlite3", ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := Migrate(context.Background(), db); err != nil {
+		t.Fatal(err)
+	}
+	r, err := New(Config{Routes: map[string]Route{"local": {Candidates: []Candidate{{ID: "busy", BaseURL: upstream.URL, Model: "busy", MaxConcurrency: 1, QueueTimeout: 25 * time.Millisecond}}}}}, db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstDone := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		rec := httptest.NewRecorder()
+		r.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"local","messages":[]}`)))
+		firstDone <- rec
+	}()
+	<-started
+	second := httptest.NewRecorder()
+	r.Handler().ServeHTTP(second, httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"local","messages":[]}`)))
+	if second.Code != http.StatusTooManyRequests || !strings.Contains(second.Body.String(), "upstream_concurrency_limit") {
+		t.Fatalf("status=%d body=%s", second.Code, second.Body.String())
+	}
+	close(finish)
+	if first := <-firstDone; first.Code != http.StatusOK {
+		t.Fatalf("first status=%d body=%s", first.Code, first.Body.String())
 	}
 }
 

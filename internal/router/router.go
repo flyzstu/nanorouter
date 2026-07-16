@@ -32,6 +32,7 @@ type Router struct {
 	db        *Store
 	client    *http.Client
 	states    map[string]*state
+	limiters  map[string]chan struct{}
 	mu        sync.Mutex
 	next      map[string]int
 	requests  *prometheus.CounterVec
@@ -60,7 +61,26 @@ func NewWithLogger(cfg Config, db *sql.DB, logger *zap.Logger) (*Router, error) 
 	if logger == nil {
 		logger = zap.NewNop()
 	}
-	r := &Router{cfg: cfg, db: &Store{db}, client: &http.Client{}, states: map[string]*state{}, next: map[string]int{}, registry: prometheus.NewRegistry(), logger: logger}
+	r := &Router{cfg: cfg, db: &Store{db}, client: &http.Client{}, states: map[string]*state{}, limiters: map[string]chan struct{}{}, next: map[string]int{}, registry: prometheus.NewRegistry(), logger: logger}
+	configuredLimits := make(map[string]int)
+	for routeName, route := range cfg.Routes {
+		for _, candidate := range route.Candidates {
+			if candidate.MaxConcurrency < 0 || candidate.QueueTimeout < 0 || (candidate.MaxConcurrency == 0 && candidate.QueueTimeout > 0) {
+				return nil, fmt.Errorf("route %q candidate %q has invalid concurrency limit", routeName, candidate.ID)
+			}
+			if limit, exists := configuredLimits[candidate.ID]; exists && limit != candidate.MaxConcurrency {
+				return nil, fmt.Errorf("candidate %q has conflicting max_concurrency values", candidate.ID)
+			}
+			configuredLimits[candidate.ID] = candidate.MaxConcurrency
+			if candidate.MaxConcurrency == 0 {
+				continue
+			}
+			if _, exists := r.limiters[candidate.ID]; exists {
+				continue
+			}
+			r.limiters[candidate.ID] = make(chan struct{}, candidate.MaxConcurrency)
+		}
+	}
 	r.requests = prometheus.NewCounterVec(prometheus.CounterOpts{Name: "nanorouter_requests_total", Help: "Upstream attempts"}, []string{"route", "upstream", "endpoint", "status"})
 	r.tokens = prometheus.NewCounterVec(prometheus.CounterOpts{Name: "nanorouter_tokens_total", Help: "Reported tokens"}, []string{"route", "upstream", "type"})
 	r.failovers = prometheus.NewCounterVec(prometheus.CounterOpts{Name: "nanorouter_failovers_total", Help: "Retries sent to another upstream"}, []string{"route", "reason"})
@@ -130,6 +150,7 @@ func (r *Router) proxy(endpoint string) http.HandlerFunc {
 		requestID := requestID(q)
 		w.Header().Set("X-Request-ID", requestID)
 		streamed, _ := payload["stream"].(bool)
+		concurrencyLimited := false
 		// 只修改 model 字段，其他 OpenAI/Responses 字段透明保留，
 		// 因而 tools、图片、response_format 等新字段不需要网关逐一适配。
 		for attempt := 0; attempt < len(route.Candidates); attempt++ {
@@ -154,11 +175,22 @@ func (r *Router) proxy(endpoint string) http.HandlerFunc {
 			}
 			p["model"] = u.Model
 			encoded, _ := json.Marshal(p)
+			queueStart := time.Now()
+			release, acquired := r.acquire(q.Context(), u)
+			if !acquired {
+				concurrencyLimited = true
+				queueLatency := int(time.Since(queueStart).Milliseconds())
+				r.record(q.Context(), routeName, u, endpoint, http.StatusTooManyRequests, queueLatency, streamed, attempt, Usage{Source: "unavailable"}, "concurrency")
+				r.failovers.WithLabelValues(routeName, "concurrency_limit").Inc()
+				r.logger.Warn("Upstream concurrency limit reached; trying another candidate", failureLogFields(requestID, routeName, u, endpoint, attempt, queueLatency, streamed, http.StatusTooManyRequests, "concurrency_limit", true)...)
+				continue
+			}
 			start := time.Now()
 			ctx, cancel := context.WithTimeout(q.Context(), r.cfg.RequestTimeout)
 			resp, err := r.do(ctx, u, upstreamEndpoint, encoded)
 			latency := int(time.Since(start).Milliseconds())
 			if err != nil {
+				release()
 				cancel()
 				r.record(q.Context(), routeName, u, endpoint, 0, latency, streamed, attempt, Usage{Source: "unavailable"}, "network")
 				r.fail(routeName, u, 30*time.Second)
@@ -171,6 +203,7 @@ func (r *Router) proxy(endpoint string) http.HandlerFunc {
 			if retryable(resp.StatusCode) {
 				io.Copy(io.Discard, resp.Body)
 				resp.Body.Close()
+				release()
 				cancel()
 				r.record(q.Context(), routeName, u, endpoint, resp.StatusCode, latency, streamed, attempt, Usage{Source: "unavailable"}, "upstream")
 				r.fail(routeName, u, cooldown(resp))
@@ -180,6 +213,7 @@ func (r *Router) proxy(endpoint string) http.HandlerFunc {
 			}
 			if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 				upstreamError := r.copyErrorResponse(w, resp)
+				release()
 				cancel()
 				r.record(q.Context(), routeName, u, endpoint, resp.StatusCode, latency, streamed, attempt, Usage{Source: "unavailable"}, "client")
 				fields := failureLogFields(requestID, routeName, u, endpoint, attempt, latency, streamed, resp.StatusCode, "upstream_rejected", false)
@@ -198,6 +232,7 @@ func (r *Router) proxy(endpoint string) http.HandlerFunc {
 				} else {
 					usage = r.stream(w, resp)
 				}
+				release()
 				cancel()
 				duration := int(time.Since(start).Milliseconds())
 				r.record(q.Context(), routeName, u, endpoint, resp.StatusCode, duration, true, attempt, usage, "")
@@ -208,6 +243,7 @@ func (r *Router) proxy(endpoint string) http.HandlerFunc {
 				if adaptedResponses {
 					b, err = chatCompletionToResponse(b, routeName)
 					if err != nil {
+						release()
 						cancel()
 						writeAPIError(w, http.StatusBadGateway, "cannot adapt upstream chat response: "+err.Error(), "upstream_error")
 						r.record(q.Context(), routeName, u, endpoint, resp.StatusCode, latency, false, attempt, Usage{Source: "unavailable"}, "upstream")
@@ -219,6 +255,7 @@ func (r *Router) proxy(endpoint string) http.HandlerFunc {
 				}
 				w.WriteHeader(resp.StatusCode)
 				_, _ = w.Write(b)
+				release()
 				cancel()
 				usage := usageFromJSON(b)
 				duration := int(time.Since(start).Milliseconds())
@@ -227,7 +264,36 @@ func (r *Router) proxy(endpoint string) http.HandlerFunc {
 			}
 			return
 		}
+		if concurrencyLimited {
+			writeAPIError(w, http.StatusTooManyRequests, "all eligible upstreams are at their concurrency limit", "upstream_concurrency_limit")
+			return
+		}
 		http.Error(w, `{"error":{"message":"all configured upstreams are unavailable","type":"upstream_error"}}`, 503)
+	}
+}
+
+// acquire 在向上游发请求前占用候选槽位。它不把本地拥塞标记为上游故障，
+// 以免短暂排队导致错误冷却；槽位由调用方在完整响应（包括 SSE）结束后释放。
+func (r *Router) acquire(ctx context.Context, u Candidate) (func(), bool) {
+	limiter := r.limiters[u.ID]
+	if limiter == nil {
+		return func() {}, true
+	}
+	if u.QueueTimeout == 0 {
+		select {
+		case limiter <- struct{}{}:
+			return func() { <-limiter }, true
+		default:
+			return nil, false
+		}
+	}
+	queueCtx, cancel := context.WithTimeout(ctx, u.QueueTimeout)
+	defer cancel()
+	select {
+	case limiter <- struct{}{}:
+		return func() { <-limiter }, true
+	case <-queueCtx.Done():
+		return nil, false
 	}
 }
 
@@ -278,6 +344,10 @@ func successLogFields(requestID, route string, u Candidate, endpoint string, att
 }
 func (r *Router) do(ctx context.Context, u Candidate, endpoint string, body []byte) (*http.Response, error) {
 	base := strings.TrimRight(u.BaseURL, "/")
+	// llama-server 的监听地址通常不带 /v1；保持其他 OpenAI 兼容上游的 base_url 语义不变。
+	if u.LlamaServer && !strings.HasSuffix(strings.ToLower(base), "/v1") {
+		base += "/v1"
+	}
 	path := strings.ReplaceAll(endpoint, "_", "/")
 	if endpoint == "chat_completions" && u.ChatCompletionsPath != "" {
 		path = strings.TrimLeft(u.ChatCompletionsPath, "/")

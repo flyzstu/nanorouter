@@ -11,6 +11,7 @@
 - SQLite 调用账本、Prometheus `/metrics`
 - Chat Completions 与 Responses 的非流式/流式 `usage` 采集
 - 将受支持的 Responses 请求适配至只提供 Chat Completions 的 SenseNova 上游
+- llama.cpp `llama-server` 本地上游（可直接填写服务根地址）
 
 ## 依赖
 
@@ -31,7 +32,68 @@ export GROQ_API_KEY='...'
 go run ./cmd/nanorouter -config config.yaml
 ```
 
+## 容器运行
+
+镜像运行阶段使用 Distroless 静态 Debian 基础镜像，以非 root 用户运行，默认读取
+`/etc/nanorouter/config.yaml`；请挂载自己的配置文件，并以环境变量传入其中
+`api_key_env` 引用的密钥。SQLite 数据库默认写入
+`/var/lib/nanorouter`，生产环境应为该目录挂载持久卷。
+
+```sh
+docker build -t nanorouter:local .
+docker run --rm -p 8080:8080 \
+  --env NANOROUTER_API_KEY \
+  --env OPENROUTER_API_KEY \
+  --mount type=bind,src="$PWD/config.yaml",dst=/etc/nanorouter/config.yaml,readonly \
+  --mount type=volume,src=nanorouter-data,dst=/var/lib/nanorouter \
+  nanorouter:local
+```
+
+仓库的 Gitea Actions 工作流会在 push、Pull Request 和手动触发时执行同一 Docker 构建，
+仅验证镜像可构建，不会向未指定的镜像仓库推送。
+
 将 `config.yaml` 中每一个 `model` 改为供应商当前实际支持的模型 ID，并为非 OpenAI 兼容供应商填入其兼容 API 基地址。只有实际支持 Responses API 的候选才应设为 `responses: true`；否则该候选只会参与 Chat Completions 路由。
+
+## llama-server 本地上游
+
+启动模型时建议用 `--alias` 固定其模型 ID，并避免与网关监听端口冲突：
+
+```sh
+llama-server -m ./model.gguf --alias local-llama --host 127.0.0.1 --port 8081
+```
+
+配置 `llama_server: true` 后，`base_url` 填服务根地址即可，网关会请求
+`http://127.0.0.1:8081/v1/chat/completions`；无需人为补写 `/v1`。未使用
+`--api-key` 时省略 `api_key_env`，不会发送 Authorization 请求头：
+
+```yaml
+routes:
+  local-llama:
+    strategy: weighted_round_robin
+    candidates:
+      - id: llama-server-local
+        base_url: http://127.0.0.1:8081
+        model: local-llama
+        llama_server: true
+        responses_via_chat_completions: true
+```
+
+上述配置对各版本稳定的 Chat Completions 接口生效；`/v1/responses` 请求经受限的
+Responses→Chat 适配。若部署的 llama-server 已验证原生 Responses 兼容性，可改为
+`responses: true`，以保留原始 Responses 字段。
+
+## 候选并发与排队
+
+候选可用 `max_concurrency` 保护本地模型或限额较小的上游。槽位从请求发往上游开始占用，
+直到完整非流式响应或 SSE 流结束后释放；满载时最多等待 `queue_timeout`，超时会尝试同一路由
+的其他候选，仍无可用槽位则返回 `429`（错误码 `upstream_concurrency_limit`）。未配置
+`max_concurrency` 时不限制并发；`queue_timeout: 0s` 表示不排队、立即拒绝。
+
+```yaml
+- id: llama-server-local
+  max_concurrency: 1
+  queue_timeout: 30s
+```
 
 ## SenseNova 的 Responses 适配
 

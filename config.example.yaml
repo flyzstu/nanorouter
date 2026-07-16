@@ -5,6 +5,23 @@ auth_env: NANOROUTER_API_KEY
 request_timeout: 90s
 
 routes:
+  # llama-server 使用服务根地址即可；llama_server: true 会自动补上 /v1。
+  # 启动示例：llama-server -m ./model.gguf --alias local-llama --port 8081
+  # 未传 --api-key 时，不设置 api_key_env，网关不会发送 Authorization。
+  local-llama:
+    strategy: weighted_round_robin
+    candidates:
+      - id: llama-server-local
+        base_url: http://127.0.0.1:8081
+        model: local-llama
+        llama_server: true
+        enabled: true
+        # 同时只向本地模型发送一个请求；其余请求最多排队 30 秒，随后返回 429。
+        max_concurrency: 1
+        queue_timeout: 30s
+        # llama-server 各版本均支持 Chat Completions；Responses 请求走受限适配。
+        responses_via_chat_completions: true
+
   # 智谱通用 API 只提供 Chat Completions；需要 Responses 的下游请求会使用
   # 受限的 Responses→Chat 适配。Coding 套餐请改用智谱专属 coding 端点。
   zhipu-agent:
