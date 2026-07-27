@@ -12,9 +12,36 @@ import (
 type Config struct {
 	Listen         string           `yaml:"listen"`
 	Database       DatabaseConfig   `yaml:"database"`
+	Logging        LoggingConfig    `yaml:"logging"`
 	AuthEnv        string           `yaml:"auth_env"`
 	RequestTimeout time.Duration    `yaml:"request_timeout"`
 	Routes         map[string]Route `yaml:"routes"`
+}
+
+type LoggingConfig struct {
+	Language string `yaml:"language"`
+	Level    string `yaml:"level"`
+}
+
+func (l *LoggingConfig) normalize() error {
+	switch strings.ToLower(strings.TrimSpace(l.Language)) {
+	case "", "en":
+		l.Language = "en"
+	case "zh", "zh-cn":
+		l.Language = "zh-CN"
+	default:
+		return fmt.Errorf("unsupported log language %q (supported: en, zh-CN)", l.Language)
+	}
+	l.Level = strings.ToUpper(strings.TrimSpace(l.Level))
+	if l.Level == "" {
+		l.Level = "INFO"
+	}
+	switch l.Level {
+	case "DEBUG", "INFO", "WARN", "ERROR":
+		return nil
+	default:
+		return fmt.Errorf("unsupported log level %q (supported: DEBUG, INFO, WARN, ERROR)", l.Level)
+	}
 }
 
 // DatabaseConfig 保持 SQLite 字符串配置的兼容性，也支持 PostgreSQL。
@@ -142,6 +169,9 @@ func LoadConfig(path string) (Config, error) {
 		c.Listen = ":8080"
 	}
 	if err := c.Database.normalize(); err != nil {
+		return c, err
+	}
+	if err := c.Logging.normalize(); err != nil {
 		return c, err
 	}
 	if c.RequestTimeout == 0 {

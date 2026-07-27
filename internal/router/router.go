@@ -137,7 +137,7 @@ func (r *Router) proxy(endpoint string) http.HandlerFunc {
 		startedAt := time.Now()
 		requestID := requestID(q)
 		w.Header().Set("X-Request-ID", requestID)
-		r.logger.Info("request_started", eventFields("request_started", requestStartLogFields(q, requestID, endpoint)...)...)
+		r.logger.Info(r.logMessage("request_started"), eventFields("request_started", requestStartLogFields(q, requestID, endpoint)...)...)
 
 		body, err := io.ReadAll(http.MaxBytesReader(w, q.Body, maxRequestBody))
 		if err != nil {
@@ -181,7 +181,7 @@ func (r *Router) proxy(endpoint string) http.HandlerFunc {
 						zap.Int("retry_delay_ms", int(delay.Milliseconds())),
 						zap.String("retry_reason", "upstream_rate_limit"),
 					)
-					r.logger.Warn("retry_scheduled", eventFields("retry_scheduled", retryFields...)...)
+					r.logger.Warn(r.logMessage("retry_scheduled"), eventFields("retry_scheduled", retryFields...)...)
 					if !waitForRetry(ctx, delay) {
 						if q.Context().Err() != nil {
 							r.logRequestFailed(requestID, endpoint, routeName, streamed, 499, attempt, time.Since(startedAt), "client_canceled")
@@ -225,7 +225,7 @@ func (r *Router) proxy(endpoint string) http.HandlerFunc {
 			}
 			p, dropped := sanitizeRequest(p, u)
 			if len(dropped) > 0 {
-				r.logger.Debug("request_sanitized", eventFields("request_sanitized", zap.String("request_id", requestID), zap.String("route", routeName), zap.String("upstream", u.ID), zap.Strings("removed_fields", dropped))...)
+				r.logger.Debug(r.logMessage("request_sanitized"), eventFields("request_sanitized", zap.String("request_id", requestID), zap.String("route", routeName), zap.String("upstream", u.ID), zap.Strings("removed_fields", dropped))...)
 			}
 			p["model"] = u.Model
 			encoded, _ := json.Marshal(p)
@@ -236,12 +236,12 @@ func (r *Router) proxy(endpoint string) http.HandlerFunc {
 				queueLatency := int(time.Since(queueStart).Milliseconds())
 				r.record(q.Context(), routeName, u, endpoint, http.StatusTooManyRequests, queueLatency, streamed, attempt, Usage{Source: "unavailable"}, "concurrency")
 				r.failovers.WithLabelValues(routeName, "concurrency_limit").Inc()
-				r.logger.Warn("upstream_attempt_finished", eventFields("upstream_attempt_finished", append(failureLogFields(requestID, routeName, u, endpoint, attempt, queueLatency, streamed, http.StatusTooManyRequests, "concurrency_limit", true), zap.String("attempt_phase", "queue"))...)...)
+				r.logger.Warn(r.logMessage("upstream_attempt_finished"), eventFields("upstream_attempt_finished", append(failureLogFields(requestID, routeName, u, endpoint, attempt, queueLatency, streamed, http.StatusTooManyRequests, "concurrency_limit", true), zap.String("attempt_phase", "queue"))...)...)
 				attempt++
 				continue
 			}
 			start := time.Now()
-			r.logger.Info("upstream_attempt_started", eventFields("upstream_attempt_started", append(requestLogFields(requestID, routeName, u, endpoint, attempt, 0, streamed, 0), zap.Int("retry", retries))...)...)
+			r.logger.Info(r.logMessage("upstream_attempt_started"), eventFields("upstream_attempt_started", append(requestLogFields(requestID, routeName, u, endpoint, attempt, 0, streamed, 0), zap.Int("retry", retries))...)...)
 			resp, err := r.do(ctx, u, upstreamEndpoint, encoded)
 			latency := int(time.Since(start).Milliseconds())
 			if err != nil {
@@ -251,7 +251,7 @@ func (r *Router) proxy(endpoint string) http.HandlerFunc {
 				r.failovers.WithLabelValues(routeName, "network").Inc()
 				fields := failureLogFields(requestID, routeName, u, endpoint, attempt, latency, streamed, 0, "network_error", true)
 				fields = append(fields, zap.Error(err))
-				r.logger.Warn("upstream_attempt_finished", eventFields("upstream_attempt_finished", fields...)...)
+				r.logger.Warn(r.logMessage("upstream_attempt_finished"), eventFields("upstream_attempt_finished", fields...)...)
 				attempt++
 				continue
 			}
@@ -259,7 +259,7 @@ func (r *Router) proxy(endpoint string) http.HandlerFunc {
 			// 包含请求解析、选路、排队及此前的回退耗时。
 			responseFields := requestLogFields(requestID, routeName, u, endpoint, attempt, latency, streamed, resp.StatusCode)
 			responseFields = append(responseFields, zap.Int("request_to_upstream_response_ms", int(time.Since(startedAt).Milliseconds())))
-			r.logger.Info("upstream_response_received", eventFields("upstream_response_received", responseFields...)...)
+			r.logger.Info(r.logMessage("upstream_response_received"), eventFields("upstream_response_received", responseFields...)...)
 			if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 				// expose_as 代表明确指定某个上游；此时不能用通用 503 掩盖
 				// 上游诊断，须原样交给下游。普通路由则继续尝试下一候选。
@@ -270,7 +270,7 @@ func (r *Router) proxy(endpoint string) http.HandlerFunc {
 					r.record(q.Context(), routeName, u, endpoint, resp.StatusCode, latency, streamed, attempt, Usage{Source: "unavailable"}, "client")
 					fields := failureLogFields(requestID, routeName, u, endpoint, attempt, latency, streamed, resp.StatusCode, "upstream_rejected", false)
 					fields = append(fields, upstreamError.logFields(true)...)
-					r.logger.Warn("upstream_attempt_finished", eventFields("upstream_attempt_finished", fields...)...)
+					r.logger.Warn(r.logMessage("upstream_attempt_finished"), eventFields("upstream_attempt_finished", fields...)...)
 					r.logRequestFailed(requestID, endpoint, routeName, streamed, resp.StatusCode, attempt+1, time.Since(startedAt), "upstream_rejected")
 					return
 				}
@@ -294,7 +294,7 @@ func (r *Router) proxy(endpoint string) http.HandlerFunc {
 				r.failovers.WithLabelValues(routeName, http.StatusText(resp.StatusCode)).Inc()
 				fields := failureLogFields(requestID, routeName, u, endpoint, attempt, latency, streamed, resp.StatusCode, outcome, true)
 				fields = append(fields, upstreamError.logFields(true)...)
-				r.logger.Warn("upstream_attempt_finished", eventFields("upstream_attempt_finished", fields...)...)
+				r.logger.Warn(r.logMessage("upstream_attempt_finished"), eventFields("upstream_attempt_finished", fields...)...)
 				attempt++
 				continue
 			}
@@ -312,7 +312,7 @@ func (r *Router) proxy(endpoint string) http.HandlerFunc {
 				release()
 				duration := int(time.Since(start).Milliseconds())
 				r.record(q.Context(), routeName, u, endpoint, resp.StatusCode, duration, true, attempt, usage, "")
-				r.logger.Info("upstream_attempt_finished", eventFields("upstream_attempt_finished", successLogFields(requestID, routeName, u, endpoint, attempt, latency, duration, true, resp.StatusCode, usage)...)...)
+				r.logger.Info(r.logMessage("upstream_attempt_finished"), eventFields("upstream_attempt_finished", successLogFields(requestID, routeName, u, endpoint, attempt, latency, duration, true, resp.StatusCode, usage)...)...)
 				r.logRequestCompleted(requestID, endpoint, routeName, u, true, attempt+1, time.Since(startedAt), usage)
 			} else {
 				b, _ := io.ReadAll(resp.Body)
@@ -336,7 +336,7 @@ func (r *Router) proxy(endpoint string) http.HandlerFunc {
 				usage := usageFromJSON(b)
 				duration := int(time.Since(start).Milliseconds())
 				r.record(q.Context(), routeName, u, endpoint, resp.StatusCode, duration, false, attempt, usage, "")
-				r.logger.Info("upstream_attempt_finished", eventFields("upstream_attempt_finished", successLogFields(requestID, routeName, u, endpoint, attempt, latency, duration, false, resp.StatusCode, usage)...)...)
+				r.logger.Info(r.logMessage("upstream_attempt_finished"), eventFields("upstream_attempt_finished", successLogFields(requestID, routeName, u, endpoint, attempt, latency, duration, false, resp.StatusCode, usage)...)...)
 				r.logRequestCompleted(requestID, endpoint, routeName, u, false, attempt+1, time.Since(startedAt), usage)
 			}
 			return
@@ -435,13 +435,34 @@ func (r *Router) logRequestCompleted(requestID, endpoint, route string, u Candid
 		zap.Int64("total_tokens", usage.Total),
 		zap.String("usage_source", usage.Source),
 	)
-	r.logger.Info("request_completed", eventFields("request_completed", fields...)...)
+	r.logger.Info(r.logMessage("request_completed"), eventFields("request_completed", fields...)...)
 }
 
 func (r *Router) logRequestFailed(requestID, endpoint, route string, streamed bool, status, attempts int, duration time.Duration, outcome string) {
 	fields := requestOutcomeLogFields(requestID, route, endpoint, streamed, attempts, duration)
 	fields = append(fields, zap.Int("status", status), zap.String("outcome", outcome))
-	r.logger.Warn("request_failed", eventFields("request_failed", fields...)...)
+	r.logger.Warn(r.logMessage("request_failed"), eventFields("request_failed", fields...)...)
+}
+
+func (r *Router) logMessage(event string) string {
+	if r.cfg.Logging.Language != "zh-CN" {
+		return event
+	}
+	if message := chineseLogMessages[event]; message != "" {
+		return message
+	}
+	return event
+}
+
+var chineseLogMessages = map[string]string{
+	"request_started":            "收到下游请求",
+	"request_sanitized":          "请求字段已清洗",
+	"upstream_attempt_started":   "开始调用上游",
+	"upstream_response_received": "已收到上游响应",
+	"upstream_attempt_finished":  "上游调用结束",
+	"retry_scheduled":            "已安排上游重试",
+	"request_completed":          "请求处理完成",
+	"request_failed":             "请求处理失败",
 }
 
 func eventFields(event string, fields ...zap.Field) []zap.Field {

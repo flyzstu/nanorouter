@@ -35,6 +35,43 @@ func TestConfigDuration(t *testing.T) {
 	}
 }
 
+func TestConfigLoggingOptions(t *testing.T) {
+	path := t.TempDir() + "/config.yaml"
+	config := "logging:\n  language: zh\n  level: warn\nroutes:\n  r:\n    candidates:\n      - id: u\n        base_url: http://example.test\n        model: m\n"
+	if err := os.WriteFile(path, []byte(config), 0600); err != nil {
+		t.Fatal(err)
+	}
+	c, err := LoadConfig(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Logging.Language != "zh-CN" || c.Logging.Level != "WARN" {
+		t.Fatalf("logging=%+v", c.Logging)
+	}
+}
+
+func TestConfigRejectsUnsupportedLoggingOptions(t *testing.T) {
+	tests := []struct {
+		name    string
+		logging string
+	}{
+		{name: "language", logging: "language: de\n  level: INFO"},
+		{name: "level", logging: "language: en\n  level: TRACE"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			path := t.TempDir() + "/config.yaml"
+			config := "logging:\n  " + tt.logging + "\nroutes:\n  r:\n    candidates:\n      - id: u\n        base_url: http://example.test\n        model: m\n"
+			if err := os.WriteFile(path, []byte(config), 0600); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := LoadConfig(path); err == nil {
+				t.Fatal("expected invalid logging configuration to fail")
+			}
+		})
+	}
+}
+
 func TestConfigRejectsExposedModelCollision(t *testing.T) {
 	path := t.TempDir() + "/config.yaml"
 	config := "routes:\n  free-fast:\n    candidates:\n      - id: u\n        base_url: http://example.test\n        model: m\n        expose_as: free-fast\n"
@@ -346,6 +383,33 @@ func TestRequestLogsIncludeCorrelationAndTiming(t *testing.T) {
 	}
 	if elapsed, ok := responseFields["request_to_upstream_response_ms"].(int64); !ok || elapsed < 15 {
 		t.Fatalf("request-to-upstream timing=%v", responseFields["request_to_upstream_response_ms"])
+	}
+}
+
+func TestChineseLogMessagesPreserveEventField(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"id":"ok"}`))
+	}))
+	defer upstream.Close()
+	db, _ := sql.Open("sqlite3", ":memory:")
+	defer db.Close()
+	if err := Migrate(context.Background(), db); err != nil {
+		t.Fatal(err)
+	}
+	core, observed := observer.New(zap.InfoLevel)
+	cfg := Config{
+		Logging: LoggingConfig{Language: "zh-CN", Level: "INFO"},
+		Routes:  map[string]Route{"free": {Candidates: []Candidate{{ID: "u", BaseURL: upstream.URL, Model: "up"}}}},
+	}
+	r, err := NewWithLogger(cfg, db, zap.New(core))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"free","messages":[]}`))
+	r.Handler().ServeHTTP(httptest.NewRecorder(), req)
+	entries := observed.FilterMessage("已收到上游响应").All()
+	if len(entries) != 1 || entries[0].ContextMap()["event"] != "upstream_response_received" {
+		t.Fatalf("logs=%v", observed.All())
 	}
 }
 

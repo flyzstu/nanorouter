@@ -2,6 +2,10 @@ listen: ":8080"
 database:
   driver: sqlite
   dsn: "./nanorouter.db"
+# 日志消息支持 en / zh-CN；等级支持 DEBUG / INFO / WARN / ERROR。
+logging:
+  language: zh-CN
+  level: INFO
 # 设定后，下游需使用 Authorization: Bearer $NANOROUTER_API_KEY。
 auth_env: NANOROUTER_API_KEY
 request_timeout: 90s

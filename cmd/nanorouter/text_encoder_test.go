@@ -34,3 +34,28 @@ func TestTextEncoderColorsLevel(t *testing.T) {
 		t.Fatalf("log=%q", buf.String())
 	}
 }
+
+func TestLoggerUsesConfiguredLevel(t *testing.T) {
+	logger, err := newLogger("WARN", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer logger.Sync()
+	if logger.Core().Enabled(zapcore.InfoLevel) {
+		t.Fatal("INFO should be disabled at WARN level")
+	}
+	if !logger.Core().Enabled(zapcore.WarnLevel) || !logger.Core().Enabled(zapcore.ErrorLevel) {
+		t.Fatal("WARN and ERROR should be enabled at WARN level")
+	}
+}
+
+func TestDebugFlagOverridesConfiguredLevel(t *testing.T) {
+	logger, err := newLogger("ERROR", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer logger.Sync()
+	if !logger.Core().Enabled(zapcore.DebugLevel) {
+		t.Fatal("debug flag should enable DEBUG logs")
+	}
+}
