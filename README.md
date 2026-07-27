@@ -130,21 +130,42 @@ Responses→Chat 适配。若部署的 llama-server 已验证原生 Responses �
 
 ## SenseNova 的 Responses 适配
 
-SenseNova 候选使用 `responses_via_chat_completions: true` 时，下游可以照常请求 `/v1/responses`，但网关会向上游调用 Chat Completions，并把结果包装回 Responses 格式。
+SenseNova 候选使用 `responses_via_chat_completions: true` 时，下游可以照常请求 `/v1/responses`，网关会向上游调用 Chat Completions，并把结果包装回 Responses 格式。
+
+**SenseNova 6.7 Flash-Lite**（推荐）使用标准 OpenAI 化接口，无需额外适配配置：
+
+```yaml
+- id: sensenova-flash-lite
+  base_url: https://token.sensenova.cn/v1
+  api_key_env: SENSENOVA_API_KEY
+  model: sensenova-6.7-flash-lite
+  responses_via_chat_completions: true
+```
+
+Flash-Lite 支持 `reasoning_effort`（`"low"` / `"medium"` / `"high"` / `"none"`）、图像输入（`image_url` 类型内容块）、工具调用与并行工具调用。`max_tokens` 字段与 OpenAI 标准一致。
+
+如果路由中同时存在不支持 `reasoning_effort` 的其他候选，应在那些候选上配置：
+
+```yaml
+drop_request_fields:
+  - reasoning_effort
+```
+
+**旧版 SenseNova 原生接口**（`api.sensenova.cn/v1/llm`）路径与 `max_tokens` 字段均非标准，需显式指定：
 
 ```yaml
 - id: sensenova-chat
   base_url: https://api.sensenova.cn/v1/llm
   api_key_env: SENSENOVA_API_KEY
-  model: "<SenseNova 模型 ID>"
+  model: "<旧版模型 ID>"
   responses_via_chat_completions: true
   chat_max_tokens_field: max_new_tokens
   chat_completions_path: chat-completions
 ```
 
-支持：`input`（文本/图片消息）、`instructions`、`temperature`、`top_p`、`max_output_tokens`、流式与 usage。`tools`、`tool_choice`、`previous_response_id`、`background` 等无法在 Chat Completions 中保持语义的字段会返回 `400 unsupported_response_feature`，不会静默降级。
+两种接口均支持：`input`（文本/图片消息）、`instructions`、`temperature`、`top_p`、`max_output_tokens`、流式与 usage。`tools`、`tool_choice`、`previous_response_id`、`background` 等无法在 Chat Completions 中保持语义的字段会返回 `400 unsupported_response_feature`，不会静默降级。
 
-Groq 同时原生支持 `/v1/chat/completions` 和 `/v1/responses`，应配置 `responses: true`，不使用适配器。Agnes 2.0 Flash 公开的是 Chat Completions 接口，示例中配置为 `responses_via_chat_completions: true`；它使用默认的 `max_tokens` 映射。SenseNova 原生接口则应额外指定 `chat_max_tokens_field: max_new_tokens`。
+Groq 同时原生支持 `/v1/chat/completions` 和 `/v1/responses`，应配置 `responses: true`，不使用适配器。Agnes 2.0 Flash 公开的是 Chat Completions 接口，示例中配置为 `responses_via_chat_completions: true`；它使用默认的 `max_tokens` 映射。
 
 Mistral Medium 3.5 使用 `https://api.mistral.ai/v1`、模型 ID `mistral-medium-3-5`，原生支持 Chat Completions；示例为其开启 Responses→Chat 适配。所有候选均可设置 `enabled: false` 临时下线，无需删除密钥或配置。未设置 `enabled` 时默认启用；全部候选均禁用的路由不会出现在 `/v1/models`。
 

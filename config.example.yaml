@@ -85,18 +85,35 @@ routes:
         drop_message_fields:
           - name
 
-      # SenseNova 没有原生 /v1/responses；网关会把受支持的 Responses
-      # 请求转换为其 /v1/llm/chat-completions 格式，再包装为 Responses 响应。
-      - id: sensenova-chat
-        base_url: https://api.sensenova.cn/v1/llm
+      # SenseNova 6.7 Flash-Lite：使用标准 OpenAI Chat Completions 接口
+      # （token.sensenova.cn/v1），无需路径或字段重映射。
+      # reasoning_effort 是 Flash-Lite 特有字段；如果路由中同时存在不支持该字段
+      # 的其他候选，请在那些候选上配置 drop_request_fields: [reasoning_effort]。
+      - id: sensenova-flash-lite
+        base_url: https://token.sensenova.cn/v1
         api_key_env: SENSENOVA_API_KEY
-        model: "<SenseNova 实际模型 ID>"
-        expose_as: sensenova-chat
+        model: sensenova-6.7-flash-lite
+        expose_as: sensenova-flash-lite
         weight: 1
         enabled: true
         responses_via_chat_completions: true
+        # max_tokens 字段与 OpenAI 标准一致，无需 chat_max_tokens_field。
+
+      # 旧版 SenseNova 原生接口（api.sensenova.cn）：路径与 max_tokens 字段均非标准，
+      # 需通过 chat_completions_path 和 chat_max_tokens_field 显式配置。
+      - id: sensenova-chat
+        base_url: https://api.sensenova.cn/v1/llm
+        api_key_env: SENSENOVA_API_KEY
+        model: "<SenseNova 旧版模型 ID>"
+        expose_as: sensenova-chat
+        weight: 1
+        enabled: false
+        responses_via_chat_completions: true
         chat_max_tokens_field: max_new_tokens
         chat_completions_path: chat-completions
+        # 旧接口不支持 reasoning_effort，如果下游可能传入该字段需删除。
+        drop_request_fields:
+          - reasoning_effort
 
       # Agnes 2.0 Flash 只公开 Chat Completions；对下游 Responses 请求使用适配器。
       - id: agnes-flash
