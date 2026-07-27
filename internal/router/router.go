@@ -126,8 +126,9 @@ func (r *Router) models(w http.ResponseWriter, q *http.Request) {
 	}
 	sort.Strings(modelIDs)
 	data := make([]map[string]any, 0, len(modelIDs))
+	created := time.Now().Unix()
 	for _, id := range modelIDs {
-		data = append(data, map[string]any{"id": id, "object": "model", "owned_by": "nanorouter"})
+		data = append(data, map[string]any{"id": id, "object": "model", "created": created, "owned_by": "nanorouter"})
 	}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]any{"object": "list", "data": data})

@@ -842,6 +842,20 @@ func TestExposedCandidateIsListedAndRoutable(t *testing.T) {
 	if !strings.Contains(models.Body.String(), `"id":"agnes-flash"`) {
 		t.Fatalf("exposed model missing: %s", models.Body.String())
 	}
+	var modelList struct {
+		Data []struct {
+			ID      string `json:"id"`
+			Created int64  `json:"created"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(models.Body.Bytes(), &modelList); err != nil {
+		t.Fatal(err)
+	}
+	for _, model := range modelList.Data {
+		if model.Created <= 0 {
+			t.Fatalf("model %q has invalid created timestamp: %d", model.ID, model.Created)
+		}
+	}
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"agnes-flash","messages":[]}`))
 	rec := httptest.NewRecorder()
 	r.Handler().ServeHTTP(rec, req)
