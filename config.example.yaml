@@ -76,19 +76,19 @@ routes:
         enabled: true
         # Groq 原生支持 /chat/completions 与 /responses，直接透传。
         # 根据 Groq 文档，以下字段会导致 Chat Completions 400 或尚不支持。
+        # reasoning_effort 为 token.sensenova.cn 特有字段，Groq 不支持。
         drop_request_fields:
           - logprobs
           - logit_bias
           - top_logprobs
           - metadata
           - store
+          - reasoning_effort
         drop_message_fields:
           - name
 
-      # SenseNova 6.7 Flash-Lite：使用标准 OpenAI Chat Completions 接口
-      # （token.sensenova.cn/v1），无需路径或字段重映射。
-      # reasoning_effort 是 Flash-Lite 特有字段；如果路由中同时存在不支持该字段
-      # 的其他候选，请在那些候选上配置 drop_request_fields: [reasoning_effort]。
+      # SenseNova 6.7 Flash-Lite：标准 OpenAI Chat Completions 接口，
+      # 支持图像输入（image_url）、工具调用、并行工具调用与 reasoning_effort。
       - id: sensenova-flash-lite
         base_url: https://token.sensenova.cn/v1
         api_key_env: SENSENOVA_API_KEY
@@ -97,23 +97,17 @@ routes:
         weight: 1
         enabled: true
         responses_via_chat_completions: true
-        # max_tokens 字段与 OpenAI 标准一致，无需 chat_max_tokens_field。
 
-      # 旧版 SenseNova 原生接口（api.sensenova.cn）：路径与 max_tokens 字段均非标准，
-      # 需通过 chat_completions_path 和 chat_max_tokens_field 显式配置。
-      - id: sensenova-chat
-        base_url: https://api.sensenova.cn/v1/llm
+      # DeepSeek V4 Flash：与 Flash-Lite 共享端点与认证，默认启用思考模式。
+      # reasoning_content 字段在思考模式下随响应透传给下游，无需网关处理。
+      - id: sensenova-deepseek-v4-flash
+        base_url: https://token.sensenova.cn/v1
         api_key_env: SENSENOVA_API_KEY
-        model: "<SenseNova 旧版模型 ID>"
-        expose_as: sensenova-chat
+        model: deepseek-v4-flash
+        expose_as: deepseek-v4-flash
         weight: 1
-        enabled: false
+        enabled: true
         responses_via_chat_completions: true
-        chat_max_tokens_field: max_new_tokens
-        chat_completions_path: chat-completions
-        # 旧接口不支持 reasoning_effort，如果下游可能传入该字段需删除。
-        drop_request_fields:
-          - reasoning_effort
 
       # Agnes 2.0 Flash 只公开 Chat Completions；对下游 Responses 请求使用适配器。
       - id: agnes-flash
@@ -124,7 +118,9 @@ routes:
         weight: 1
         responses_via_chat_completions: true
         enabled: true
-        # 默认值为 max_tokens，与 Agnes 的 API 一致。
+        # reasoning_effort 为 token.sensenova.cn 特有字段，Agnes 不支持。
+        drop_request_fields:
+          - reasoning_effort
 
       # Mistral Medium 3.5 原生支持 Chat Completions；Responses 通过适配器提供。
       - id: mistral-medium-3-5
@@ -135,6 +131,8 @@ routes:
         weight: 1
         responses_via_chat_completions: true
         enabled: true
+        drop_request_fields:
+          - reasoning_effort
 
       # Cerebras 的 gpt-oss-120b 原生支持 Chat Completions；Responses 使用适配器。
       - id: cerebras-gpt-oss-120b
@@ -145,3 +143,5 @@ routes:
         weight: 1
         responses_via_chat_completions: true
         enabled: true
+        drop_request_fields:
+          - reasoning_effort
