@@ -23,6 +23,9 @@ routes:
         queue_timeout: 30s
         # llama-server 各版本均支持 Chat Completions；Responses 请求走受限适配。
         responses_via_chat_completions: true
+        # 其他上游思考模型可能在对话历史中包含 reasoning_content，llama-server 不支持该字段。
+        drop_message_fields:
+          - reasoning_content
 
   # 智谱通用 API 只提供 Chat Completions；需要 Responses 的下游请求会使用
   # 受限的 Responses→Chat 适配。Coding 套餐请改用智谱专属 coding 端点。
@@ -40,6 +43,8 @@ routes:
         drop_request_fields:
           - promptCacheKey
           - prompt_cache_key
+        drop_message_fields:
+          - reasoning_content
 
   free-fast:
     strategy: weighted_round_robin
@@ -58,6 +63,8 @@ routes:
         drop_request_fields:
           - promptCacheKey
           - prompt_cache_key
+        drop_message_fields:
+          - reasoning_content
       - id: openrouter-deepseek
         base_url: https://openrouter.ai/api/v1
         api_key_env: OPENROUTER_API_KEY
@@ -84,8 +91,11 @@ routes:
           - metadata
           - store
           - reasoning_effort
+        # reasoning_content 是 DeepSeek 思考模式在 assistant 消息中添加的字段，
+        # 其他上游不支持该字段且会返回 422。
         drop_message_fields:
           - name
+          - reasoning_content
 
       # SenseNova 6.7 Flash-Lite：标准 OpenAI Chat Completions 接口，
       # 支持图像输入（image_url）、工具调用、并行工具调用与 reasoning_effort。
@@ -121,6 +131,8 @@ routes:
         # reasoning_effort 为 token.sensenova.cn 特有字段，Agnes 不支持。
         drop_request_fields:
           - reasoning_effort
+        drop_message_fields:
+          - reasoning_content
 
       # Mistral Medium 3.5 原生支持 Chat Completions；Responses 通过适配器提供。
       - id: mistral-medium-3-5
@@ -133,6 +145,8 @@ routes:
         enabled: true
         drop_request_fields:
           - reasoning_effort
+        drop_message_fields:
+          - reasoning_content
 
       # Cerebras 的 gpt-oss-120b 原生支持 Chat Completions；Responses 使用适配器。
       - id: cerebras-gpt-oss-120b
@@ -145,3 +159,5 @@ routes:
         enabled: true
         drop_request_fields:
           - reasoning_effort
+        drop_message_fields:
+          - reasoning_content

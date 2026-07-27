@@ -811,3 +811,61 @@ func TestDisabledCandidateIsSkippedAndHiddenWhenAllDisabled(t *testing.T) {
 		t.Fatalf("disabled route leaked: %s", models.Body.String())
 	}
 }
+
+func TestReasoningContentStrippedFromAssistantMessages(t *testing.T) {
+	// 模拟 Mistral 等不支持 reasoning_content 的上游；收到该字段返回 422。
+	var gotMessages []any
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var in map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&in)
+		gotMessages, _ = in["messages"].([]any)
+		for _, raw := range gotMessages {
+			msg, _ := raw.(map[string]any)
+			if _, ok := msg["reasoning_content"]; ok {
+				// 模拟 Mistral 422：extra_forbidden
+				w.WriteHeader(http.StatusUnprocessableEntity)
+				_, _ = w.Write([]byte(`{"detail":[{"type":"extra_forbidden","msg":"Extra inputs are not permitted"}]}`))
+				return
+			}
+		}
+		_, _ = w.Write([]byte(`{"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}`))
+	}))
+	defer upstream.Close()
+	db, _ := sql.Open("sqlite3", ":memory:")
+	defer db.Close()
+	if err := Migrate(context.Background(), db); err != nil {
+		t.Fatal(err)
+	}
+	candidate := Candidate{
+		ID:                "mistral",
+		BaseURL:           upstream.URL,
+		Model:             "mistral-medium-3-5",
+		DropMessageFields: []string{"reasoning_content"},
+	}
+	r, err := New(Config{Routes: map[string]Route{"free": {Candidates: []Candidate{candidate}}}}, db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 对话历史中含有 DeepSeek 思考模式产生的 reasoning_content 字段。
+	body := `{"model":"free","messages":[` +
+		`{"role":"user","content":"9.11 和 9.8 哪个更大？"},` +
+		`{"role":"assistant","content":"9.8 更大。","reasoning_content":"用户在比较两个小数..."}` +
+		`]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	rec := httptest.NewRecorder()
+	r.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	// 验证上游实际收到的消息中不含 reasoning_content。
+	if len(gotMessages) != 2 {
+		t.Fatalf("expected 2 messages, got %d", len(gotMessages))
+	}
+	assistant, _ := gotMessages[1].(map[string]any)
+	if _, ok := assistant["reasoning_content"]; ok {
+		t.Fatal("reasoning_content was not stripped from assistant message")
+	}
+	if assistant["content"] != "9.8 更大。" {
+		t.Fatalf("content was altered: %v", assistant["content"])
+	}
+}
