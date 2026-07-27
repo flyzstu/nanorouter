@@ -1,6 +1,6 @@
 # nanorouter
 
-为 Agent、Open WebUI 等下游提供一个 OpenAI 兼容入口，并把逻辑模型名路由到多个独立上游。若上游在返回首个成功响应前发生网络错误，或返回 `408`、`425`、`429`、`5xx`，请求会切换至下一个可用候选。
+为 Agent、Open WebUI 等下游提供一个 OpenAI 兼容入口，并把逻辑模型名路由到多个独立上游。若上游在返回首个成功响应前发生网络错误，返回候选级的 `401/403/404`，或返回 `408`、`425`、`429`、`500/502/503/504`，聚合路由会切换至下一个可用候选；`400/422` 等请求错误不会触发切换。
 
 已实现：
 
@@ -38,10 +38,13 @@ go run ./cmd/nanorouter -config config.yaml
 logging:
   language: zh-CN # en 或 zh-CN，默认 en
   level: INFO     # DEBUG、INFO、WARN 或 ERROR，默认 INFO
+  format: text    # text 或 json，默认 text
+  color: true     # 文本日志是否显示彩色等级，默认 true
 ```
 
-中文模式只翻译日志消息；用于检索和告警的结构化字段名及 `event` 值保持英文稳定。`-debug`
-仍会启用彩色文本日志，并将本次启动的日志等级覆盖为 `DEBUG`。
+中文模式只翻译日志消息；用于检索和告警的结构化字段名及 `event` 值保持英文稳定。默认输出
+带颜色的 `key=value` 文本；日志采集系统需要 JSON 时可设置 `format: json`，此时 `color` 不生效。
+`-debug` 会强制使用彩色文本日志，并将本次启动的日志等级覆盖为 `DEBUG`。
 
 ## 数据库
 
@@ -209,7 +212,8 @@ Model:    free-fast
 
 每个 Chat Completions / Responses 请求会按 `request_started`、`upstream_attempt_started`、
 `upstream_response_received`、`upstream_attempt_finished`、`retry_scheduled`、`request_completed`
-或 `request_failed` 写结构化日志，并用 `request_id` 关联。生产环境输出 JSON；`-debug` 输出同一事件和字段的易读 `key=value` 文本。
+或 `request_failed` 写结构化日志，并用 `request_id` 关联。默认输出带颜色的 `key=value` 文本；
+配置 `logging.format: json` 可切换为 JSON。
 `request_started` 会记录方法、路径、客户端地址和普通请求 Header；`Authorization`、Cookie，以及名称含
 `key`、`token`、`secret`、`password` 的 Header 会完全省略。日志不会包含请求正文、prompt、模型回复或密钥。
 

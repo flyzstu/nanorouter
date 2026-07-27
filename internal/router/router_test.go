@@ -45,7 +45,7 @@ func TestConfigLoggingOptions(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if c.Logging.Language != "zh-CN" || c.Logging.Level != "WARN" {
+	if c.Logging.Language != "zh-CN" || c.Logging.Level != "WARN" || c.Logging.Format != "text" || !c.Logging.ColorEnabled() {
 		t.Fatalf("logging=%+v", c.Logging)
 	}
 }
@@ -57,6 +57,7 @@ func TestConfigRejectsUnsupportedLoggingOptions(t *testing.T) {
 	}{
 		{name: "language", logging: "language: de\n  level: INFO"},
 		{name: "level", logging: "language: en\n  level: TRACE"},
+		{name: "format", logging: "language: en\n  level: INFO\n  format: xml"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -461,7 +462,7 @@ func TestUpstreamErrorMessageIsIncludedInFailureLogs(t *testing.T) {
 	t.Fatalf("upstream error message missing: %v", fields)
 }
 
-func TestUpstreamRejectionFailsOverToNextCandidate(t *testing.T) {
+func TestNonRetryableUpstreamRejectionDoesNotFailOver(t *testing.T) {
 	var rejected, succeeded int
 	bad := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		rejected++
@@ -489,22 +490,93 @@ func TestUpstreamRejectionFailsOverToNextCandidate(t *testing.T) {
 	}
 	rec := httptest.NewRecorder()
 	r.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"free","messages":[]}`)))
-	if rec.Code != http.StatusOK || rejected != 1 || succeeded != 1 {
+	if rec.Code != http.StatusBadRequest || rejected != 1 || succeeded != 0 {
 		t.Fatalf("status=%d rejected=%d succeeded=%d body=%s", rec.Code, rejected, succeeded, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "unsupported parameter") {
+		t.Fatalf("body=%s", rec.Body.String())
+	}
+	entries := observed.FilterMessage("upstream_attempt_finished").All()
+	if len(entries) != 1 {
+		t.Fatalf("logs=%v", observed.All())
+	}
+	fields := entries[0].ContextMap()
+	if fields["retryable"] != false || fields["outcome"] != "upstream_rejected" {
+		t.Fatalf("fields=%v", fields)
+	}
+	if fields["upstream_error_type"] != "invalid_request_error" || fields["upstream_error_code"] != "bad_param" || fields["upstream_error_message"] != "unsupported parameter" {
+		t.Fatalf("fields=%v", fields)
+	}
+}
+
+func TestServerErrorFailsOverToNextCandidate(t *testing.T) {
+	var failed, succeeded int
+	bad := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		failed++
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = w.Write([]byte(`{"error":{"message":"temporarily unavailable"}}`))
+	}))
+	defer bad.Close()
+	good := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		succeeded++
+		_, _ = w.Write([]byte(`{"usage":{"prompt_tokens":1,"completion_tokens":2,"total_tokens":3}}`))
+	}))
+	defer good.Close()
+	db, _ := sql.Open("sqlite3", ":memory:")
+	defer db.Close()
+	if err := Migrate(context.Background(), db); err != nil {
+		t.Fatal(err)
+	}
+	r, err := New(Config{Routes: map[string]Route{"free": {Candidates: []Candidate{
+		{ID: "bad", BaseURL: bad.URL, Model: "bad"},
+		{ID: "good", BaseURL: good.URL, Model: "good"},
+	}}}}, db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec := httptest.NewRecorder()
+	r.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"free","messages":[]}`)))
+	if rec.Code != http.StatusOK || failed != 1 || succeeded != 1 {
+		t.Fatalf("status=%d failed=%d succeeded=%d body=%s", rec.Code, failed, succeeded, rec.Body.String())
 	}
 	if attempts := rec.Header().Get("X-Nanorouter-Attempts"); attempts != "2" {
 		t.Fatalf("attempts=%q", attempts)
 	}
-	entries := observed.FilterMessage("upstream_attempt_finished").All()
-	if len(entries) != 2 {
-		t.Fatalf("failover logs=%v", observed.All())
-	}
-	fields := entries[0].ContextMap()
-	if fields["status"] != int64(http.StatusBadRequest) {
-		fields = entries[1].ContextMap()
-	}
-	if fields["upstream_error_type"] != "invalid_request_error" || fields["upstream_error_code"] != "bad_param" || fields["upstream_error_message"] != "unsupported parameter" {
-		t.Fatalf("fields=%v", fields)
+}
+
+func TestCandidateAuthOrModelErrorFailsOver(t *testing.T) {
+	for _, status := range []int{http.StatusUnauthorized, http.StatusForbidden, http.StatusNotFound} {
+		t.Run(http.StatusText(status), func(t *testing.T) {
+			var failed, succeeded int
+			bad := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				failed++
+				w.WriteHeader(status)
+				_, _ = w.Write([]byte(`{"error":{"message":"candidate unavailable"}}`))
+			}))
+			defer bad.Close()
+			good := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				succeeded++
+				_, _ = w.Write([]byte(`{"usage":{"prompt_tokens":1,"completion_tokens":2,"total_tokens":3}}`))
+			}))
+			defer good.Close()
+			db, _ := sql.Open("sqlite3", ":memory:")
+			defer db.Close()
+			if err := Migrate(context.Background(), db); err != nil {
+				t.Fatal(err)
+			}
+			r, err := New(Config{Routes: map[string]Route{"free": {Candidates: []Candidate{
+				{ID: "bad", BaseURL: bad.URL, Model: "bad"},
+				{ID: "good", BaseURL: good.URL, Model: "good"},
+			}}}}, db)
+			if err != nil {
+				t.Fatal(err)
+			}
+			rec := httptest.NewRecorder()
+			r.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"free","messages":[]}`)))
+			if rec.Code != http.StatusOK || failed != 1 || succeeded != 1 {
+				t.Fatalf("status=%d failed=%d succeeded=%d body=%s", rec.Code, failed, succeeded, rec.Body.String())
+			}
+		})
 	}
 }
 
@@ -659,6 +731,33 @@ func TestExposedCandidateReturnsItsUpstreamError(t *testing.T) {
 	want := `{"error":{"message":"model access denied","type":"permission_error","code":"model_not_found"}}`
 	if got := rec.Body.String(); got != want {
 		t.Fatalf("body=%s", got)
+	}
+}
+
+func TestExposedCandidateDoesNotRetryRateLimit(t *testing.T) {
+	calls := 0
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		calls++
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = w.Write([]byte(`{"error":{"message":"rate limited"}}`))
+	}))
+	defer upstream.Close()
+	db, _ := sql.Open("sqlite3", ":memory:")
+	defer db.Close()
+	if err := Migrate(context.Background(), db); err != nil {
+		t.Fatal(err)
+	}
+	r, err := New(Config{Routes: map[string]Route{"pool": {Candidates: []Candidate{{ID: "only", BaseURL: upstream.URL, Model: "up", ExposeAs: "direct"}}}}}, db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec := httptest.NewRecorder()
+	r.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"direct","messages":[]}`)))
+	if rec.Code != http.StatusTooManyRequests || calls != 1 {
+		t.Fatalf("status=%d calls=%d body=%s", rec.Code, calls, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "rate limited") {
+		t.Fatalf("body=%s", rec.Body.String())
 	}
 }
 

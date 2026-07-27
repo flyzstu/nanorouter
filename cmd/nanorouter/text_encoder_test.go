@@ -36,7 +36,7 @@ func TestTextEncoderColorsLevel(t *testing.T) {
 }
 
 func TestLoggerUsesConfiguredLevel(t *testing.T) {
-	logger, err := newLogger("WARN", false)
+	logger, err := newLogger("WARN", "text", true, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -50,7 +50,7 @@ func TestLoggerUsesConfiguredLevel(t *testing.T) {
 }
 
 func TestDebugFlagOverridesConfiguredLevel(t *testing.T) {
-	logger, err := newLogger("ERROR", true)
+	logger, err := newLogger("ERROR", "json", false, true)
 	if err != nil {
 		t.Fatal(err)
 	}

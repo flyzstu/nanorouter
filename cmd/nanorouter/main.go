@@ -26,7 +26,7 @@ func main() {
 		logger, _ := zap.NewProduction()
 		logger.Fatal("load configuration failed", zap.Error(err))
 	}
-	logger, err := newLogger(cfg.Logging.Level, *debug)
+	logger, err := newLogger(cfg.Logging.Level, cfg.Logging.Format, cfg.Logging.ColorEnabled(), *debug)
 	if err != nil {
 		panic(err)
 	}
@@ -62,7 +62,7 @@ func main() {
 	}
 }
 
-func newLogger(levelName string, debug bool) (*zap.Logger, error) {
+func newLogger(levelName, format string, color, debug bool) (*zap.Logger, error) {
 	level := zap.InfoLevel
 	if err := level.UnmarshalText([]byte(levelName)); err != nil {
 		return nil, err
@@ -70,6 +70,9 @@ func newLogger(levelName string, debug bool) (*zap.Logger, error) {
 	if debug {
 		level = zap.DebugLevel
 		return zap.New(zapcore.NewCore(newTextEncoder(true), zapcore.Lock(os.Stderr), level)), nil
+	}
+	if format == "text" {
+		return zap.New(zapcore.NewCore(newTextEncoder(color), zapcore.Lock(os.Stderr), level)), nil
 	}
 	logConfig := zap.NewProductionConfig()
 	logConfig.EncoderConfig.TimeKey = "time"

@@ -21,6 +21,8 @@ type Config struct {
 type LoggingConfig struct {
 	Language string `yaml:"language"`
 	Level    string `yaml:"level"`
+	Format   string `yaml:"format"`
+	Color    *bool  `yaml:"color"`
 }
 
 func (l *LoggingConfig) normalize() error {
@@ -38,10 +40,25 @@ func (l *LoggingConfig) normalize() error {
 	}
 	switch l.Level {
 	case "DEBUG", "INFO", "WARN", "ERROR":
-		return nil
 	default:
 		return fmt.Errorf("unsupported log level %q (supported: DEBUG, INFO, WARN, ERROR)", l.Level)
 	}
+	l.Format = strings.ToLower(strings.TrimSpace(l.Format))
+	if l.Format == "" {
+		l.Format = "text"
+	}
+	if l.Format != "text" && l.Format != "json" {
+		return fmt.Errorf("unsupported log format %q (supported: text, json)", l.Format)
+	}
+	if l.Color == nil {
+		enabled := true
+		l.Color = &enabled
+	}
+	return nil
+}
+
+func (l LoggingConfig) ColorEnabled() bool {
+	return l.Color == nil || *l.Color
 }
 
 // DatabaseConfig 保持 SQLite 字符串配置的兼容性，也支持 PostgreSQL。

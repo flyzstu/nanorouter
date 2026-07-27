@@ -2,10 +2,12 @@ listen: ":8080"
 database:
   driver: sqlite
   dsn: "./nanorouter.db"
-# 日志消息支持 en / zh-CN；等级支持 DEBUG / INFO / WARN / ERROR。
+# 默认输出带颜色的 key=value 文本；采集系统需要 JSON 时设置 format: json。
 logging:
   language: zh-CN
   level: INFO
+  format: text
+  color: true
 # 设定后，下游需使用 Authorization: Bearer $NANOROUTER_API_KEY。
 auth_env: NANOROUTER_API_KEY
 request_timeout: 90s

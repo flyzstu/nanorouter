@@ -263,9 +263,10 @@ func (r *Router) proxy(endpoint string) http.HandlerFunc {
 			r.logger.Info(r.logMessage("upstream_response_received"), eventFields("upstream_response_received", responseFields...)...)
 			if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 				// expose_as 代表明确指定某个上游；此时不能用通用 503 掩盖
-				// 上游诊断，须原样交给下游。普通路由则继续尝试下一候选。
+				// 上游诊断，须原样交给下游。普通路由只对候选认证、模型失效或
+				// 临时服务错误切换，避免 400/422 参数错误误触发模型轮转。
 				directUpstream := routeName == u.ExposeAs && u.ExposeAs != ""
-				if directUpstream && resp.StatusCode != http.StatusTooManyRequests {
+				if directUpstream || !failoverEligible(resp.StatusCode) {
 					upstreamError := r.copyErrorResponse(w, resp)
 					release()
 					r.record(q.Context(), routeName, u, endpoint, resp.StatusCode, latency, streamed, attempt, Usage{Source: "unavailable"}, "client")
@@ -278,22 +279,18 @@ func (r *Router) proxy(endpoint string) http.HandlerFunc {
 
 				upstreamError := readUpstreamError(resp)
 				release()
-				kind, outcome := "client", "upstream_rejected"
-				if retryable(resp.StatusCode) {
-					kind, outcome = "upstream", "upstream_unavailable"
-					if resp.StatusCode == http.StatusTooManyRequests {
-						rateLimited = true
-						backoff := r.retryBackoff(retries + 1)
-						cooldown := maxDuration(backoff, retryAfter(resp))
-						retryDelay = maxDuration(retryDelay, cooldown)
-						r.fail(routeName, u, cooldown)
-					} else {
-						r.fail(routeName, u, cooldown(resp))
-					}
+				if resp.StatusCode == http.StatusTooManyRequests {
+					rateLimited = true
+					backoff := r.retryBackoff(retries + 1)
+					cooldown := maxDuration(backoff, retryAfter(resp))
+					retryDelay = maxDuration(retryDelay, cooldown)
+					r.fail(routeName, u, cooldown)
+				} else {
+					r.fail(routeName, u, cooldown(resp))
 				}
-				r.record(q.Context(), routeName, u, endpoint, resp.StatusCode, latency, streamed, attempt, Usage{Source: "unavailable"}, kind)
+				r.record(q.Context(), routeName, u, endpoint, resp.StatusCode, latency, streamed, attempt, Usage{Source: "unavailable"}, "upstream")
 				r.failovers.WithLabelValues(routeName, http.StatusText(resp.StatusCode)).Inc()
-				fields := failureLogFields(requestID, routeName, u, endpoint, attempt, latency, streamed, resp.StatusCode, outcome, true)
+				fields := failureLogFields(requestID, routeName, u, endpoint, attempt, latency, streamed, resp.StatusCode, "upstream_unavailable", true)
 				fields = append(fields, upstreamError.logFields(true)...)
 				r.logger.Warn(r.logMessage("upstream_attempt_finished"), eventFields("upstream_attempt_finished", fields...)...)
 				attempt++
@@ -655,8 +652,8 @@ func (r *Router) stream(w http.ResponseWriter, resp *http.Response) Usage {
 		}
 	}
 }
-func retryable(s int) bool {
-	return s == 408 || s == 425 || s == 429 || s == 500 || s == 502 || s == 503 || s == 504
+func failoverEligible(s int) bool {
+	return s == 401 || s == 403 || s == 404 || s == 408 || s == 425 || s == 429 || s == 500 || s == 502 || s == 503 || s == 504
 }
 func cooldown(resp *http.Response) time.Duration {
 	if delay := retryAfter(resp); delay > 0 {
