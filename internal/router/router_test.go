@@ -297,6 +297,7 @@ func TestCandidateConcurrencyLimitRejectsWhenQueueTimesOut(t *testing.T) {
 
 func TestRequestLogsIncludeCorrelationAndTiming(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		time.Sleep(20 * time.Millisecond)
 		_, _ = w.Write([]byte(`{"usage":{"prompt_tokens":3,"completion_tokens":4,"total_tokens":7}}`))
 	}))
 	defer upstream.Close()
@@ -334,6 +335,17 @@ func TestRequestLogsIncludeCorrelationAndTiming(t *testing.T) {
 	started := observed.FilterMessage("request_started").All()
 	if len(started) != 1 || started[0].ContextMap()["http_path"] != "/v1/chat/completions" {
 		t.Fatalf("start logs=%v", observed.All())
+	}
+	responses := observed.FilterMessage("upstream_response_received").All()
+	if len(responses) != 1 {
+		t.Fatalf("response logs=%v", observed.All())
+	}
+	responseFields := responses[0].ContextMap()
+	if responseFields["event"] != "upstream_response_received" || responseFields["request_id"] != "call-123" || responseFields["status"] != int64(http.StatusOK) {
+		t.Fatalf("response fields=%v", responseFields)
+	}
+	if elapsed, ok := responseFields["request_to_upstream_response_ms"].(int64); !ok || elapsed < 15 {
+		t.Fatalf("request-to-upstream timing=%v", responseFields["request_to_upstream_response_ms"])
 	}
 }
 

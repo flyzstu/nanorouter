@@ -255,6 +255,11 @@ func (r *Router) proxy(endpoint string) http.HandlerFunc {
 				attempt++
 				continue
 			}
+			// 收到上游响应头后立即记录下游请求到上游返回的完整等待时间，
+			// 包含请求解析、选路、排队及此前的回退耗时。
+			responseFields := requestLogFields(requestID, routeName, u, endpoint, attempt, latency, streamed, resp.StatusCode)
+			responseFields = append(responseFields, zap.Int("request_to_upstream_response_ms", int(time.Since(startedAt).Milliseconds())))
+			r.logger.Info("upstream_response_received", eventFields("upstream_response_received", responseFields...)...)
 			if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 				// expose_as 代表明确指定某个上游；此时不能用通用 503 掩盖
 				// 上游诊断，须原样交给下游。普通路由则继续尝试下一候选。
