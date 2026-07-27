@@ -7,7 +7,7 @@
 - `POST /v1/chat/completions`
 - `POST /v1/responses`（包括 SSE 原样透传）
 - `GET /v1/models`
-- 每个上游的加权轮转、429/错误冷却与 `Retry-After` 处理
+- 每个上游的加权轮转、429/错误冷却与请求内指数退避重试
 - SQLite 调用账本、Prometheus `/metrics`
 - Chat Completions 与 Responses 的非流式/流式 `usage` 采集
 - 将受支持的 Responses 请求适配至只提供 Chat Completions 的 SenseNova 上游
@@ -175,6 +175,19 @@ Model:    free-fast
 ```
 
 调用返回额外包含 `X-Nanorouter-Route`、`X-Nanorouter-Upstream` 和 `X-Nanorouter-Attempts`，可用于排障。
+
+## 429 重试与日志
+
+当某个上游返回 `429` 时，网关会先将它暂时冷却并尝试同一路由的其他候选；若一轮候选都不可用，
+网关会在**同一个下游请求**中最多重试 5 次，退避间隔依次为 1、2、4、8、16 秒。上游给出
+`Retry-After` 时，网关会采用不短于该值的等待时间。整个过程受 `request_timeout` 和客户端取消约束；
+超过重试次数后才返回 `429 upstream_rate_limited`，无需下游重复提交同一请求。
+
+每个 Chat Completions / Responses 请求会按 `request_started`、`upstream_attempt_started`、
+`upstream_attempt_finished`、`retry_scheduled`、`request_completed` 或 `request_failed` 写结构化日志，并用
+`request_id` 关联。生产环境输出 JSON；`-debug` 输出同一事件和字段的易读 `key=value` 文本。
+`request_started` 会记录方法、路径、客户端地址和普通请求 Header；`Authorization`、Cookie，以及名称含
+`key`、`token`、`secret`、`password` 的 Header 会完全省略。日志不会包含请求正文、prompt、模型回复或密钥。
 
 ## 查看用量
 

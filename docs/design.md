@@ -49,7 +49,11 @@ Agent / Open WebUI
 
 `weight: 3` 的候选在轮转序列中占三个槽位，大约承受三倍请求。`Router.mu` 保护轮转游标和冷却状态，防止并发请求同时涌向刚发生 429 的上游。
 
-收到 429/5xx 后，上游进入冷却；若响应给出 `Retry-After` 则优先服从，否则为 30 秒。这是适合单实例的轻量熔断器。多实例时各自状态不共享，下一步可迁移到 Redis。
+收到 429/5xx 后，上游进入冷却。对于 429，当前请求会先尝试其他候选；如果一轮候选都不可用，
+则在网关内最多再试 5 次，等待时间按 1、2、4、8、16 秒指数增长。`Retry-After` 会作为该次等待的
+最小值。每次重试都受整个 `request_timeout` 和客户端取消信号约束，因而不会要求下游盲目重复提交。
+其他可重试错误仍采用 30 秒冷却（有 `Retry-After` 时优先服从）。这是适合单实例的轻量熔断器；多实例时
+各自状态不共享，下一步可迁移到 Redis。
 
 ## 两种 API 与能力声明
 
@@ -89,7 +93,11 @@ SSE 首字节发给下游后不能再安全换模型：会重复文字，或破�
 
 账本不保存 prompt、回复正文或 API Key，避免用户内容和密钥落入普通运维数据库。Prometheus 用于实时请求率、失败率和 token 速率；SQLite 用于按模型汇总历史使用量。
 
-运行日志使用 Zap 的结构化 JSON。成功请求记录 `info`，可重试故障与被上游拒绝的请求记录 `warn`；字段与账本一样只含元数据，便于 Loki、Elasticsearch 或 `jq` 查询。
+运行日志使用 Zap 的结构化 JSON；`-debug` 则用相同字段输出稳定的 `key=value` 文本。每个请求以
+`request_started` 开始，随后记录 `upstream_attempt_started`、`upstream_attempt_finished` 和必要时的
+`retry_scheduled`，并以 `request_completed` 或 `request_failed` 收束。所有事件共享 `request_id`，方便
+Loki、Elasticsearch 或 `jq` 追踪。开始事件会记录安全的下游 Header，但会完全省略 Authorization、Cookie
+以及名称包含 key、token、secret、password 的 Header；日志始终不记录 prompt、回复或密钥。
 
 ## 推荐的下一步
 

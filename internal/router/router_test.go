@@ -320,23 +320,24 @@ func TestRequestLogsIncludeCorrelationAndTiming(t *testing.T) {
 	if rec.Header().Get("X-Request-ID") != "call-123" {
 		t.Fatalf("request ID header=%q", rec.Header().Get("X-Request-ID"))
 	}
-	entries := observed.All()
-	if len(entries) != 1 || entries[0].Message != "Upstream request completed" {
-		t.Fatalf("logs=%v", entries)
+	entries := observed.FilterMessage("request_completed").All()
+	if len(entries) != 1 {
+		t.Fatalf("logs=%v", observed.All())
 	}
 	fields := entries[0].ContextMap()
 	if fields["request_id"] != "call-123" || fields["outcome"] != "success" || fields["upstream_model"] != "up" {
 		t.Fatalf("fields=%v", fields)
 	}
-	if _, ok := fields["ttfb_ms"]; !ok {
-		t.Fatalf("ttfb missing: %v", fields)
+	if fields["event"] != "request_completed" || fields["attempts"] != int64(1) {
+		t.Fatalf("lifecycle fields=%v", fields)
 	}
-	if _, ok := fields["duration_ms"]; !ok {
-		t.Fatalf("duration missing: %v", fields)
+	started := observed.FilterMessage("request_started").All()
+	if len(started) != 1 || started[0].ContextMap()["http_path"] != "/v1/chat/completions" {
+		t.Fatalf("start logs=%v", observed.All())
 	}
 }
 
-func TestDebugLogIncludesUpstreamRejectionReason(t *testing.T) {
+func TestUpstreamRejectionLogIncludesReason(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusForbidden)
 		_, _ = w.Write([]byte(`{"error":{"message":"model access denied","type":"permission_error","code":"model_not_found"}}`))
@@ -350,12 +351,12 @@ func TestDebugLogIncludesUpstreamRejectionReason(t *testing.T) {
 	if err := Migrate(context.Background(), db); err != nil {
 		t.Fatal(err)
 	}
-	core, observed := observer.New(zap.DebugLevel)
-	r, err := NewWithLogger(Config{Routes: map[string]Route{"free": {Candidates: []Candidate{{ID: "u", BaseURL: upstream.URL, Model: "up"}}}}}, db, zap.New(core))
+	core, observed := observer.New(zap.InfoLevel)
+	r, err := NewWithLogger(Config{Routes: map[string]Route{"free": {Candidates: []Candidate{{ID: "u", BaseURL: upstream.URL, Model: "up", ExposeAs: "direct"}}}}}, db, zap.New(core))
 	if err != nil {
 		t.Fatal(err)
 	}
-	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"free","messages":[]}`))
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"direct","messages":[]}`))
 	rec := httptest.NewRecorder()
 	r.Handler().ServeHTTP(rec, req)
 	if rec.Code != http.StatusForbidden {
@@ -364,9 +365,9 @@ func TestDebugLogIncludesUpstreamRejectionReason(t *testing.T) {
 	if rec.Body.String() != `{"error":{"message":"model access denied","type":"permission_error","code":"model_not_found"}}` {
 		t.Fatalf("body=%s", rec.Body.String())
 	}
-	entries := observed.All()
-	if len(entries) != 1 || entries[0].Message != "Upstream request rejected" {
-		t.Fatalf("logs=%v", entries)
+	entries := observed.FilterMessage("upstream_attempt_finished").All()
+	if len(entries) != 1 {
+		t.Fatalf("logs=%v", observed.All())
 	}
 	fields := entries[0].ContextMap()
 	if fields["upstream_error_type"] != "permission_error" || fields["upstream_error_code"] != "model_not_found" || fields["upstream_error_message"] != "model access denied" {
@@ -374,12 +375,214 @@ func TestDebugLogIncludesUpstreamRejectionReason(t *testing.T) {
 	}
 }
 
-func TestUpstreamErrorMessageIsDebugOnly(t *testing.T) {
-	fields := upstreamError{Type: "permission_error", Message: "model access denied"}.logFields(false)
+func TestUpstreamErrorMessageIsIncludedInFailureLogs(t *testing.T) {
+	fields := upstreamError{Type: "permission_error", Message: "model access denied"}.logFields(true)
 	for _, field := range fields {
-		if field.Key == "upstream_error_message" {
-			t.Fatalf("message should not be logged without debug: %v", fields)
+		if field.Key == "upstream_error_message" && field.String == "model access denied" {
+			return
 		}
+	}
+	t.Fatalf("upstream error message missing: %v", fields)
+}
+
+func TestUpstreamRejectionFailsOverToNextCandidate(t *testing.T) {
+	var rejected, succeeded int
+	bad := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		rejected++
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(`{"error":{"message":"unsupported parameter","type":"invalid_request_error","code":"bad_param"}}`))
+	}))
+	defer bad.Close()
+	good := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		succeeded++
+		_, _ = w.Write([]byte(`{"usage":{"prompt_tokens":1,"completion_tokens":2,"total_tokens":3}}`))
+	}))
+	defer good.Close()
+	db, _ := sql.Open("sqlite3", ":memory:")
+	defer db.Close()
+	if err := Migrate(context.Background(), db); err != nil {
+		t.Fatal(err)
+	}
+	core, observed := observer.New(zap.InfoLevel)
+	r, err := NewWithLogger(Config{Routes: map[string]Route{"free": {Candidates: []Candidate{
+		{ID: "bad", BaseURL: bad.URL, Model: "bad"},
+		{ID: "good", BaseURL: good.URL, Model: "good"},
+	}}}}, db, zap.New(core))
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec := httptest.NewRecorder()
+	r.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"free","messages":[]}`)))
+	if rec.Code != http.StatusOK || rejected != 1 || succeeded != 1 {
+		t.Fatalf("status=%d rejected=%d succeeded=%d body=%s", rec.Code, rejected, succeeded, rec.Body.String())
+	}
+	if attempts := rec.Header().Get("X-Nanorouter-Attempts"); attempts != "2" {
+		t.Fatalf("attempts=%q", attempts)
+	}
+	entries := observed.FilterMessage("upstream_attempt_finished").All()
+	if len(entries) != 2 {
+		t.Fatalf("failover logs=%v", observed.All())
+	}
+	fields := entries[0].ContextMap()
+	if fields["status"] != int64(http.StatusBadRequest) {
+		fields = entries[1].ContextMap()
+	}
+	if fields["upstream_error_type"] != "invalid_request_error" || fields["upstream_error_code"] != "bad_param" || fields["upstream_error_message"] != "unsupported parameter" {
+		t.Fatalf("fields=%v", fields)
+	}
+}
+
+func TestRateLimitRetriesInternallyWithExponentialSchedule(t *testing.T) {
+	calls := 0
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		calls++
+		if calls < 3 {
+			w.WriteHeader(http.StatusTooManyRequests)
+			_, _ = w.Write([]byte(`{"error":{"message":"rate limited"}}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"usage":{"prompt_tokens":1,"completion_tokens":2,"total_tokens":3}}`))
+	}))
+	defer upstream.Close()
+	db, _ := sql.Open("sqlite3", ":memory:")
+	defer db.Close()
+	if err := Migrate(context.Background(), db); err != nil {
+		t.Fatal(err)
+	}
+	core, observed := observer.New(zap.InfoLevel)
+	r, err := NewWithLogger(Config{Routes: map[string]Route{"free": {Candidates: []Candidate{{ID: "limited", BaseURL: upstream.URL, Model: "up"}}}}}, db, zap.New(core))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var backoffs []int
+	r.retryBackoff = func(retry int) time.Duration {
+		backoffs = append(backoffs, retry)
+		return 0
+	}
+	rec := httptest.NewRecorder()
+	r.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"free","messages":[]}`)))
+	if rec.Code != http.StatusOK || calls != 3 {
+		t.Fatalf("status=%d calls=%d body=%s", rec.Code, calls, rec.Body.String())
+	}
+	if attempts := rec.Header().Get("X-Nanorouter-Attempts"); attempts != "3" {
+		t.Fatalf("attempts=%q", attempts)
+	}
+	if got := observed.FilterMessage("retry_scheduled").All(); len(got) != 2 || got[0].ContextMap()["retry"] != int64(1) || got[1].ContextMap()["retry"] != int64(2) {
+		t.Fatalf("retry logs=%v", got)
+	}
+	if len(backoffs) < 2 || backoffs[0] != 1 || backoffs[1] != 2 {
+		t.Fatalf("backoff schedule=%v", backoffs)
+	}
+}
+
+func TestExponentialBackoff(t *testing.T) {
+	for retry, want := range map[int]time.Duration{
+		1: time.Second,
+		2: 2 * time.Second,
+		3: 4 * time.Second,
+		4: 8 * time.Second,
+		5: 16 * time.Second,
+	} {
+		if got := exponentialBackoff(retry); got != want {
+			t.Fatalf("retry=%d backoff=%s want=%s", retry, got, want)
+		}
+	}
+}
+
+func TestRateLimitStopsAfterFiveRetries(t *testing.T) {
+	calls := 0
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		calls++
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = w.Write([]byte(`{"error":{"message":"rate limited"}}`))
+	}))
+	defer upstream.Close()
+	db, _ := sql.Open("sqlite3", ":memory:")
+	defer db.Close()
+	if err := Migrate(context.Background(), db); err != nil {
+		t.Fatal(err)
+	}
+	r, err := New(Config{Routes: map[string]Route{"free": {Candidates: []Candidate{{ID: "limited", BaseURL: upstream.URL, Model: "up"}}}}}, db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r.retryBackoff = func(int) time.Duration { return 0 }
+	rec := httptest.NewRecorder()
+	r.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"free","messages":[]}`)))
+	if rec.Code != http.StatusTooManyRequests || calls != maxRateLimitRetries+1 {
+		t.Fatalf("status=%d calls=%d body=%s", rec.Code, calls, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "upstream_rate_limited") {
+		t.Fatalf("body=%s", rec.Body.String())
+	}
+}
+
+func TestRequestStartLogOmitsSensitiveHeaders(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"id":"ok"}`))
+	}))
+	defer upstream.Close()
+	db, _ := sql.Open("sqlite3", ":memory:")
+	defer db.Close()
+	if err := Migrate(context.Background(), db); err != nil {
+		t.Fatal(err)
+	}
+	core, observed := observer.New(zap.InfoLevel)
+	r, err := NewWithLogger(Config{Routes: map[string]Route{"free": {Candidates: []Candidate{{ID: "u", BaseURL: upstream.URL, Model: "up"}}}}}, db, zap.New(core))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"free","messages":[]}`))
+	req.Header.Set("Authorization", "Bearer should-not-appear")
+	req.Header.Set("Cookie", "session=should-not-appear")
+	req.Header.Set("X-API-Key", "should-not-appear")
+	req.Header.Set("User-Agent", "nanorouter-test")
+	r.Handler().ServeHTTP(httptest.NewRecorder(), req)
+	entries := observed.FilterMessage("request_started").All()
+	if len(entries) != 1 {
+		t.Fatalf("logs=%v", observed.All())
+	}
+	headers, ok := entries[0].ContextMap()["request_headers"].(map[string][]string)
+	if !ok {
+		t.Fatalf("headers=%#v", entries[0].ContextMap()["request_headers"])
+	}
+	if _, found := headers["Authorization"]; found {
+		t.Fatalf("authorization leaked: %v", headers)
+	}
+	if _, found := headers["Cookie"]; found {
+		t.Fatalf("cookie leaked: %v", headers)
+	}
+	if _, found := headers["X-Api-Key"]; found {
+		t.Fatalf("api key leaked: %v", headers)
+	}
+	if got := headers["User-Agent"]; len(got) != 1 || got[0] != "nanorouter-test" {
+		t.Fatalf("safe header missing: %v", headers)
+	}
+}
+
+func TestExposedCandidateReturnsItsUpstreamError(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = w.Write([]byte(`{"error":{"message":"model access denied","type":"permission_error","code":"model_not_found"}}`))
+	}))
+	defer upstream.Close()
+	db, _ := sql.Open("sqlite3", ":memory:")
+	defer db.Close()
+	if err := Migrate(context.Background(), db); err != nil {
+		t.Fatal(err)
+	}
+	r, err := New(Config{Routes: map[string]Route{"pool": {Candidates: []Candidate{{ID: "only", BaseURL: upstream.URL, Model: "up", ExposeAs: "direct"}}}}}, db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec := httptest.NewRecorder()
+	r.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"direct","messages":[]}`)))
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	want := `{"error":{"message":"model access denied","type":"permission_error","code":"model_not_found"}}`
+	if got := rec.Body.String(); got != want {
+		t.Fatalf("body=%s", got)
 	}
 }
 
