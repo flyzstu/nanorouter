@@ -109,8 +109,8 @@ type Candidate struct {
 	// ResponsesViaChatCompletions 将下游 Responses 请求适配到仅支持 Chat Completions 的上游。
 	// 仅应为已验证适配能力的供应商开启，例如 SenseNova。
 	ResponsesViaChatCompletions bool `yaml:"responses_via_chat_completions"`
-	// ChatMaxTokensField 用于 Responses 降级转换。OpenAI 兼容上游通常为 max_tokens，
-	// SenseNova 原生接口使用 max_new_tokens。
+	// ChatMaxTokensField 用于 Responses 降级转换。OpenAI 兼容上游通常为 max_tokens（默认值）；
+	// 仅在上游使用非标准字段名时配置，例如旧版 SenseNova 原生接口的 max_new_tokens。
 	ChatMaxTokensField string `yaml:"chat_max_tokens_field"`
 	// ChatCompletionsPath 覆盖默认 chat/completions 路径，用于少数非标准上游。
 	ChatCompletionsPath string `yaml:"chat_completions_path"`

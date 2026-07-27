@@ -61,7 +61,7 @@ Chat Completions 与 Responses 共享选路器，但不会互相转换 schema。
 
 对于 SenseNova 这类只提供 Chat Completions 的上游，可以改用 `responses_via_chat_completions: true`。这是一个受限适配器：`input`、`instructions`、图片/文本 content part、采样参数和最大输出 token 能够映射；结果会从 SenseNova 的 `data.choices` / `data.usage` 转成 Responses 对象或 SSE 事件。工具调用、后台任务和 `previous_response_id` 没有等价表示，必须返回 400，而不能假装成功。
 
-`chat_max_tokens_field` 解决供应商参数命名差异：默认是 `max_tokens`（适用于 Agnes 一类 OpenAI Chat 兼容服务）；SenseNova 原生接口使用 `max_new_tokens`，需在候选中显式配置。`chat_completions_path` 则解决路径差异，默认 `chat/completions`，SenseNova 原生接口是 `chat-completions`。Groq 提供原生 `/responses`，应使用 `responses: true` 而不是该适配器。
+`chat_max_tokens_field` 解决供应商参数命名差异：默认是 `max_tokens`（适用于 Agnes、SenseNova 新版接口一类标准化服务）；对于少数使用非标准命名的上游（如旧版 SenseNova 原生接口的 `max_new_tokens`）需在候选中显式配置。`chat_completions_path` 则解决路径差异，默认 `chat/completions`，旧版 SenseNova 原生接口是 `chat-completions`。当前 SenseNova 已全面迁移至 `token.sensenova.cn/v1` 标准化端点，无需配置这两个字段。Groq 提供原生 `/responses`，应使用 `responses: true` 而不是该适配器。
 
 候选的 `enabled` 是运维开关：省略时默认开启，设为 `false` 时选路器跳过它；一条路由的所有候选都禁用后，该路由也不再出现在 `/v1/models`。这让你可以安全地下线失效模型，而不需要删掉配置。
 
