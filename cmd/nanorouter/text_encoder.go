@@ -35,7 +35,7 @@ func (e *textEncoder) EncodeEntry(entry zapcore.Entry, fields []zapcore.Field) (
 		field.AddTo(clone.fields)
 	}
 	buf := e.pool.Get()
-	buf.AppendString(entry.Time.Format("2006-01-02T15:04:05.000Z0700"))
+	buf.AppendString(entry.Time.Format("2006-01-02 15:04:05.000 -07:00"))
 	buf.AppendByte('\t')
 	buf.AppendString(e.level(entry.Level))
 	buf.AppendByte('\t')

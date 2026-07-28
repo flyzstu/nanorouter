@@ -462,6 +462,53 @@ func TestUpstreamErrorMessageIsIncludedInFailureLogs(t *testing.T) {
 	t.Fatalf("upstream error message missing: %v", fields)
 }
 
+func TestOpenRouterNestedErrorDetailsAreLoggedWithoutFlaggedInput(t *testing.T) {
+	body := []byte(`{
+		"error": {
+			"code": 400,
+			"message": "Provider returned error",
+			"metadata": {
+				"error_type": "invalid_request",
+				"provider_name": "NVIDIA",
+				"provider_code": "bad_parameter",
+				"param": "messages",
+				"flagged_input": "do not write this prompt",
+				"raw": "{\"error\":{\"message\":\"assistant message is invalid\",\"type\":\"invalid_request_error\",\"code\":\"invalid_messages\"}}"
+			}
+		}
+	}`)
+	fields := parseUpstreamError(body).logFields(true)
+	got := map[string]string{}
+	for _, field := range fields {
+		switch field.Key {
+		case "upstream_error_code", "upstream_error_type", "upstream_error_category", "upstream_provider", "upstream_provider_error_code", "upstream_error_param", "upstream_error_message", "upstream_error_detail":
+			got[field.Key] = field.String
+		}
+	}
+	want := map[string]string{
+		"upstream_error_code":          "400",
+		"upstream_error_type":          "invalid_request",
+		"upstream_provider":            "NVIDIA",
+		"upstream_provider_error_code": "bad_parameter",
+		"upstream_error_param":         "messages",
+		"upstream_error_message":       "Provider returned error",
+		"upstream_error_detail":        "assistant message is invalid",
+	}
+	for key, value := range want {
+		if got[key] != value {
+			t.Fatalf("%s=%q want=%q fields=%v", key, got[key], value, got)
+		}
+	}
+	if len(got) != len(want) {
+		t.Fatalf("unexpected fields=%v want=%v", got, want)
+	}
+	for _, field := range fields {
+		if strings.Contains(field.String, "do not write this prompt") {
+			t.Fatalf("flagged input leaked into logs: %v", fields)
+		}
+	}
+}
+
 func TestNonRetryableUpstreamRejectionDoesNotFailOver(t *testing.T) {
 	var rejected, succeeded int
 	bad := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {

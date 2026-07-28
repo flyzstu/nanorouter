@@ -711,9 +711,14 @@ func clone(a map[string]any) map[string]any {
 }
 
 type upstreamError struct {
-	Type    string
-	Code    string
-	Message string
+	Type         string
+	Code         string
+	Message      string
+	ErrorType    string
+	Provider     string
+	ProviderCode string
+	Param        string
+	Detail       string
 }
 
 func parseUpstreamError(body []byte) upstreamError {
@@ -737,6 +742,28 @@ func parseUpstreamError(body []byte) upstreamError {
 	} else if code, ok := payload["error_code"]; ok {
 		result.Code = fmt.Sprint(code)
 	}
+	// OpenRouter 会把供应商原始错误放进 error.metadata；只提取诊断字段，
+	// 避免 flagged_input、prompt、content 等可能含用户输入的数据进入日志。
+	if metadata, ok := data["metadata"].(map[string]any); ok {
+		result.ErrorType = stringField(metadata, "error_type")
+		result.Provider = stringField(metadata, "provider_name")
+		result.ProviderCode = scalarField(metadata, "provider_code")
+		result.Param = scalarField(metadata, "param")
+		if raw, ok := metadata["raw"].(string); ok {
+			if nested := parseUpstreamError([]byte(raw)); nested.Message != "" {
+				result.Detail = nested.Message
+				if result.ErrorType == "" {
+					result.ErrorType = nested.Type
+				}
+				if result.ProviderCode == "" {
+					result.ProviderCode = nested.Code
+				}
+				if result.Param == "" {
+					result.Param = nested.Param
+				}
+			}
+		}
+	}
 	return result
 }
 
@@ -745,17 +772,45 @@ func stringField(data map[string]any, key string) string {
 	return v
 }
 
+func scalarField(data map[string]any, key string) string {
+	switch value := data[key].(type) {
+	case string:
+		return value
+	case float64, float32, int, int64, int32, uint, uint64, uint32, bool:
+		return fmt.Sprint(value)
+	default:
+		return ""
+	}
+}
+
 func (e upstreamError) logFields(includeMessage bool) []zap.Field {
 	fields := []zap.Field{}
 	if e.Type != "" {
 		fields = append(fields, zap.String("upstream_error_type", e.Type))
+	} else if e.ErrorType != "" {
+		fields = append(fields, zap.String("upstream_error_type", e.ErrorType))
 	}
 	if e.Code != "" {
 		fields = append(fields, zap.String("upstream_error_code", e.Code))
 	}
+	if e.Type != "" && e.ErrorType != "" && e.ErrorType != e.Type {
+		fields = append(fields, zap.String("upstream_error_category", e.ErrorType))
+	}
+	if e.Provider != "" {
+		fields = append(fields, zap.String("upstream_provider", e.Provider))
+	}
+	if e.ProviderCode != "" {
+		fields = append(fields, zap.String("upstream_provider_error_code", e.ProviderCode))
+	}
+	if e.Param != "" {
+		fields = append(fields, zap.String("upstream_error_param", e.Param))
+	}
 	// 上游错误是故障切换的关键诊断信息；仍限制长度并压缩空白，避免日志膨胀。
 	if includeMessage && e.Message != "" {
 		fields = append(fields, zap.String("upstream_error_message", truncateLogMessage(e.Message)))
+	}
+	if includeMessage && e.Detail != "" && e.Detail != e.Message {
+		fields = append(fields, zap.String("upstream_error_detail", truncateLogMessage(e.Detail)))
 	}
 	return fields
 }

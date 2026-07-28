@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"time"
+	_ "time/tzdata"
 
 	_ "github.com/lib/pq"
 	"github.com/nanorouter/nanorouter/internal/router"
