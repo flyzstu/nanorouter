@@ -19,7 +19,7 @@ import (
 
 func TestConfigDuration(t *testing.T) {
 	path := t.TempDir() + "/config.yaml"
-	if err := os.WriteFile(path, []byte("request_timeout: 2s\nroutes:\n  r:\n    candidates:\n      - id: u\n        base_url: http://example.test\n        model: m\n        max_concurrency: 2\n        queue_timeout: 3s\n"), 0600); err != nil {
+	if err := os.WriteFile(path, []byte("request_timeout: 2s\nroutes:\n  r:\n    candidates:\n      - id: u\n        base_url: http://example.test\n        model: m\n        max_concurrency: 2\n        queue_timeout: 3s\n        max_tokens_limit: 65536\n"), 0600); err != nil {
 		t.Fatal(err)
 	}
 	c, err := LoadConfig(path)
@@ -30,8 +30,8 @@ func TestConfigDuration(t *testing.T) {
 		t.Fatalf("timeout=%s", c.RequestTimeout)
 	}
 	candidate := c.Routes["r"].Candidates[0]
-	if candidate.MaxConcurrency != 2 || candidate.QueueTimeout != 3*time.Second {
-		t.Fatalf("candidate limit=%d queue_timeout=%s", candidate.MaxConcurrency, candidate.QueueTimeout)
+	if candidate.MaxConcurrency != 2 || candidate.QueueTimeout != 3*time.Second || candidate.MaxTokensLimit != 65536 {
+		t.Fatalf("candidate concurrency=%d queue_timeout=%s max_tokens_limit=%d", candidate.MaxConcurrency, candidate.QueueTimeout, candidate.MaxTokensLimit)
 	}
 }
 
@@ -91,6 +91,17 @@ func TestConfigRejectsQueueTimeoutWithoutConcurrencyLimit(t *testing.T) {
 		t.Fatal(err)
 	}
 	if _, err := LoadConfig(path); err == nil || !strings.Contains(err.Error(), "queue_timeout") {
+		t.Fatalf("error=%v", err)
+	}
+}
+
+func TestConfigRejectsNegativeMaxTokensLimit(t *testing.T) {
+	path := t.TempDir() + "/config.yaml"
+	config := "routes:\n  r:\n    candidates:\n      - id: u\n        base_url: http://example.test\n        model: m\n        max_tokens_limit: -1\n"
+	if err := os.WriteFile(path, []byte(config), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadConfig(path); err == nil || !strings.Contains(err.Error(), "max_tokens_limit") {
 		t.Fatalf("error=%v", err)
 	}
 }
@@ -929,6 +940,65 @@ func TestCandidateSpecificRequestSanitization(t *testing.T) {
 	rec := httptest.NewRecorder()
 	r.Handler().ServeHTTP(rec, req)
 	if rec.Code != 200 {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestCandidateSpecificMaxTokensLimit(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var in map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&in)
+		if in["max_tokens"] != float64(65536) {
+			t.Fatalf("max_tokens=%v", in["max_tokens"])
+		}
+		_, _ = w.Write([]byte(`{"id":"ok","usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}`))
+	}))
+	defer upstream.Close()
+	db, _ := sql.Open("sqlite3", ":memory:")
+	defer db.Close()
+	if err := Migrate(context.Background(), db); err != nil {
+		t.Fatal(err)
+	}
+	candidate := Candidate{ID: "sense", BaseURL: upstream.URL, Model: "sensenova-6.7-flash-lite", MaxTokensLimit: 65536}
+	r, err := New(Config{Routes: map[string]Route{"auto": {Candidates: []Candidate{candidate}}}}, db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := `{"model":"auto","messages":[{"role":"user","content":"hi"}],"max_tokens":131072}`
+	rec := httptest.NewRecorder()
+	r.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body)))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestAdaptedResponsesUsesCandidateMaxTokensLimit(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var in map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&in)
+		if in["max_new_tokens"] != float64(65536) {
+			t.Fatalf("max_new_tokens=%v", in["max_new_tokens"])
+		}
+		_, _ = w.Write([]byte(`{"data":{"id":"sense-1","choices":[{"message":"ok","finish_reason":"stop"}]},"status":{"code":0}}`))
+	}))
+	defer upstream.Close()
+	db, _ := sql.Open("sqlite3", ":memory:")
+	defer db.Close()
+	if err := Migrate(context.Background(), db); err != nil {
+		t.Fatal(err)
+	}
+	candidate := Candidate{
+		ID: "sense", BaseURL: upstream.URL, Model: "sensenova-6.7-flash-lite",
+		ResponsesViaChatCompletions: true, ChatMaxTokensField: "max_new_tokens", MaxTokensLimit: 65536,
+	}
+	r, err := New(Config{Routes: map[string]Route{"auto": {Candidates: []Candidate{candidate}}}}, db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := `{"model":"auto","input":"hi","max_output_tokens":131072}`
+	rec := httptest.NewRecorder()
+	r.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(body)))
+	if rec.Code != http.StatusOK {
 		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
 	}
 }

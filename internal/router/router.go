@@ -71,6 +71,9 @@ func NewWithLogger(cfg Config, db *sql.DB, logger *zap.Logger) (*Router, error) 
 			if candidate.MaxConcurrency < 0 || candidate.QueueTimeout < 0 || (candidate.MaxConcurrency == 0 && candidate.QueueTimeout > 0) {
 				return nil, fmt.Errorf("route %q candidate %q has invalid concurrency limit", routeName, candidate.ID)
 			}
+			if candidate.MaxTokensLimit < 0 {
+				return nil, fmt.Errorf("route %q candidate %q has negative max_tokens_limit", routeName, candidate.ID)
+			}
 			if limit, exists := configuredLimits[candidate.ID]; exists && limit != candidate.MaxConcurrency {
 				return nil, fmt.Errorf("candidate %q has conflicting max_concurrency values", candidate.ID)
 			}
@@ -227,6 +230,10 @@ func (r *Router) proxy(endpoint string) http.HandlerFunc {
 			p, dropped := sanitizeRequest(p, u)
 			if len(dropped) > 0 {
 				r.logger.Debug(r.logMessage("request_sanitized"), eventFields("request_sanitized", zap.String("request_id", requestID), zap.String("route", routeName), zap.String("upstream", u.ID), zap.Strings("removed_fields", dropped))...)
+			}
+			p, clamped := clampRequestMaxTokens(p, u)
+			if len(clamped) > 0 {
+				r.logger.Debug(r.logMessage("request_tokens_clamped"), eventFields("request_tokens_clamped", zap.String("request_id", requestID), zap.String("route", routeName), zap.String("upstream", u.ID), zap.Strings("fields", clamped), zap.Int("max_tokens_limit", u.MaxTokensLimit))...)
 			}
 			p["model"] = u.Model
 			encoded, _ := json.Marshal(p)
@@ -455,6 +462,7 @@ func (r *Router) logMessage(event string) string {
 var chineseLogMessages = map[string]string{
 	"request_started":            "收到下游请求",
 	"request_sanitized":          "请求字段已清洗",
+	"request_tokens_clamped":     "请求 token 上限已调整",
 	"upstream_attempt_started":   "开始调用上游",
 	"upstream_response_received": "已收到上游响应",
 	"upstream_attempt_finished":  "上游调用结束",
