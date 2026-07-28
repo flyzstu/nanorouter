@@ -216,6 +216,11 @@ Model:    free-fast
 配置 `logging.format: json` 可切换为 JSON。
 `request_started` 会记录方法、路径、客户端地址和普通请求 Header；`Authorization`、Cookie，以及名称含
 `key`、`token`、`secret`、`password` 的 Header 会完全省略。日志不会包含请求正文、prompt、模型回复或密钥。
+文本日志使用 `2026-07-28 14:18:38.629 +08:00` 格式；可通过环境变量 `TZ=Asia/Shanghai`
+输出北京时间。程序已内嵌 IANA 时区数据，因此在 distroless 镜像中也无需额外挂载
+`/usr/share/zoneinfo`。JSON 日志继续使用 ISO 8601，数据库中的请求时间仍统一保存为 UTC。
+上游拒绝请求时，日志会提取错误消息及 OpenRouter `metadata` 中的错误类别、供应商、供应商错误码和参数；
+可能包含用户输入的 `flagged_input`、prompt、content 以及未解析的原始响应不会写入日志，完整错误体仍透明返回下游。
 
 ## 查看用量
 

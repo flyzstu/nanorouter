@@ -16,6 +16,9 @@ func TestTextEncoderUsesKeyValueFields(t *testing.T) {
 		t.Fatal(err)
 	}
 	got := buf.String()
+	if !strings.HasPrefix(got, "2026-07-15 21:52:16.000 +08:00\t") {
+		t.Fatalf("human-readable timestamp missing: %q", got)
+	}
 	if !strings.Contains(got, "\tINFO\tUpstream request completed route=\"auto\" status=200\n") {
 		t.Fatalf("log=%q", got)
 	}

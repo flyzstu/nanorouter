@@ -8,6 +8,7 @@ logging:
   level: INFO
   format: text
   color: true
+# 日志时区通过进程环境变量 TZ 控制，例如 TZ=Asia/Shanghai；数据库时间始终保存为 UTC。
 # 设定后，下游需使用 Authorization: Bearer $NANOROUTER_API_KEY。
 auth_env: NANOROUTER_API_KEY
 request_timeout: 90s
