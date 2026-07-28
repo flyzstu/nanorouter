@@ -159,15 +159,22 @@ SenseNova 目前推荐使用 `token.sensenova.cn/v1` 端点，该端点为标准
   api_key_env: SENSENOVA_API_KEY
   model: sensenova-6.7-flash-lite
   responses_via_chat_completions: true
+  max_tokens_limit: 65536
 
 - id: sensenova-deepseek-v4-flash
   base_url: https://token.sensenova.cn/v1
   api_key_env: SENSENOVA_API_KEY
   model: deepseek-v4-flash
   responses_via_chat_completions: true
+  max_tokens_limit: 65536
 ```
 
 两个模型均支持 `reasoning_effort`（`"low"` / `"medium"` / `"high"` / `"none"`）。DeepSeek V4 Flash 思考模式下响应中会额外包含 `reasoning_content` 字段（推理过程），网关直接透传给下游。
+
+`max_tokens_limit` 会在选中候选后，把 Chat Completions 的 `max_tokens` /
+`max_completion_tokens`、Responses 的 `max_output_tokens`，以及适配器生成的自定义 token
+字段约束到 `[1, limit]`。因此 SenseNova 不会再因下游请求超过 `65536`（或传入 `0`）而返回
+`field MaxTokens invalid`，同时原始值仍可供故障切换到限制不同的其他候选使用。
 
 若路由中同时存在不支持 `reasoning_effort` 的其他候选（如 Groq、Agnes、Mistral、Cerebras），应在那些候选上配置 `drop_request_fields: [reasoning_effort]`。清洗在选中候选后不影响故障转移时其他候选接收该字段的能力。
 

@@ -162,6 +162,9 @@ type Candidate struct {
 	// 仅删除已确认不支持且允许降级的字段，不应放入 model、messages 等必需字段。
 	DropRequestFields []string `yaml:"drop_request_fields"`
 	DropMessageFields []string `yaml:"drop_message_fields"`
+	// MaxTokensLimit 将候选收到的最大输出 token 参数约束到 [1, limit]。
+	// 该改写在选中候选后执行，不会改变故障切换时其他候选收到的原始值。
+	MaxTokensLimit int `yaml:"max_tokens_limit"`
 	// Enabled 未配置时默认为 true；设置为 false 会立即从路由候选中排除。
 	Enabled *bool `yaml:"enabled"`
 	// MaxConcurrency 限制此候选同时在途的请求数；0 表示不限制。
@@ -211,6 +214,9 @@ func LoadConfig(path string) (Config, error) {
 			}
 			if u.MaxConcurrency < 0 {
 				return c, fmt.Errorf("candidate %q in route %q has negative max_concurrency", u.ID, name)
+			}
+			if u.MaxTokensLimit < 0 {
+				return c, fmt.Errorf("candidate %q in route %q has negative max_tokens_limit", u.ID, name)
 			}
 			if u.QueueTimeout < 0 {
 				return c, fmt.Errorf("candidate %q in route %q has negative queue_timeout", u.ID, name)

@@ -114,6 +114,8 @@ routes:
         weight: 1
         enabled: true
         responses_via_chat_completions: true
+        # SenseNova 要求最大输出 token 位于 [1, 65536]；过大或为 0 时按候选独立调整。
+        max_tokens_limit: 65536
 
       # DeepSeek V4 Flash：与 Flash-Lite 共享端点与认证，默认启用思考模式。
       # reasoning_content 字段在思考模式下随响应透传给下游，无需网关处理。
@@ -125,6 +127,7 @@ routes:
         weight: 1
         enabled: true
         responses_via_chat_completions: true
+        max_tokens_limit: 65536
 
       # Agnes 2.0 Flash 只公开 Chat Completions；对下游 Responses 请求使用适配器。
       - id: agnes-flash
