@@ -3,6 +3,7 @@ package router
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -599,6 +600,126 @@ func TestServerErrorFailsOverToNextCandidate(t *testing.T) {
 	}
 	if attempts := rec.Header().Get("X-Nanorouter-Attempts"); attempts != "2" {
 		t.Fatalf("attempts=%q", attempts)
+	}
+}
+
+func TestSessionAffinityPinsRequestsToCandidate(t *testing.T) {
+	first := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"id":"first"}`))
+	}))
+	defer first.Close()
+	second := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"id":"second"}`))
+	}))
+	defer second.Close()
+	db, _ := sql.Open("sqlite3", ":memory:")
+	defer db.Close()
+	if err := Migrate(context.Background(), db); err != nil {
+		t.Fatal(err)
+	}
+	r, err := New(Config{Routes: map[string]Route{"auto": {Candidates: []Candidate{
+		{ID: "first", BaseURL: first.URL, Model: "first"},
+		{ID: "second", BaseURL: second.URL, Model: "second"},
+	}}}}, db)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var pinned string
+	for i := 0; i < 5; i++ {
+		req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"auto","messages":[]}`))
+		req.Header.Set(sessionAffinityHeader, "session-123")
+		rec := httptest.NewRecorder()
+		r.Handler().ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("request %d status=%d body=%s", i, rec.Code, rec.Body.String())
+		}
+		selected := rec.Header().Get("X-Nanorouter-Upstream")
+		if i == 0 {
+			pinned = selected
+		} else if selected != pinned {
+			t.Fatalf("request %d selected %q, want pinned upstream %q", i, selected, pinned)
+		}
+	}
+}
+
+func TestMissingSessionAffinityUsesWeightedRoundRobin(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"id":"ok"}`))
+	}))
+	defer upstream.Close()
+	db, _ := sql.Open("sqlite3", ":memory:")
+	defer db.Close()
+	if err := Migrate(context.Background(), db); err != nil {
+		t.Fatal(err)
+	}
+	r, err := New(Config{Routes: map[string]Route{"auto": {Candidates: []Candidate{
+		{ID: "first", BaseURL: upstream.URL, Model: "first"},
+		{ID: "second", BaseURL: upstream.URL, Model: "second"},
+	}}}}, db)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	selected := make([]string, 0, 2)
+	for _, affinity := range []string{"", "   "} {
+		req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"auto","messages":[]}`))
+		if affinity != "" {
+			req.Header.Set(sessionAffinityHeader, affinity)
+		}
+		rec := httptest.NewRecorder()
+		r.Handler().ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("affinity %q status=%d body=%s", affinity, rec.Code, rec.Body.String())
+		}
+		selected = append(selected, rec.Header().Get("X-Nanorouter-Upstream"))
+	}
+	if selected[0] != "first" || selected[1] != "second" {
+		t.Fatalf("selected=%v, want weighted round robin", selected)
+	}
+}
+
+func TestSessionAffinityAllowsFailover(t *testing.T) {
+	var failed, succeeded int
+	bad := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		failed++
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer bad.Close()
+	good := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		succeeded++
+		_, _ = w.Write([]byte(`{"id":"ok"}`))
+	}))
+	defer good.Close()
+	db, _ := sql.Open("sqlite3", ":memory:")
+	defer db.Close()
+	if err := Migrate(context.Background(), db); err != nil {
+		t.Fatal(err)
+	}
+	r, err := New(Config{Routes: map[string]Route{"auto": {Candidates: []Candidate{
+		{ID: "bad", BaseURL: bad.URL, Model: "bad"},
+		{ID: "good", BaseURL: good.URL, Model: "good"},
+	}}}}, db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	affinity := ""
+	for i := 0; ; i++ {
+		candidate := fmt.Sprintf("session-%d", i)
+		if affinitySlot("auto", candidate, 2) == 0 {
+			affinity = candidate
+			break
+		}
+	}
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"auto","messages":[]}`))
+	req.Header.Set(sessionAffinityHeader, affinity)
+	rec := httptest.NewRecorder()
+	r.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK || failed != 1 || succeeded != 1 {
+		t.Fatalf("status=%d failed=%d succeeded=%d body=%s", rec.Code, failed, succeeded, rec.Body.String())
+	}
+	if rec.Header().Get("X-Nanorouter-Attempts") != "2" {
+		t.Fatalf("attempts=%q", rec.Header().Get("X-Nanorouter-Attempts"))
 	}
 }
 

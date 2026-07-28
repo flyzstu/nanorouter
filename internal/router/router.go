@@ -8,6 +8,7 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"fmt"
+	"hash/fnv"
 	"io"
 	"net/http"
 	"os"
@@ -28,6 +29,7 @@ const maxRequestBody = 16 << 20
 const maxUpstreamErrorBody = 8 << 10
 const maxUpstreamErrorMessage = 512
 const maxRateLimitRetries = 5
+const sessionAffinityHeader = "X-Session-Affinity"
 
 type Router struct {
 	cfg          Config
@@ -163,6 +165,7 @@ func (r *Router) proxy(endpoint string) http.HandlerFunc {
 			return
 		}
 		streamed, _ := payload["stream"].(bool)
+		sessionAffinity := strings.TrimSpace(q.Header.Get(sessionAffinityHeader))
 		ctx, cancelRequest := context.WithTimeout(q.Context(), r.cfg.RequestTimeout)
 		defer cancelRequest()
 		concurrencyLimited := false
@@ -174,7 +177,7 @@ func (r *Router) proxy(endpoint string) http.HandlerFunc {
 		// 只修改 model 字段，其他 OpenAI/Responses 字段透明保留，
 		// 因而 tools、图片、response_format 等新字段不需要网关逐一适配。
 		for {
-			u, ok := r.pick(routeName, route, endpoint, attempted)
+			u, ok := r.pick(routeName, route, endpoint, attempted, sessionAffinity)
 			if !ok {
 				if rateLimited && retries < maxRateLimitRetries {
 					retries++
@@ -537,7 +540,7 @@ func (r *Router) do(ctx context.Context, u Candidate, endpoint string, body []by
 	}
 	return r.client.Do(req)
 }
-func (r *Router) pick(name string, route Route, endpoint string, excluded map[string]bool) (Candidate, bool) {
+func (r *Router) pick(name string, route Route, endpoint string, excluded map[string]bool, sessionAffinity string) (Candidate, bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	// 将权重展开为候选槽位，例如 weight=3 的上游在轮转序列中占三个槽位。
@@ -560,9 +563,22 @@ func (r *Router) pick(name string, route Route, endpoint string, excluded map[st
 	if len(eligible) == 0 {
 		return Candidate{}, false
 	}
+	if sessionAffinity != "" {
+		// 下游提供会话键时使用稳定哈希，同一会话在候选集合不变时固定到同一上游。
+		// 候选冷却或本次请求已尝试失败时，eligible 会变化，从而仍可故障切换。
+		return eligible[affinitySlot(name, sessionAffinity, len(eligible))], true
+	}
 	u := eligible[r.next[name]%len(eligible)]
 	r.next[name]++
 	return u, true
+}
+
+func affinitySlot(routeName, sessionAffinity string, slots int) int {
+	h := fnv.New64a()
+	_, _ = h.Write([]byte(routeName))
+	_, _ = h.Write([]byte{0})
+	_, _ = h.Write([]byte(sessionAffinity))
+	return int(h.Sum64() % uint64(slots))
 }
 
 func hasEnabledCandidate(route Route) bool {
