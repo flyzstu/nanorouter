@@ -70,7 +70,7 @@ Chat Completions 与 Responses 共享选路器，但不会互相转换 schema。
 
 `chat_max_tokens_field` 解决供应商参数命名差异：默认是 `max_tokens`（适用于 Agnes、SenseNova 新版接口一类标准化服务）；对于少数使用非标准命名的上游（如旧版 SenseNova 原生接口的 `max_new_tokens`）需在候选中显式配置。`chat_completions_path` 则解决路径差异，默认 `chat/completions`，旧版 SenseNova 原生接口是 `chat-completions`。当前 SenseNova 已全面迁移至 `token.sensenova.cn/v1` 标准化端点，无需配置这两个字段。Groq 提供原生 `/responses`，应使用 `responses: true` 而不是该适配器。
 
-候选的 `enabled` 是运维开关：省略时默认开启，设为 `false` 时选路器跳过它；一条路由的所有候选都禁用后，该路由也不再出现在 `/v1/models`。这让你可以安全地下线失效模型，而不需要删掉配置。
+候选的 `enabled` 是总运维开关：省略时默认开启，设为 `false` 时聚合路由和 `expose_as` 入口都会跳过它。`aggregate_enabled` 是独立的聚合开关，省略时默认开启；设为 `false` 后候选不参与父路由的轮转与故障切换，但仍可通过 `expose_as` 直接访问。父路由没有任何已启用且参与聚合的候选时，不会出现在 `/v1/models`，但其中已启用的公开候选仍会单独列出。
 
 Cerebras `gpt-oss-120b` 与 Mistral 一样使用原生 Chat Completions 加 Responses 适配的组合。它的普通 Chat 路径可保留工具调用与结构化输出；若下游一定需要完整的 Responses 工具/状态语义，应优先路由到 Groq 或 OpenRouter 的原生 Responses 候选。
 
@@ -103,8 +103,9 @@ SSE 首字节发给下游后不能再安全换模型：会重复文字，或破�
 运行日志使用 Zap 的结构化 JSON；`-debug` 则用相同字段输出稳定的 `key=value` 文本。每个请求以
 `request_started` 开始，随后记录 `upstream_attempt_started`、`upstream_attempt_finished` 和必要时的
 `retry_scheduled`，并以 `request_completed` 或 `request_failed` 收束。所有事件共享 `request_id`，方便
-Loki、Elasticsearch 或 `jq` 追踪。开始事件会记录安全的下游 Header，但会完全省略 Authorization、Cookie
-以及名称包含 key、token、secret、password 的 Header；日志始终不记录 prompt、回复或密钥。
+Loki、Elasticsearch 或 `jq` 追踪。开始事件将客户端 IP、User-Agent、请求体大小和会话亲和键是否存在
+记录为扁平字段，不输出完整 Header map 或会话键值；日志始终不记录 Authorization、Cookie、prompt、
+回复或密钥。
 
 ## 推荐的下一步
 

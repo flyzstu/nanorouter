@@ -63,6 +63,8 @@ routes:
         api_key_env: ZHIPUAI_API_KEY
         model: "<智谱实际模型 ID，例如 glm-5.1>"
         expose_as: zhipu-glm
+        # 可设为 false，使候选只通过 expose_as 开放而不参与 free-fast。
+        aggregate_enabled: true
         weight: 1
         responses_via_chat_completions: true
         enabled: true

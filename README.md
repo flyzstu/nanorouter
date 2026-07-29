@@ -196,7 +196,7 @@ OpenCode 会向部分 OpenAI 兼容上游发送 `promptCacheKey`。智谱候选�
 
 ## 公开单个候选
 
-候选配置 `expose_as` 后，仍会参与其父路由（如 `free-fast`）的加权和故障切换，但也会以该值作为独立模型 ID 出现在 `GET /v1/models`。例如 `expose_as: agnes-flash` 后，下游可用 `model: agnes-flash` 直接选择 Agnes，不会切换到 `free-fast` 的其他候选。公开 ID 必须在全局唯一，且不能与顶层路由同名；候选禁用后该 ID 会从模型列表中隐藏。
+候选配置 `expose_as` 后，默认仍会参与其父路由（如 `free-fast`）的加权和故障切换，但也会以该值作为独立模型 ID 出现在 `GET /v1/models`。例如 `expose_as: agnes-flash` 后，下游可用 `model: agnes-flash` 直接选择 Agnes，不会切换到 `free-fast` 的其他候选。设置 `aggregate_enabled: false` 可让候选只通过 `expose_as` 开放，而不进入父路由；`enabled: false` 仍会将两种入口一起关闭。公开 ID 必须在全局唯一，且不能与顶层路由同名。如果父路由没有任何已启用且参与聚合的候选，它也不会出现在模型列表中。
 
 不会自动改写语义性参数：例如 Groq 的 `n` 只支持 `1`，如果下游传 `n > 1`，网关会让 Groq 返回明确错误，而不是静默篡改成单个候选。
 
@@ -230,8 +230,9 @@ Model:    free-fast
 `upstream_response_received`、`upstream_attempt_finished`、`retry_scheduled`、`request_completed`
 或 `request_failed` 写结构化日志，并用 `request_id` 关联。默认输出带颜色的 `key=value` 文本；
 配置 `logging.format: json` 可切换为 JSON。
-`request_started` 会记录方法、路径、客户端地址和普通请求 Header；`Authorization`、Cookie，以及名称含
-`key`、`token`、`secret`、`password` 的 Header 会完全省略。日志不会包含请求正文、prompt、模型回复或密钥。
+`request_started` 会以扁平字段记录方法、路径、直连地址、转发链首个客户端 IP、User-Agent、请求体大小，
+以及是否提供会话亲和键；不会输出完整 Header map，也不会记录会话键的值。日志不会包含 Authorization、
+Cookie、请求正文、prompt、模型回复或密钥。
 文本日志使用 `2026-07-28 14:18:38.629 +08:00` 格式；可通过环境变量 `TZ=Asia/Shanghai`
 输出北京时间。程序已内嵌 IANA 时区数据，因此在 distroless 镜像中也无需额外挂载
 `/usr/share/zoneinfo`。JSON 日志继续使用 ISO 8601，数据库中的请求时间仍统一保存为 UTC。

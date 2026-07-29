@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"hash/fnv"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"sort"
@@ -120,7 +121,7 @@ func (r *Router) auth(next http.Handler) http.Handler {
 func (r *Router) models(w http.ResponseWriter, q *http.Request) {
 	modelIDs := make([]string, 0, len(r.cfg.Routes))
 	for name, route := range r.cfg.Routes {
-		if hasEnabledCandidate(route) {
+		if hasEnabledAggregateCandidate(route) {
 			modelIDs = append(modelIDs, name)
 		}
 		for _, candidate := range route.Candidates {
@@ -381,6 +382,14 @@ func (r *Router) acquire(ctx context.Context, u Candidate) (func(), bool) {
 // 让下游可绕过加权/故障切换池，直接选择特定上游。
 func (r *Router) routeForModel(name string) (Route, bool) {
 	if route, ok := r.cfg.Routes[name]; ok {
+		// 顶层模型只包含参与聚合的候选；expose_as 的单候选路由不受此开关影响。
+		candidates := make([]Candidate, 0, len(route.Candidates))
+		for _, candidate := range route.Candidates {
+			if candidate.IsAggregateEnabled() {
+				candidates = append(candidates, candidate)
+			}
+		}
+		route.Candidates = candidates
 		return route, true
 	}
 	for _, route := range r.cfg.Routes {
@@ -410,15 +419,41 @@ func requestLogFields(requestID, route string, u Candidate, endpoint string, att
 
 // requestStartLogFields 仅记录可安全公开的下游元数据；请求正文与认证信息绝不写入日志。
 func requestStartLogFields(q *http.Request, requestID, endpoint string) []zap.Field {
-	return []zap.Field{
+	fields := []zap.Field{
 		zap.String("request_id", requestID),
 		zap.String("endpoint", endpoint),
 		zap.String("http_method", q.Method),
 		zap.String("http_path", q.URL.Path),
 		zap.String("remote_addr", q.RemoteAddr),
 		zap.Int64("request_content_length", q.ContentLength),
-		zap.Any("request_headers", sanitizeLogHeaders(q.Header)),
 	}
+	if clientIP := requestClientIP(q); clientIP != "" {
+		fields = append(fields, zap.String("client_ip", clientIP))
+	}
+	if userAgent := strings.TrimSpace(q.UserAgent()); userAgent != "" {
+		fields = append(fields, zap.String("user_agent", truncateLogMessage(userAgent)))
+	}
+	if strings.TrimSpace(q.Header.Get(sessionAffinityHeader)) != "" {
+		// 会话键可能用于关联用户行为，只记录是否存在，不记录其实际内容。
+		fields = append(fields, zap.Bool("session_affinity", true))
+	}
+	return fields
+}
+
+func requestClientIP(q *http.Request) string {
+	if forwarded := q.Header.Get("X-Forwarded-For"); forwarded != "" {
+		if clientIP := strings.TrimSpace(strings.Split(forwarded, ",")[0]); clientIP != "" {
+			return truncateLogMessage(clientIP)
+		}
+	}
+	if realIP := strings.TrimSpace(q.Header.Get("X-Real-IP")); realIP != "" {
+		return truncateLogMessage(realIP)
+	}
+	host, _, err := net.SplitHostPort(q.RemoteAddr)
+	if err == nil {
+		return host
+	}
+	return truncateLogMessage(strings.TrimSpace(q.RemoteAddr))
 }
 
 func requestOutcomeLogFields(requestID, route, endpoint string, streamed bool, attempts int, duration time.Duration) []zap.Field {
@@ -478,32 +513,6 @@ func eventFields(event string, fields ...zap.Field) []zap.Field {
 	return append([]zap.Field{zap.String("event", event)}, fields...)
 }
 
-func sanitizeLogHeaders(headers http.Header) map[string][]string {
-	result := make(map[string][]string, len(headers))
-	for name, values := range headers {
-		if isSensitiveHeader(name) {
-			continue
-		}
-		result[name] = make([]string, 0, len(values))
-		for _, value := range values {
-			result[name] = append(result[name], truncateLogMessage(value))
-		}
-	}
-	return result
-}
-
-func isSensitiveHeader(name string) bool {
-	name = strings.ToLower(name)
-	if name == "authorization" || name == "proxy-authorization" || name == "cookie" || name == "set-cookie" {
-		return true
-	}
-	for _, marker := range []string{"key", "token", "secret", "password"} {
-		if strings.Contains(name, marker) {
-			return true
-		}
-	}
-	return false
-}
 func failureLogFields(requestID, route string, u Candidate, endpoint string, attempt, ttfb int, streamed bool, status int, outcome string, retryable bool) []zap.Field {
 	fields := requestLogFields(requestID, route, u, endpoint, attempt, ttfb, streamed, status)
 	return append(fields, zap.String("outcome", outcome), zap.Bool("retryable", retryable))
@@ -581,9 +590,9 @@ func affinitySlot(routeName, sessionAffinity string, slots int) int {
 	return int(h.Sum64() % uint64(slots))
 }
 
-func hasEnabledCandidate(route Route) bool {
+func hasEnabledAggregateCandidate(route Route) bool {
 	for _, candidate := range route.Candidates {
-		if candidate.IsEnabled() {
+		if candidate.IsEnabled() && candidate.IsAggregateEnabled() {
 			return true
 		}
 	}

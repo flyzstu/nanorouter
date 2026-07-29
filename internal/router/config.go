@@ -167,6 +167,9 @@ type Candidate struct {
 	MaxTokensLimit int `yaml:"max_tokens_limit"`
 	// Enabled 未配置时默认为 true；设置为 false 会立即从路由候选中排除。
 	Enabled *bool `yaml:"enabled"`
+	// AggregateEnabled 控制候选是否参与父路由的轮转与故障切换。
+	// 未配置时默认为 true；设为 false 后仍可通过 expose_as 直接访问。
+	AggregateEnabled *bool `yaml:"aggregate_enabled"`
 	// MaxConcurrency 限制此候选同时在途的请求数；0 表示不限制。
 	MaxConcurrency int `yaml:"max_concurrency"`
 	// QueueTimeout 是候选已满时等待空闲槽位的最长时间；0 表示不排队，立即拒绝。
@@ -175,6 +178,10 @@ type Candidate struct {
 }
 
 func (c Candidate) IsEnabled() bool { return c.Enabled == nil || *c.Enabled }
+
+func (c Candidate) IsAggregateEnabled() bool {
+	return c.AggregateEnabled == nil || *c.AggregateEnabled
+}
 
 func LoadConfig(path string) (Config, error) {
 	b, err := os.ReadFile(path)

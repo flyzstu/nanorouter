@@ -36,6 +36,25 @@ func TestConfigDuration(t *testing.T) {
 	}
 }
 
+func TestConfigAggregateEnabled(t *testing.T) {
+	path := t.TempDir() + "/config.yaml"
+	config := "routes:\n  r:\n    candidates:\n      - id: u\n        base_url: http://example.test\n        model: m\n        expose_as: direct-u\n        aggregate_enabled: false\n"
+	if err := os.WriteFile(path, []byte(config), 0600); err != nil {
+		t.Fatal(err)
+	}
+	c, err := LoadConfig(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	candidate := c.Routes["r"].Candidates[0]
+	if candidate.IsAggregateEnabled() {
+		t.Fatal("aggregate_enabled=false was not loaded")
+	}
+	if !candidate.IsEnabled() {
+		t.Fatal("candidate should remain enabled when enabled is omitted")
+	}
+}
+
 func TestConfigLoggingOptions(t *testing.T) {
 	path := t.TempDir() + "/config.yaml"
 	config := "logging:\n  language: zh\n  level: warn\nroutes:\n  r:\n    candidates:\n      - id: u\n        base_url: http://example.test\n        model: m\n"
@@ -844,7 +863,7 @@ func TestRateLimitStopsAfterFiveRetries(t *testing.T) {
 	}
 }
 
-func TestRequestStartLogOmitsSensitiveHeaders(t *testing.T) {
+func TestRequestStartLogUsesReadableClientMetadata(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = w.Write([]byte(`{"id":"ok"}`))
 	}))
@@ -864,26 +883,32 @@ func TestRequestStartLogOmitsSensitiveHeaders(t *testing.T) {
 	req.Header.Set("Cookie", "session=should-not-appear")
 	req.Header.Set("X-API-Key", "should-not-appear")
 	req.Header.Set("User-Agent", "nanorouter-test")
+	req.Header.Set("X-Forwarded-For", "203.0.113.8, 10.0.0.2")
+	req.Header.Set("X-Real-IP", "10.0.0.3")
+	req.Header.Set("X-Session-Affinity", "should-not-appear")
 	r.Handler().ServeHTTP(httptest.NewRecorder(), req)
 	entries := observed.FilterMessage("request_started").All()
 	if len(entries) != 1 {
 		t.Fatalf("logs=%v", observed.All())
 	}
-	headers, ok := entries[0].ContextMap()["request_headers"].(map[string][]string)
-	if !ok {
-		t.Fatalf("headers=%#v", entries[0].ContextMap()["request_headers"])
+	fields := entries[0].ContextMap()
+	if _, found := fields["request_headers"]; found {
+		t.Fatalf("request header map should not be logged: %v", fields)
 	}
-	if _, found := headers["Authorization"]; found {
-		t.Fatalf("authorization leaked: %v", headers)
+	if fields["client_ip"] != "203.0.113.8" {
+		t.Fatalf("client_ip=%v", fields["client_ip"])
 	}
-	if _, found := headers["Cookie"]; found {
-		t.Fatalf("cookie leaked: %v", headers)
+	if fields["user_agent"] != "nanorouter-test" {
+		t.Fatalf("user_agent=%v", fields["user_agent"])
 	}
-	if _, found := headers["X-Api-Key"]; found {
-		t.Fatalf("api key leaked: %v", headers)
+	if fields["session_affinity"] != true {
+		t.Fatalf("session_affinity=%v", fields["session_affinity"])
 	}
-	if got := headers["User-Agent"]; len(got) != 1 || got[0] != "nanorouter-test" {
-		t.Fatalf("safe header missing: %v", headers)
+	encoded := fmt.Sprint(fields)
+	for _, secret := range []string{"should-not-appear", "Bearer"} {
+		if strings.Contains(encoded, secret) {
+			t.Fatalf("sensitive value %q leaked: %v", secret, fields)
+		}
 	}
 }
 
@@ -1204,6 +1229,81 @@ func TestExposedCandidateIsListedAndRoutable(t *testing.T) {
 	}
 	if route := rec.Header().Get("X-Nanorouter-Route"); route != "agnes-flash" {
 		t.Fatalf("route=%q", route)
+	}
+}
+
+func TestAggregateDisabledCandidateIsOnlyRoutableThroughExposeAs(t *testing.T) {
+	aggregateEnabled := false
+	var pooledRequests, directRequests int
+	pooled := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		pooledRequests++
+		_, _ = w.Write([]byte(`{"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}`))
+	}))
+	defer pooled.Close()
+	direct := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		directRequests++
+		_, _ = w.Write([]byte(`{"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}`))
+	}))
+	defer direct.Close()
+	db, _ := sql.Open("sqlite3", ":memory:")
+	defer db.Close()
+	if err := Migrate(context.Background(), db); err != nil {
+		t.Fatal(err)
+	}
+	exposeOnly := Candidate{
+		ID:               "direct",
+		BaseURL:          direct.URL,
+		Model:            "direct-upstream",
+		ExposeAs:         "direct-model",
+		AggregateEnabled: &aggregateEnabled,
+	}
+	r, err := New(Config{Routes: map[string]Route{
+		"free": {
+			Candidates: []Candidate{
+				{ID: "pooled", BaseURL: pooled.URL, Model: "pooled-upstream"},
+				exposeOnly,
+			},
+		},
+		"expose-only-parent": {Candidates: []Candidate{{
+			ID:               "sole-direct",
+			BaseURL:          direct.URL,
+			Model:            "direct-upstream",
+			ExposeAs:         "sole-direct-model",
+			AggregateEnabled: &aggregateEnabled,
+		}}},
+	}}, db)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	models := httptest.NewRecorder()
+	r.Handler().ServeHTTP(models, httptest.NewRequest(http.MethodGet, "/v1/models", nil))
+	if !strings.Contains(models.Body.String(), `"id":"free"`) ||
+		!strings.Contains(models.Body.String(), `"id":"direct-model"`) {
+		t.Fatalf("expected aggregate and exposed models: %s", models.Body.String())
+	}
+	if strings.Contains(models.Body.String(), `"id":"expose-only-parent"`) {
+		t.Fatalf("empty aggregate route leaked: %s", models.Body.String())
+	}
+
+	pooledRequest := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"free","messages":[]}`))
+	pooledResponse := httptest.NewRecorder()
+	r.Handler().ServeHTTP(pooledResponse, pooledRequest)
+	if pooledResponse.Code != http.StatusOK {
+		t.Fatalf("pooled status=%d body=%s", pooledResponse.Code, pooledResponse.Body.String())
+	}
+	if pooledRequests != 1 || directRequests != 0 {
+		t.Fatalf("after pooled request: pooled=%d direct=%d", pooledRequests, directRequests)
+	}
+
+	directRequest := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"direct-model","messages":[]}`))
+	directResponse := httptest.NewRecorder()
+	r.Handler().ServeHTTP(directResponse, directRequest)
+	if directResponse.Code != http.StatusOK {
+		t.Fatalf("direct status=%d body=%s", directResponse.Code, directResponse.Body.String())
+	}
+	if pooledRequests != 1 || directRequests != 1 {
+		t.Fatalf("after direct request: pooled=%d direct=%d", pooledRequests, directRequests)
 	}
 }
 
