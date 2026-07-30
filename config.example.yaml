@@ -140,6 +140,7 @@ routes:
         weight: 1
         responses_via_chat_completions: true
         enabled: true
+        max_tokens_limit: 65536
         # reasoning_effort 为 token.sensenova.cn 特有字段，Agnes 不支持。
         drop_request_fields:
           - reasoning_effort
