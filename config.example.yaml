@@ -111,6 +111,11 @@ routes:
         weight: 3
         responses: true
         enabled: true
+        # 候选级配置覆盖全局 retry；expose_as 入口只重试自身。
+        retry:
+          max_retries: 5
+          base_delay: 2s
+          max_delay: 30s
       - id: groq-qwen
         base_url: https://api.groq.com/openai/v1
         api_key_env: GROQ_API_KEY
@@ -145,6 +150,10 @@ routes:
         weight: 1
         enabled: true
         responses_via_chat_completions: true
+        retry:
+          max_retries: 2
+          base_delay: 500ms
+          max_delay: 4s
         # SenseNova 要求最大输出 token 位于 [1, 65536]；过大或为 0 时按候选独立调整。
         max_tokens_limit: 65536
 

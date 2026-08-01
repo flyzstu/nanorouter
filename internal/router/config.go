@@ -58,6 +58,53 @@ type RetryConfig struct {
 	MaxDelay            time.Duration `yaml:"max_delay"`
 }
 
+// CandidateRetryConfig 覆盖单个候选的内部重试策略。未配置字段继承全局 retry；
+// expose_as 入口只会按此策略重试当前候选，不会切换到父路由的其他候选。
+type CandidateRetryConfig struct {
+	Enabled    *bool         `yaml:"enabled"`
+	MaxRetries *int          `yaml:"max_retries"`
+	BaseDelay  time.Duration `yaml:"base_delay"`
+	MaxDelay   time.Duration `yaml:"max_delay"`
+}
+
+type candidateRetryPolicy struct {
+	MaxRetries int
+	BaseDelay  time.Duration
+	MaxDelay   time.Duration
+	CustomWait bool
+}
+
+func (c CandidateRetryConfig) resolve(global RetryConfig) (candidateRetryPolicy, error) {
+	policy := candidateRetryPolicy{
+		MaxRetries: *global.MaxRateLimitRetries,
+		BaseDelay:  global.BaseDelay,
+		MaxDelay:   global.MaxDelay,
+		CustomWait: c.BaseDelay != 0 || c.MaxDelay != 0,
+	}
+	if c.MaxRetries != nil {
+		policy.MaxRetries = *c.MaxRetries
+	}
+	if c.BaseDelay != 0 {
+		policy.BaseDelay = c.BaseDelay
+	}
+	if c.MaxDelay != 0 {
+		policy.MaxDelay = c.MaxDelay
+	}
+	if c.Enabled != nil && !*c.Enabled {
+		policy.MaxRetries = 0
+	}
+	if policy.MaxRetries < 0 {
+		return policy, fmt.Errorf("max_retries must not be negative")
+	}
+	if c.BaseDelay < 0 || c.MaxDelay < 0 {
+		return policy, fmt.Errorf("retry delays must not be negative")
+	}
+	if policy.MaxDelay < policy.BaseDelay {
+		return policy, fmt.Errorf("max_delay must be at least base_delay")
+	}
+	return policy, nil
+}
+
 func (c *RetryConfig) normalize() error {
 	if c.MaxRateLimitRetries == nil {
 		defaultRetries := maxRateLimitRetries
@@ -300,6 +347,8 @@ type Candidate struct {
 	AdaptiveConcurrency bool          `yaml:"adaptive_concurrency"`
 	MinConcurrency      int           `yaml:"min_concurrency"`
 	TargetTTFB          time.Duration `yaml:"target_ttfb"`
+	// Retry 覆盖全局内部重试参数；默认仅重试 429/502/503/504。
+	Retry CandidateRetryConfig `yaml:"retry"`
 }
 
 func (c Candidate) IsEnabled() bool { return c.Enabled == nil || *c.Enabled }
@@ -359,6 +408,9 @@ func LoadConfig(path string) (Config, error) {
 			}
 			if u.MaxTokensLimit < 0 {
 				return c, fmt.Errorf("candidate %q in route %q has negative max_tokens_limit", u.ID, name)
+			}
+			if _, err := u.Retry.resolve(c.Retry); err != nil {
+				return c, fmt.Errorf("candidate %q in route %q has invalid retry settings: %w", u.ID, name, err)
 			}
 			if u.QueueTimeout < 0 {
 				return c, fmt.Errorf("candidate %q in route %q has negative queue_timeout", u.ID, name)

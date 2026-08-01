@@ -61,7 +61,6 @@ type Router struct {
 	logger            *zap.Logger
 	retryBackoff      func(int) time.Duration
 	retryWait         func(context.Context, time.Duration) bool
-	maxRetries        int
 }
 
 // state 是单个上游的熔断状态。冷却期内不再向它发送新请求，
@@ -99,7 +98,7 @@ func NewWithLogger(cfg Config, db *sql.DB, logger *zap.Logger) (*Router, error) 
 	if logger == nil {
 		logger = zap.NewNop()
 	}
-	r := &Router{cfg: cfg, db: NewStoreWithConfig(db, cfg.Database), client: newUpstreamHTTPClient(), states: map[string]*state{}, limiters: map[string]*candidateLimiter{}, admission: newAdmissionController(cfg.Backpressure), retryBudgets: map[string]*retryBudget{}, next: map[string]int{}, registry: prometheus.NewRegistry(), logger: logger, retryWait: waitForRetry, maxRetries: *cfg.Retry.MaxRateLimitRetries}
+	r := &Router{cfg: cfg, db: NewStoreWithConfig(db, cfg.Database), client: newUpstreamHTTPClient(), states: map[string]*state{}, limiters: map[string]*candidateLimiter{}, admission: newAdmissionController(cfg.Backpressure), retryBudgets: map[string]*retryBudget{}, next: map[string]int{}, registry: prometheus.NewRegistry(), logger: logger, retryWait: waitForRetry}
 	r.retryBackoff = func(retry int) time.Duration {
 		return jitteredExponentialBackoff(retry, cfg.Retry.BaseDelay, cfg.Retry.MaxDelay)
 	}
@@ -107,6 +106,11 @@ func NewWithLogger(cfg Config, db *sql.DB, logger *zap.Logger) (*Router, error) 
 	for routeName, route := range cfg.Routes {
 		if budget := newRetryBudget(route.RetryBudget); budget != nil {
 			r.retryBudgets[routeName] = budget
+			for _, candidate := range route.Candidates {
+				if candidate.ExposeAs != "" {
+					r.retryBudgets[candidate.ExposeAs] = newRetryBudget(route.RetryBudget)
+				}
+			}
 		}
 		for _, candidate := range route.Candidates {
 			if candidate.MaxConcurrency < 0 || candidate.QueueTimeout < 0 || candidate.AttemptTimeout < 0 || (candidate.MaxConcurrency == 0 && candidate.QueueTimeout > 0) {
@@ -117,6 +121,9 @@ func NewWithLogger(cfg Config, db *sql.DB, logger *zap.Logger) (*Router, error) 
 			}
 			if candidate.MaxTokensLimit < 0 {
 				return nil, fmt.Errorf("route %q candidate %q has negative max_tokens_limit", routeName, candidate.ID)
+			}
+			if _, err := candidate.Retry.resolve(cfg.Retry); err != nil {
+				return nil, fmt.Errorf("route %q candidate %q has invalid retry settings: %w", routeName, candidate.ID, err)
 			}
 			if configured, exists := configuredLimits[candidate.ID]; exists && (configured.MaxConcurrency != candidate.MaxConcurrency || configured.AdaptiveConcurrency != candidate.AdaptiveConcurrency || configured.MinConcurrency != candidate.MinConcurrency || configured.TargetTTFB != candidate.TargetTTFB) {
 				return nil, fmt.Errorf("candidate %q has conflicting concurrency settings", candidate.ID)
@@ -283,32 +290,35 @@ func (r *Router) proxy(endpoint string) http.HandlerFunc {
 		}
 		concurrencyLimited := false
 		rateLimited := false
-		var retryAt time.Time
 		retries := 0
 		attempt := 0
 		upstreamAttempts := 0
 		attempted := make(map[string]bool, len(route.Candidates))
+		var retryCounts map[string]int
+		var pendingRetries map[string]pendingCandidateRetry
 		// 只修改 model 字段，其他 OpenAI/Responses 字段透明保留，
 		// 因而 tools、图片、response_format 等新字段不需要网关逐一适配。
 		for {
 			u, ok := r.pick(routeName, route, endpoint, attempted, sessionAffinity)
 			if !ok {
-				if rateLimited && retries < r.maxRetries {
-					retries++
-					delay := time.Until(retryAt)
-					if retryAt.IsZero() || delay < 0 {
+				if pending, retryable := earliestPendingRetry(pendingRetries); retryable {
+					delay := time.Until(pending.At)
+					if delay < 0 {
 						delay = 0
 					}
+					retries++
 					if r.logger.Core().Enabled(zap.WarnLevel) {
 						retryFields := append(requestOutcomeLogFields(requestID, routeName, endpoint, streamed, attempt, time.Since(startedAt)),
 							zap.Int("retry", retries),
-							zap.Int("max_retries", r.maxRetries),
+							zap.Int("candidate_retry", pending.Number),
+							zap.Int("max_retries", pending.Policy.MaxRetries),
 							zap.Int("retry_delay_ms", int(delay.Milliseconds())),
-							zap.String("retry_reason", "upstream_rate_limit"),
+							zap.String("retry_reason", http.StatusText(pending.Status)),
+							zap.String("upstream", pending.Candidate.ID),
 						)
 						r.logger.Warn(r.logMessage("retry_scheduled"), eventFields("retry_scheduled", retryFields...)...)
 					}
-					r.retryWaits.WithLabelValues(routeName, endpoint, "upstream_rate_limit").Observe(delay.Seconds())
+					r.retryWaits.WithLabelValues(routeName, endpoint, fmt.Sprint(pending.Status)).Observe(delay.Seconds())
 					if !r.retryWait(ctx, delay) {
 						if q.Context().Err() != nil {
 							r.logRequestFailed(requestID, endpoint, routeName, streamed, 499, attempt, time.Since(startedAt), "client_canceled")
@@ -318,8 +328,12 @@ func (r *Router) proxy(endpoint string) http.HandlerFunc {
 						r.logRequestFailed(requestID, endpoint, routeName, streamed, http.StatusGatewayTimeout, attempt, time.Since(startedAt), "retry_timeout")
 						return
 					}
-					attempted = make(map[string]bool, len(route.Candidates))
-					retryAt = time.Time{}
+					delete(attempted, pending.Candidate.ID)
+					delete(pendingRetries, pending.Candidate.ID)
+					if retryCounts == nil {
+						retryCounts = make(map[string]int, 1)
+					}
+					retryCounts[pending.Candidate.ID] = pending.Number
 					continue
 				}
 				if rateLimited {
@@ -450,16 +464,14 @@ func (r *Router) proxy(endpoint string) http.HandlerFunc {
 			}
 			if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 				// expose_as 代表明确指定某个上游；此时不能用通用 503 掩盖
-				// 上游诊断，须原样交给下游。普通路由只对候选认证、模型失效或
-				// 临时服务错误切换，避免 400/422 参数错误误触发模型轮转。
+				// 上游诊断；只有明确配置允许的临时状态才原地重试该候选。
+				// 普通路由仍先切换其他候选，避免重试拖慢健康上游的接管。
 				directUpstream := routeName == u.ExposeAs && u.ExposeAs != ""
-				if directUpstream || !failoverEligible(resp.StatusCode) {
+				policy, _ := u.Retry.resolve(r.cfg.Retry)
+				candidateRetry := internalRetryEligible(resp.StatusCode) && retryCounts[u.ID] < policy.MaxRetries
+				if (directUpstream && !candidateRetry) || !failoverEligible(resp.StatusCode) {
 					if failoverEligible(resp.StatusCode) {
-						if resp.StatusCode == http.StatusTooManyRequests {
-							r.failUntil(u, time.Now().Add(maxDuration(r.retryBackoff(retries+1), retryAfter(resp))))
-						} else {
-							r.fail(routeName, u, cooldown(resp))
-						}
+						r.fail(routeName, u, cooldown(resp))
 					} else {
 						r.success(u)
 					}
@@ -481,13 +493,17 @@ func (r *Router) proxy(endpoint string) http.HandlerFunc {
 				release()
 				if resp.StatusCode == http.StatusTooManyRequests {
 					rateLimited = true
-					backoff := r.retryBackoff(retries + 1)
-					cooldown := maxDuration(backoff, retryAfter(resp))
-					candidateRetryAt := time.Now().Add(cooldown)
-					if retryAt.IsZero() || candidateRetryAt.Before(retryAt) {
-						retryAt = candidateRetryAt
+				}
+				if candidateRetry {
+					number := retryCounts[u.ID] + 1
+					delay := r.candidateRetryDelay(policy, number)
+					delay = maxDuration(delay, retryAfter(resp))
+					retryAt := time.Now().Add(delay)
+					if pendingRetries == nil {
+						pendingRetries = make(map[string]pendingCandidateRetry, 1)
 					}
-					r.failUntil(u, candidateRetryAt)
+					pendingRetries[u.ID] = pendingCandidateRetry{Candidate: u, At: retryAt, Number: number, Status: resp.StatusCode, Policy: policy}
+					r.failUntil(u, retryAt)
 				} else {
 					r.fail(routeName, u, cooldown(resp))
 				}
@@ -957,6 +973,38 @@ func (r *Router) stream(w http.ResponseWriter, resp *http.Response) (Usage, erro
 func failoverEligible(s int) bool {
 	return s == 401 || s == 403 || s == 404 || s == 408 || s == 425 || s == 429 || s == 500 || s == 502 || s == 503 || s == 504
 }
+
+func internalRetryEligible(status int) bool {
+	return status == http.StatusTooManyRequests || status == http.StatusBadGateway || status == http.StatusServiceUnavailable || status == http.StatusGatewayTimeout
+}
+
+type pendingCandidateRetry struct {
+	Candidate Candidate
+	At        time.Time
+	Number    int
+	Status    int
+	Policy    candidateRetryPolicy
+}
+
+func earliestPendingRetry(pending map[string]pendingCandidateRetry) (pendingCandidateRetry, bool) {
+	var earliest pendingCandidateRetry
+	found := false
+	for _, retry := range pending {
+		if !found || retry.At.Before(earliest.At) {
+			earliest = retry
+			found = true
+		}
+	}
+	return earliest, found
+}
+
+func (r *Router) candidateRetryDelay(policy candidateRetryPolicy, retry int) time.Duration {
+	if !policy.CustomWait {
+		return r.retryBackoff(retry)
+	}
+	return jitteredExponentialBackoff(retry, policy.BaseDelay, policy.MaxDelay)
+}
+
 func cooldown(resp *http.Response) time.Duration {
 	if delay := retryAfter(resp); delay > 0 {
 		return delay

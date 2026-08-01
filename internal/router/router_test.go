@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -39,7 +40,7 @@ func TestConfigDuration(t *testing.T) {
 
 func TestConfigAdvancedReliabilityOptions(t *testing.T) {
 	path := t.TempDir() + "/config.yaml"
-	config := "database:\n  driver: sqlite\n  dsn: ':memory:'\n  async_write: true\n  batch_size: 8\n  queue_size: 32\n  flush_interval: 20ms\nprofiling:\n  enabled: true\nbackpressure:\n  max_inflight: 100\n  max_queue: 20\n  queue_timeout: 250ms\nroutes:\n  r:\n    retry_budget:\n      enabled: true\n      ratio: 0.2\n      burst: 5\n    candidates:\n      - id: u\n        base_url: http://example.test\n        model: m\n        max_concurrency: 10\n        min_concurrency: 2\n        adaptive_concurrency: true\n        target_ttfb: 500ms\n        attempt_timeout: 3s\n"
+	config := "database:\n  driver: sqlite\n  dsn: ':memory:'\n  async_write: true\n  batch_size: 8\n  queue_size: 32\n  flush_interval: 20ms\nprofiling:\n  enabled: true\nbackpressure:\n  max_inflight: 100\n  max_queue: 20\n  queue_timeout: 250ms\nroutes:\n  r:\n    retry_budget:\n      enabled: true\n      ratio: 0.2\n      burst: 5\n    candidates:\n      - id: u\n        base_url: http://example.test\n        model: m\n        max_concurrency: 10\n        min_concurrency: 2\n        adaptive_concurrency: true\n        target_ttfb: 500ms\n        attempt_timeout: 3s\n        retry:\n          enabled: true\n          max_retries: 2\n          base_delay: 500ms\n          max_delay: 3s\n"
 	if err := os.WriteFile(path, []byte(config), 0600); err != nil {
 		t.Fatal(err)
 	}
@@ -59,6 +60,9 @@ func TestConfigAdvancedReliabilityOptions(t *testing.T) {
 	}
 	if !u.AdaptiveConcurrency || u.MinConcurrency != 2 || u.TargetTTFB != 500*time.Millisecond || u.AttemptTimeout != 3*time.Second {
 		t.Fatalf("candidate=%+v", u)
+	}
+	if u.Retry.Enabled == nil || !*u.Retry.Enabled || u.Retry.MaxRetries == nil || *u.Retry.MaxRetries != 2 || u.Retry.BaseDelay != 500*time.Millisecond || u.Retry.MaxDelay != 3*time.Second {
+		t.Fatalf("candidate retry=%+v", u.Retry)
 	}
 }
 
@@ -913,7 +917,9 @@ func TestCandidateAttemptTimeoutFailsOver(t *testing.T) {
 }
 
 func TestCandidateAttemptTimeoutTerminatesAdaptedSSE(t *testing.T) {
+	var calls atomic.Int64
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		calls.Add(1)
 		w.Header().Set("Content-Type", "text/event-stream")
 		_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{\"content\":\"partial\"},\"finish_reason\":null}]}\n\n"))
 		if flush, ok := w.(http.Flusher); ok {
@@ -944,6 +950,9 @@ func TestCandidateAttemptTimeoutTerminatesAdaptedSSE(t *testing.T) {
 	}
 	if elapsed := time.Since(started); elapsed > 150*time.Millisecond {
 		t.Fatalf("stream timeout took %s", elapsed)
+	}
+	if calls.Load() != 1 {
+		t.Fatalf("streaming request retried after downstream bytes: calls=%d", calls.Load())
 	}
 }
 
@@ -1287,7 +1296,7 @@ func TestExposedCandidateReturnsItsUpstreamError(t *testing.T) {
 	}
 }
 
-func TestExposedCandidateDoesNotRetryRateLimit(t *testing.T) {
+func TestExposedCandidateCanDisableRateLimitRetry(t *testing.T) {
 	calls := 0
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		calls++
@@ -1300,7 +1309,8 @@ func TestExposedCandidateDoesNotRetryRateLimit(t *testing.T) {
 	if err := Migrate(context.Background(), db); err != nil {
 		t.Fatal(err)
 	}
-	r, err := New(Config{Routes: map[string]Route{"pool": {Candidates: []Candidate{{ID: "only", BaseURL: upstream.URL, Model: "up", ExposeAs: "direct"}}}}}, db)
+	disabled := false
+	r, err := New(Config{Routes: map[string]Route{"pool": {Candidates: []Candidate{{ID: "only", BaseURL: upstream.URL, Model: "up", ExposeAs: "direct", Retry: CandidateRetryConfig{Enabled: &disabled}}}}}}, db)
 	if err != nil {
 		t.Fatal(err)
 	}

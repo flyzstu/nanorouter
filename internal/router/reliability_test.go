@@ -72,6 +72,20 @@ func TestReliabilityConfigRejectsInvalidSettings(t *testing.T) {
 			t.Fatalf("retry budget accepted: %+v", cfg)
 		}
 	}
+	global := RetryConfig{}
+	if err := global.normalize(); err != nil {
+		t.Fatal(err)
+	}
+	negative := -1
+	for _, cfg := range []CandidateRetryConfig{
+		{MaxRetries: &negative},
+		{BaseDelay: 2 * time.Second, MaxDelay: time.Second},
+		{BaseDelay: -time.Second},
+	} {
+		if _, err := cfg.resolve(global); err == nil {
+			t.Fatalf("candidate retry accepted: %+v", cfg)
+		}
+	}
 }
 
 func TestRetryBudgetBoundsAttemptAmplification(t *testing.T) {
@@ -189,5 +203,184 @@ func TestRouteRetryBudgetStopsExtraUpstreamAttempt(t *testing.T) {
 	r.Handler().ServeHTTP(metrics, httptest.NewRequest(http.MethodGet, "/metrics", nil))
 	if !strings.Contains(metrics.Body.String(), `nanorouter_retry_budget_denied_total{route="free"} 1`) {
 		t.Fatalf("retry budget metric missing:\n%s", metrics.Body.String())
+	}
+}
+
+func TestExposedCandidateUsesIndependentRetryPolicy(t *testing.T) {
+	var directCalls, otherCalls atomic.Int64
+	direct := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		call := directCalls.Add(1)
+		if call <= 2 {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_, _ = w.Write([]byte(`{"error":{"message":"temporary"}}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}`))
+	}))
+	defer direct.Close()
+	other := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		otherCalls.Add(1)
+		_, _ = w.Write([]byte(`{"id":"other"}`))
+	}))
+	defer other.Close()
+	db, _ := sql.Open("sqlite3", ":memory:")
+	defer db.Close()
+	if err := Migrate(context.Background(), db); err != nil {
+		t.Fatal(err)
+	}
+	maxRetries := 2
+	r, err := New(Config{Routes: map[string]Route{
+		"pool": {Candidates: []Candidate{
+			{ID: "direct", BaseURL: direct.URL, Model: "direct-up", ExposeAs: "direct-model", Retry: CandidateRetryConfig{MaxRetries: &maxRetries, BaseDelay: 5 * time.Second, MaxDelay: 5 * time.Second}},
+			{ID: "other", BaseURL: other.URL, Model: "other-up"},
+		}},
+	}}, db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var waits []time.Duration
+	r.retryWait = func(_ context.Context, delay time.Duration) bool {
+		waits = append(waits, delay)
+		r.mu.Lock()
+		r.states["direct"].until = time.Time{}
+		r.mu.Unlock()
+		return true
+	}
+	rec := httptest.NewRecorder()
+	r.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"direct-model","messages":[]}`)))
+	if rec.Code != http.StatusOK || directCalls.Load() != 3 || otherCalls.Load() != 0 {
+		t.Fatalf("status=%d direct=%d other=%d body=%s", rec.Code, directCalls.Load(), otherCalls.Load(), rec.Body.String())
+	}
+	if len(waits) != 2 {
+		t.Fatalf("waits=%v", waits)
+	}
+	for _, delay := range waits {
+		if delay < 2400*time.Millisecond || delay > 5*time.Second {
+			t.Fatalf("candidate delay=%s, want equal jitter in [2.5s, 5s]", delay)
+		}
+	}
+}
+
+func TestExposedCandidateRetryAfterOverridesCandidateDelay(t *testing.T) {
+	var calls atomic.Int64
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		if calls.Add(1) == 1 {
+			w.Header().Set("Retry-After", "7")
+			w.WriteHeader(http.StatusTooManyRequests)
+			return
+		}
+		_, _ = w.Write([]byte(`{"id":"ok"}`))
+	}))
+	defer upstream.Close()
+	db, _ := sql.Open("sqlite3", ":memory:")
+	defer db.Close()
+	if err := Migrate(context.Background(), db); err != nil {
+		t.Fatal(err)
+	}
+	maxRetries := 1
+	r, err := New(Config{Routes: map[string]Route{"pool": {Candidates: []Candidate{{
+		ID: "direct", BaseURL: upstream.URL, Model: "up", ExposeAs: "direct", Retry: CandidateRetryConfig{MaxRetries: &maxRetries, BaseDelay: time.Second, MaxDelay: time.Second},
+	}}}}}, db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var waited time.Duration
+	r.retryWait = func(_ context.Context, delay time.Duration) bool {
+		waited = delay
+		r.mu.Lock()
+		r.states["direct"].until = time.Time{}
+		r.mu.Unlock()
+		return true
+	}
+	rec := httptest.NewRecorder()
+	r.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"direct","messages":[]}`)))
+	if rec.Code != http.StatusOK || calls.Load() != 2 {
+		t.Fatalf("status=%d calls=%d body=%s", rec.Code, calls.Load(), rec.Body.String())
+	}
+	if waited < 6900*time.Millisecond || waited > 7*time.Second {
+		t.Fatalf("waited=%s, want Retry-After near 7s", waited)
+	}
+}
+
+func TestExposedCandidateDoesNotRetryStatus500(t *testing.T) {
+	var calls atomic.Int64
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		calls.Add(1)
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = w.Write([]byte(`{"error":{"message":"failed"}}`))
+	}))
+	defer upstream.Close()
+	db, _ := sql.Open("sqlite3", ":memory:")
+	defer db.Close()
+	if err := Migrate(context.Background(), db); err != nil {
+		t.Fatal(err)
+	}
+	r, err := New(Config{Routes: map[string]Route{"pool": {Candidates: []Candidate{{ID: "direct", BaseURL: upstream.URL, Model: "up", ExposeAs: "direct"}}}}}, db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec := httptest.NewRecorder()
+	r.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"direct","messages":[]}`)))
+	if rec.Code != http.StatusInternalServerError || calls.Load() != 1 {
+		t.Fatalf("status=%d calls=%d body=%s", rec.Code, calls.Load(), rec.Body.String())
+	}
+}
+
+func TestExposedCandidateInheritsGlobalRetry(t *testing.T) {
+	var calls atomic.Int64
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		if calls.Add(1) == 1 {
+			w.WriteHeader(http.StatusBadGateway)
+			return
+		}
+		_, _ = w.Write([]byte(`{"id":"ok"}`))
+	}))
+	defer upstream.Close()
+	db, _ := sql.Open("sqlite3", ":memory:")
+	defer db.Close()
+	if err := Migrate(context.Background(), db); err != nil {
+		t.Fatal(err)
+	}
+	maxRetries := 1
+	r, err := New(Config{
+		Retry:  RetryConfig{MaxRateLimitRetries: &maxRetries},
+		Routes: map[string]Route{"pool": {Candidates: []Candidate{{ID: "direct", BaseURL: upstream.URL, Model: "up", ExposeAs: "direct"}}}},
+	}, db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r.retryBackoff = func(int) time.Duration { return 0 }
+	rec := httptest.NewRecorder()
+	r.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"direct","messages":[]}`)))
+	if rec.Code != http.StatusOK || calls.Load() != 2 {
+		t.Fatalf("status=%d calls=%d body=%s", rec.Code, calls.Load(), rec.Body.String())
+	}
+}
+
+func TestExposedCandidateRetryUsesParentBudget(t *testing.T) {
+	var calls atomic.Int64
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		calls.Add(1)
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer upstream.Close()
+	db, _ := sql.Open("sqlite3", ":memory:")
+	defer db.Close()
+	if err := Migrate(context.Background(), db); err != nil {
+		t.Fatal(err)
+	}
+	maxRetries := 2
+	r, err := New(Config{Routes: map[string]Route{"pool": {
+		RetryBudget: RetryBudgetConfig{Enabled: true, Ratio: 0.01, Burst: 1},
+		Candidates:  []Candidate{{ID: "direct", BaseURL: upstream.URL, Model: "up", ExposeAs: "direct", Retry: CandidateRetryConfig{MaxRetries: &maxRetries}}},
+	}}}, db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r.retryBackoff = func(int) time.Duration { return 0 }
+	rec := httptest.NewRecorder()
+	r.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"direct","messages":[]}`)))
+	if rec.Code != http.StatusTooManyRequests || !strings.Contains(rec.Body.String(), "retry_budget_exhausted") || calls.Load() != 2 {
+		t.Fatalf("status=%d calls=%d body=%s", rec.Code, calls.Load(), rec.Body.String())
 	}
 }
