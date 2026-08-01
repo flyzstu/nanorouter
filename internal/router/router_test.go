@@ -3,6 +3,7 @@ package router
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -33,6 +34,57 @@ func TestConfigDuration(t *testing.T) {
 	candidate := c.Routes["r"].Candidates[0]
 	if candidate.MaxConcurrency != 2 || candidate.QueueTimeout != 3*time.Second || candidate.MaxTokensLimit != 65536 {
 		t.Fatalf("candidate concurrency=%d queue_timeout=%s max_tokens_limit=%d", candidate.MaxConcurrency, candidate.QueueTimeout, candidate.MaxTokensLimit)
+	}
+}
+
+func TestConfigAdvancedReliabilityOptions(t *testing.T) {
+	path := t.TempDir() + "/config.yaml"
+	config := "database:\n  driver: sqlite\n  dsn: ':memory:'\n  async_write: true\n  batch_size: 8\n  queue_size: 32\n  flush_interval: 20ms\nprofiling:\n  enabled: true\nbackpressure:\n  max_inflight: 100\n  max_queue: 20\n  queue_timeout: 250ms\nroutes:\n  r:\n    retry_budget:\n      enabled: true\n      ratio: 0.2\n      burst: 5\n    candidates:\n      - id: u\n        base_url: http://example.test\n        model: m\n        max_concurrency: 10\n        min_concurrency: 2\n        adaptive_concurrency: true\n        target_ttfb: 500ms\n        attempt_timeout: 3s\n"
+	if err := os.WriteFile(path, []byte(config), 0600); err != nil {
+		t.Fatal(err)
+	}
+	c, err := LoadConfig(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	u := c.Routes["r"].Candidates[0]
+	if !c.Database.AsyncWrite || c.Database.BatchSize != 8 || c.Database.QueueSize != 32 || c.Database.FlushInterval != 20*time.Millisecond || !c.Profiling.Enabled {
+		t.Fatalf("database/profiling=%+v %+v", c.Database, c.Profiling)
+	}
+	if c.Backpressure.MaxInflight != 100 || c.Backpressure.MaxQueue != 20 || c.Backpressure.QueueTimeout != 250*time.Millisecond {
+		t.Fatalf("backpressure=%+v", c.Backpressure)
+	}
+	if budget := c.Routes["r"].RetryBudget; !budget.Enabled || budget.Ratio != 0.2 || budget.Burst != 5 {
+		t.Fatalf("retry budget=%+v", budget)
+	}
+	if !u.AdaptiveConcurrency || u.MinConcurrency != 2 || u.TargetTTFB != 500*time.Millisecond || u.AttemptTimeout != 3*time.Second {
+		t.Fatalf("candidate=%+v", u)
+	}
+}
+
+func TestConfigRetryOptions(t *testing.T) {
+	path := t.TempDir() + "/config.yaml"
+	config := "retry:\n  max_rate_limit_retries: 0\n  base_delay: 250ms\n  max_delay: 2s\nroutes:\n  r:\n    candidates:\n      - id: u\n        base_url: http://example.test\n        model: m\n"
+	if err := os.WriteFile(path, []byte(config), 0600); err != nil {
+		t.Fatal(err)
+	}
+	c, err := LoadConfig(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Retry.MaxRateLimitRetries == nil || *c.Retry.MaxRateLimitRetries != 0 || c.Retry.BaseDelay != 250*time.Millisecond || c.Retry.MaxDelay != 2*time.Second {
+		t.Fatalf("retry=%+v", c.Retry)
+	}
+}
+
+func TestConfigRejectsInvalidRetryOptions(t *testing.T) {
+	path := t.TempDir() + "/config.yaml"
+	config := "retry:\n  max_rate_limit_retries: -1\n  base_delay: 2s\n  max_delay: 1s\nroutes:\n  r:\n    candidates:\n      - id: u\n        base_url: http://example.test\n        model: m\n"
+	if err := os.WriteFile(path, []byte(config), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadConfig(path); err == nil || !strings.Contains(err.Error(), "retry") {
+		t.Fatalf("error=%v", err)
 	}
 }
 
@@ -821,6 +873,165 @@ func TestRateLimitRetriesInternallyWithExponentialSchedule(t *testing.T) {
 	}
 }
 
+func TestCandidateAttemptTimeoutFailsOver(t *testing.T) {
+	slow := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		select {
+		case <-req.Context().Done():
+		case <-time.After(200 * time.Millisecond):
+		}
+	}))
+	defer slow.Close()
+	good := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"id":"ok","usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}`))
+	}))
+	defer good.Close()
+	db, _ := sql.Open("sqlite3", ":memory:")
+	defer db.Close()
+	if err := Migrate(context.Background(), db); err != nil {
+		t.Fatal(err)
+	}
+	r, err := New(Config{RequestTimeout: time.Second, Routes: map[string]Route{"free": {Candidates: []Candidate{
+		{ID: "slow", BaseURL: slow.URL, Model: "slow", AttemptTimeout: 20 * time.Millisecond},
+		{ID: "good", BaseURL: good.URL, Model: "good", AttemptTimeout: 200 * time.Millisecond},
+	}}}}, db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	started := time.Now()
+	rec := httptest.NewRecorder()
+	r.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"free","messages":[]}`)))
+	if rec.Code != http.StatusOK || rec.Header().Get("X-Nanorouter-Upstream") != "good" || rec.Header().Get("X-Nanorouter-Attempts") != "2" {
+		t.Fatalf("status=%d headers=%#v body=%s", rec.Code, rec.Header(), rec.Body.String())
+	}
+	if elapsed := time.Since(started); elapsed > 500*time.Millisecond {
+		t.Fatalf("failover took %s", elapsed)
+	}
+	var kind string
+	if err := db.QueryRow(`SELECT error_kind FROM llm_requests WHERE upstream_id = 'slow'`).Scan(&kind); err != nil || kind != "attempt_timeout" {
+		t.Fatalf("error_kind=%q err=%v", kind, err)
+	}
+}
+
+func TestCandidateAttemptTimeoutTerminatesAdaptedSSE(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{\"content\":\"partial\"},\"finish_reason\":null}]}\n\n"))
+		if flush, ok := w.(http.Flusher); ok {
+			flush.Flush()
+		}
+		select {
+		case <-req.Context().Done():
+		case <-time.After(200 * time.Millisecond):
+		}
+	}))
+	defer upstream.Close()
+	db, _ := sql.Open("sqlite3", ":memory:")
+	defer db.Close()
+	if err := Migrate(context.Background(), db); err != nil {
+		t.Fatal(err)
+	}
+	r, err := New(Config{RequestTimeout: time.Second, Routes: map[string]Route{"free": {Candidates: []Candidate{{
+		ID: "slow-stream", BaseURL: upstream.URL, Model: "up", ResponsesViaChatCompletions: true, AttemptTimeout: 20 * time.Millisecond,
+	}}}}}, db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	started := time.Now()
+	rec := httptest.NewRecorder()
+	r.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"free","input":"hello","stream":true}`)))
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `"delta":"partial"`) || !strings.Contains(rec.Body.String(), "event: error") {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if elapsed := time.Since(started); elapsed > 150*time.Millisecond {
+		t.Fatalf("stream timeout took %s", elapsed)
+	}
+}
+
+func TestHalfOpenCircuitAllowsSingleProbe(t *testing.T) {
+	r := &Router{states: map[string]*state{"recovering": {until: time.Now().Add(-time.Second), failures: 2}}, next: map[string]int{}}
+	route := Route{Candidates: []Candidate{{ID: "recovering"}}}
+	probe, ok := r.pick("route", route, "chat_completions", nil, "")
+	if !ok || probe.ID != "recovering" {
+		t.Fatalf("probe=%#v ok=%v", probe, ok)
+	}
+	if _, ok := r.pick("route", route, "chat_completions", nil, ""); ok {
+		t.Fatal("second concurrent half-open probe should be rejected")
+	}
+	r.success(probe)
+	if _, ok := r.pick("route", route, "chat_completions", nil, ""); !ok {
+		t.Fatal("successful probe should close the circuit")
+	}
+}
+
+func TestAdaptiveLimiterAIMD(t *testing.T) {
+	limiter := newCandidateLimiter(Candidate{MaxConcurrency: 8, MinConcurrency: 2, AdaptiveConcurrency: true, TargetTTFB: 100 * time.Millisecond})
+	if got := limiter.currentLimit(); got != 2 {
+		t.Fatalf("initial limit=%d", got)
+	}
+	if got := limiter.observe(http.StatusOK, 50*time.Millisecond, true); got != 2 {
+		t.Fatalf("limit after one success=%d", got)
+	}
+	if got := limiter.observe(http.StatusOK, 50*time.Millisecond, true); got != 3 {
+		t.Fatalf("additive increase limit=%d", got)
+	}
+	if got := limiter.observe(http.StatusTooManyRequests, 10*time.Millisecond, true); got != 2 {
+		t.Fatalf("multiplicative decrease limit=%d", got)
+	}
+	for i := 0; i < 5; i++ {
+		if got := limiter.observe(http.StatusTooManyRequests, 10*time.Millisecond, true); got < 2 {
+			t.Fatalf("limit fell below minimum: %d", got)
+		}
+	}
+}
+
+func TestAsyncSQLiteStoreFlushesOnClose(t *testing.T) {
+	db, _ := sql.Open("sqlite3", ":memory:")
+	defer db.Close()
+	if err := Migrate(context.Background(), db); err != nil {
+		t.Fatal(err)
+	}
+	store := NewStoreWithConfig(db, DatabaseConfig{Driver: "sqlite", AsyncWrite: true, BatchSize: 4, QueueSize: 32, FlushInterval: time.Hour})
+	for i := 0; i < 11; i++ {
+		if err := store.Insert(context.Background(), Record{ID: fmt.Sprintf("async-%d", i), Route: "r", UpstreamID: "u", UpstreamModel: "m", Endpoint: "chat_completions", Usage: Usage{Source: "unavailable"}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := store.Close(ctx); err != nil {
+		t.Fatal(err)
+	}
+	var count int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM llm_requests`).Scan(&count); err != nil || count != 11 {
+		t.Fatalf("count=%d err=%v", count, err)
+	}
+	if err := store.Insert(context.Background(), Record{ID: "late"}); !errors.Is(err, errLedgerClosed) {
+		t.Fatalf("insert after close error=%v", err)
+	}
+}
+
+func TestPprofIsOptIn(t *testing.T) {
+	db, _ := sql.Open("sqlite3", ":memory:")
+	defer db.Close()
+	if err := Migrate(context.Background(), db); err != nil {
+		t.Fatal(err)
+	}
+	base := Config{Routes: map[string]Route{"r": {Candidates: []Candidate{{ID: "u", BaseURL: "http://example.test", Model: "m"}}}}}
+	disabled, _ := New(base, db)
+	rec := httptest.NewRecorder()
+	disabled.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/debug/pprof/goroutine", nil))
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("disabled pprof status=%d", rec.Code)
+	}
+	base.Profiling.Enabled = true
+	enabled, _ := New(base, db)
+	rec = httptest.NewRecorder()
+	enabled.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/debug/pprof/goroutine?debug=1", nil))
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "goroutine profile") {
+		t.Fatalf("enabled pprof status=%d body=%s", rec.Code, rec.Body.String())
+	}
+}
+
 func TestExponentialBackoff(t *testing.T) {
 	for retry, want := range map[int]time.Duration{
 		1: time.Second,
@@ -831,6 +1042,144 @@ func TestExponentialBackoff(t *testing.T) {
 	} {
 		if got := exponentialBackoff(retry); got != want {
 			t.Fatalf("retry=%d backoff=%s want=%s", retry, got, want)
+		}
+	}
+}
+
+func TestJitteredExponentialBackoffStaysWithinEqualJitterWindow(t *testing.T) {
+	for retry := 1; retry <= maxRateLimitRetries; retry++ {
+		upper := exponentialBackoff(retry)
+		lower := upper / 2
+		for sample := 0; sample < 100; sample++ {
+			got := jitteredExponentialBackoff(retry, time.Second, 16*time.Second)
+			if got < lower || got > upper {
+				t.Fatalf("retry=%d backoff=%s outside [%s,%s]", retry, got, lower, upper)
+			}
+		}
+	}
+}
+
+func TestRateLimitWaitsForEarliestRecoveringCandidate(t *testing.T) {
+	makeLimited := func(retryAfter string) *httptest.Server {
+		return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Retry-After", retryAfter)
+			w.WriteHeader(http.StatusTooManyRequests)
+			_, _ = w.Write([]byte(`{"error":{"message":"rate limited"}}`))
+		}))
+	}
+	slow := makeLimited("60")
+	defer slow.Close()
+	fast := makeLimited("1")
+	defer fast.Close()
+	db, _ := sql.Open("sqlite3", ":memory:")
+	defer db.Close()
+	if err := Migrate(context.Background(), db); err != nil {
+		t.Fatal(err)
+	}
+	r, err := New(Config{Routes: map[string]Route{"free": {Candidates: []Candidate{
+		{ID: "slow", BaseURL: slow.URL, Model: "slow"},
+		{ID: "fast", BaseURL: fast.URL, Model: "fast"},
+	}}}}, db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r.retryBackoff = func(int) time.Duration { return time.Second }
+	var waited time.Duration
+	r.retryWait = func(_ context.Context, delay time.Duration) bool {
+		waited = delay
+		return false
+	}
+	rec := httptest.NewRecorder()
+	r.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"free","messages":[]}`)))
+	if rec.Code != http.StatusGatewayTimeout {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if waited < 900*time.Millisecond || waited > 1100*time.Millisecond {
+		t.Fatalf("waited=%s, want earliest candidate near 1s rather than 60s", waited)
+	}
+}
+
+func TestUpstreamClientUsesGatewayConnectionPool(t *testing.T) {
+	client := newUpstreamHTTPClient()
+	transport, ok := client.Transport.(*http.Transport)
+	if !ok {
+		t.Fatalf("transport=%T", client.Transport)
+	}
+	if transport.MaxIdleConns != upstreamMaxIdleConns || transport.MaxIdleConnsPerHost != upstreamMaxIdleConnsPerHost {
+		t.Fatalf("connection pool total=%d per_host=%d", transport.MaxIdleConns, transport.MaxIdleConnsPerHost)
+	}
+	if !transport.ForceAttemptHTTP2 {
+		t.Fatal("HTTP/2 should remain enabled")
+	}
+}
+
+func TestMetricsExposeQueueTTFBRetryAndInflight(t *testing.T) {
+	calls := 0
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		calls++
+		if calls == 1 {
+			w.WriteHeader(http.StatusTooManyRequests)
+			return
+		}
+		_, _ = w.Write([]byte(`{"usage":{"prompt_tokens":1,"completion_tokens":2,"total_tokens":3}}`))
+	}))
+	defer upstream.Close()
+	db, _ := sql.Open("sqlite3", ":memory:")
+	defer db.Close()
+	if err := Migrate(context.Background(), db); err != nil {
+		t.Fatal(err)
+	}
+	r, err := New(Config{Routes: map[string]Route{"free": {Candidates: []Candidate{{ID: "u", BaseURL: upstream.URL, Model: "up"}}}}}, db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r.retryBackoff = func(int) time.Duration { return 0 }
+	rec := httptest.NewRecorder()
+	r.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"free","messages":[]}`)))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	metrics := httptest.NewRecorder()
+	r.Handler().ServeHTTP(metrics, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	for _, name := range []string{
+		"nanorouter_upstream_ttfb_seconds",
+		"nanorouter_upstream_queue_seconds",
+		"nanorouter_retry_delay_seconds",
+		"nanorouter_upstream_inflight",
+	} {
+		if !strings.Contains(metrics.Body.String(), name) {
+			t.Fatalf("missing metric %q:\n%s", name, metrics.Body.String())
+		}
+	}
+	if !strings.Contains(metrics.Body.String(), `nanorouter_upstream_inflight{endpoint="chat_completions",route="free",upstream="u"} 0`) {
+		t.Fatalf("inflight gauge did not return to zero:\n%s", metrics.Body.String())
+	}
+}
+
+func TestLargeWeightsDoNotChangeWeightedSelection(t *testing.T) {
+	r := &Router{states: map[string]*state{}, next: map[string]int{}}
+	route := Route{Candidates: []Candidate{{ID: "bulk", Weight: 1_000_000}, {ID: "rare", Weight: 1}}}
+	for i := 0; i < 10; i++ {
+		got, ok := r.pick("large", route, "chat_completions", nil, "")
+		if !ok || got.ID != "bulk" {
+			t.Fatalf("pick %d=%#v ok=%v", i, got, ok)
+		}
+	}
+	r.next["large"] = 1_000_000
+	got, ok := r.pick("large", route, "chat_completions", nil, "")
+	if !ok || got.ID != "rare" {
+		t.Fatalf("boundary pick=%#v ok=%v", got, ok)
+	}
+}
+
+func BenchmarkPickLargeWeights(b *testing.B) {
+	r := &Router{states: map[string]*state{}, next: map[string]int{}}
+	route := Route{Candidates: []Candidate{{ID: "bulk", Weight: 1_000_000}, {ID: "rare", Weight: 1}}}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if _, ok := r.pick("large", route, "chat_completions", nil, ""); !ok {
+			b.Fatal("candidate not selected")
 		}
 	}
 }
@@ -1036,7 +1385,7 @@ func TestResponsesCanAdaptToChatCompletions(t *testing.T) {
 	}
 }
 
-func TestResponsesAdapterRejectsTools(t *testing.T) {
+func TestResponsesAdapterRejectsBuiltInTools(t *testing.T) {
 	db, _ := sql.Open("sqlite3", ":memory:")
 	defer db.Close()
 	if err := Migrate(context.Background(), db); err != nil {
@@ -1046,10 +1395,10 @@ func TestResponsesAdapterRejectsTools(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"free","input":"hello","tools":[]}`))
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"free","input":"hello","tools":[{"type":"web_search"}]}`))
 	rec := httptest.NewRecorder()
 	r.Handler().ServeHTTP(rec, req)
-	if rec.Code != 400 || !strings.Contains(rec.Body.String(), "tools cannot be adapted") {
+	if rec.Code != 400 || !strings.Contains(rec.Body.String(), "tool type") {
 		t.Fatalf("status/body %d %s", rec.Code, rec.Body.String())
 	}
 }

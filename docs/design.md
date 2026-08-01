@@ -33,7 +33,7 @@ Agent / Open WebUI
 ## 一次请求的生命周期
 
 1. 客户端向 `/v1/chat/completions` 或 `/v1/responses` 发请求。
-2. 网关限制请求体最大 16 MiB，读取 `model` 作为路由名。
+2. 网关先通过可选的全局背压准入，再限制请求体最大 16 MiB，读取 `model` 作为路由名。
 3. 从未冷却、且支持目标端点的候选中选择一个：存在非空 `X-Session-Affinity` 时按路由名和
    会话键做稳定的加权哈希，否则按权重轮转。
 4. 将逻辑名替换为真实模型 ID，以该上游自己的 Bearer Key 转发。
@@ -44,6 +44,12 @@ Agent / Open WebUI
 `queue_timeout`；超时后优先尝试路由中的其他候选，所有候选均满载时返回 429。局部并发
 限制不是上游故障，因此不会触发候选冷却。SSE 从开始转发到结束始终占用一个槽位。
 
+`attempt_timeout` 是候选级完整调用期限，防止一个上游独占全局请求预算。自适应并发开启后，
+limiter 以 `min_concurrency` 起步：有排队且 TTFB 达标时加性增长，429 或超过两倍目标 TTFB 时
+乘性下降，最大不超过 `max_concurrency`。该状态仅在单实例内维护。
+
+全局背压使用固定在途槽和有界等待队列，并在读取请求体前准入，以限制慢上游期间的 goroutine 与正文内存增长。路由级 Retry Budget 使用令牌桶：初始请求按比例补充令牌，真实额外上游调用消耗令牌，既允许有限突发故障切换，又限制长期请求放大率。这两类状态均为单实例内状态。
+
 聚合路由会在网络错误、`401/403/404` 候选认证或模型错误，以及
 `408/425/429/500/502/503/504` 临时错误时切换候选。`400/422` 往往代表请求参数不兼容，
 换模型可能掩盖客户端或清洗配置问题，因此直接回传。通过 `expose_as` 明确选择候选时，
@@ -51,14 +57,15 @@ Agent / Open WebUI
 
 ## 权重和熔断
 
-`weight: 3` 的候选在轮转序列中占三个槽位，大约承受三倍请求。`Router.mu` 保护轮转游标和冷却状态，防止并发请求同时涌向刚发生 429 的上游。
+`weight: 3` 的候选在轮转序列中占三个逻辑槽位，大约承受三倍请求。实现使用累计权重定位，不会按 weight 展开候选切片。`Router.mu` 保护轮转游标和冷却状态，防止并发请求同时涌向刚发生 429 的上游。
 
 `X-Session-Affinity` 是可选提示，不是可用性约束。同一路由和候选集合下，相同键稳定落到同一
 加权槽位；候选冷却、拥塞或请求内失败后仍允许选择其他候选。缺少或空白 Header 时保持原有轮转行为。
 
-收到 429/5xx 后，上游进入冷却。对于 429，当前请求会先尝试其他候选；如果一轮候选都不可用，
-则在网关内最多再试 5 次，等待时间按 1、2、4、8、16 秒指数增长。`Retry-After` 会作为该次等待的
-最小值。每次重试都受整个 `request_timeout` 和客户端取消信号约束，因而不会要求下游盲目重复提交。
+收到 429/5xx 后，上游进入冷却。冷却结束进入半开状态，只有一个请求能作为探针；探针成功关闭
+熔断器，失败则重新冷却，避免并发流量在同一时刻冲回上游。对于 429，当前请求会先尝试其他候选；如果一轮候选都不可用，
+则按 `retry` 配置在网关内重试。默认指数窗口为 1、2、4、8、16 秒，每次实际等待随机落在该窗口的
+50%–100%，避免并发实例同步重试。每个候选的 `Retry-After` 都是其最小冷却时间；当前请求只等到最早可恢复的候选，而不会被最慢候选拖住。每次重试都受整个 `request_timeout` 和客户端取消信号约束，因而不会要求下游盲目重复提交。
 其他可重试错误仍采用 30 秒冷却（有 `Retry-After` 时优先服从）。这是适合单实例的轻量熔断器；多实例时
 各自状态不共享，下一步可迁移到 Redis。
 
@@ -66,7 +73,7 @@ Agent / Open WebUI
 
 Chat Completions 与 Responses 共享选路器，但不会互相转换 schema。配置中的 `responses: true` 是上游能力声明；Responses 请求会跳过没有该标记的候选。这样可以完整保留 Responses 特有的 `input`、`previous_response_id`、内建工具和输出事件，但需要你确认每家供应商的兼容性。
 
-对于 SenseNova 这类只提供 Chat Completions 的上游，可以改用 `responses_via_chat_completions: true`。这是一个受限适配器：`input`、`instructions`、图片/文本 content part、采样参数和最大输出 token 能够映射；结果会从 SenseNova 的 `data.choices` / `data.usage` 转成 Responses 对象或 SSE 事件。工具调用、后台任务和 `previous_response_id` 没有等价表示，必须返回 400，而不能假装成功。
+对于 SenseNova 这类只提供 Chat Completions 的上游，可以改用 `responses_via_chat_completions: true`。这是一个受限适配器：`input`、`instructions`、图片/文本 content part、采样与推理强度参数、结构化输出、自定义函数定义/调用/结果和最大输出 token 能够映射；结果会从标准 `choices` 或 SenseNova 的 `data.choices` / `data.usage` 转成 Responses 对象或完整的文本/函数调用 SSE 事件。OpenAI 托管工具、后台任务、状态链、prompt 模板和 reasoning summary 没有纯 Chat Completions 等价表示，必须返回 400，而不能假装成功。
 
 `chat_max_tokens_field` 解决供应商参数命名差异：默认是 `max_tokens`（适用于 Agnes、SenseNova 新版接口一类标准化服务）；对于少数使用非标准命名的上游（如旧版 SenseNova 原生接口的 `max_new_tokens`）需在候选中显式配置。`chat_completions_path` 则解决路径差异，默认 `chat/completions`，旧版 SenseNova 原生接口是 `chat-completions`。当前 SenseNova 已全面迁移至 `token.sensenova.cn/v1` 标准化端点，无需配置这两个字段。Groq 提供原生 `/responses`，应使用 `responses: true` 而不是该适配器。
 
@@ -98,7 +105,7 @@ SSE 首字节发给下游后不能再安全换模型：会重复文字，或破�
 - `usage_source`：`upstream` 或 `unavailable`；
 - `error_kind`：`network`、`upstream` 或 `client`。
 
-账本不保存 prompt、回复正文或 API Key，避免用户内容和密钥落入普通运维数据库。Prometheus 用于实时请求率、失败率和 token 速率；SQLite 用于按模型汇总历史使用量。
+账本不保存 prompt、回复正文或 API Key，避免用户内容和密钥落入普通运维数据库。Prometheus 用于实时请求率、失败率、token 速率，以及上游 TTFB、并发槽排队、内部退避、动态并发窗口、全局背压和重试预算观测；SQLite 用于按模型汇总历史使用量。SQLite 可选异步批量写：正常关闭会排空队列，队列溢出或异常退出可能丢失尚未提交的记录，因此默认关闭。
 
 运行日志使用 Zap 的结构化 JSON；`-debug` 则用相同字段输出稳定的 `key=value` 文本。每个请求以
 `request_started` 开始，随后记录 `upstream_attempt_started`、`upstream_attempt_finished` 和必要时的
@@ -110,6 +117,6 @@ Loki、Elasticsearch 或 `jq` 追踪。开始事件将客户端 IP、User-Agent�
 ## 推荐的下一步
 
 1. 增加管理 API，用于查看候选、临时禁用和解除冷却。
-2. 增加按路由的并发/RPM/token 限制，保护免费额度。
+2. 增加按路由的 RPM/token 限制，保护免费额度。
 3. 为候选声明视觉、工具调用、JSON Schema 和上下文长度等能力。
-4. 高并发时为 SQLite 写入加队列与批量提交，降低锁竞争。
+4. 将单实例背压、预算和熔断状态按需迁移到共享协调层。

@@ -1,17 +1,19 @@
 package router
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"crypto/rand"
 	"database/sql"
+	"encoding/binary"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"hash/fnv"
 	"io"
 	"net"
 	"net/http"
+	"net/http/pprof"
 	"os"
 	"sort"
 	"strconv"
@@ -31,21 +33,35 @@ const maxUpstreamErrorBody = 8 << 10
 const maxUpstreamErrorMessage = 512
 const maxRateLimitRetries = 5
 const sessionAffinityHeader = "X-Session-Affinity"
+const upstreamMaxIdleConns = 256
+const upstreamMaxIdleConnsPerHost = 64
 
 type Router struct {
-	cfg          Config
-	db           *Store
-	client       *http.Client
-	states       map[string]*state
-	limiters     map[string]chan struct{}
-	mu           sync.Mutex
-	next         map[string]int
-	requests     *prometheus.CounterVec
-	tokens       *prometheus.CounterVec
-	failovers    *prometheus.CounterVec
-	registry     *prometheus.Registry
-	logger       *zap.Logger
-	retryBackoff func(int) time.Duration
+	cfg               Config
+	db                *Store
+	client            *http.Client
+	states            map[string]*state
+	limiters          map[string]*candidateLimiter
+	admission         *admissionController
+	retryBudgets      map[string]*retryBudget
+	mu                sync.Mutex
+	next              map[string]int
+	requests          *prometheus.CounterVec
+	tokens            *prometheus.CounterVec
+	failovers         *prometheus.CounterVec
+	ttfb              *prometheus.HistogramVec
+	queueWait         *prometheus.HistogramVec
+	retryWaits        *prometheus.HistogramVec
+	inflight          *prometheus.GaugeVec
+	concurrency       *prometheus.GaugeVec
+	admissionRejected *prometheus.CounterVec
+	retryBudgetDenied *prometheus.CounterVec
+	retryBudgetTokens *prometheus.GaugeVec
+	registry          *prometheus.Registry
+	logger            *zap.Logger
+	retryBackoff      func(int) time.Duration
+	retryWait         func(context.Context, time.Duration) bool
+	maxRetries        int
 }
 
 // state 是单个上游的熔断状态。冷却期内不再向它发送新请求，
@@ -53,6 +69,7 @@ type Router struct {
 type state struct {
 	until    time.Time
 	failures int
+	probing  bool
 }
 
 func New(cfg Config, db *sql.DB) (*Router, error) {
@@ -64,46 +81,111 @@ func NewWithLogger(cfg Config, db *sql.DB, logger *zap.Logger) (*Router, error) 
 	if cfg.RequestTimeout == 0 {
 		cfg.RequestTimeout = 90 * time.Second
 	}
+	if err := cfg.Retry.normalize(); err != nil {
+		return nil, err
+	}
+	if err := cfg.Database.normalize(); err != nil {
+		return nil, err
+	}
+	if err := cfg.Backpressure.normalize(); err != nil {
+		return nil, err
+	}
+	for routeName, route := range cfg.Routes {
+		if err := route.RetryBudget.normalize(routeName); err != nil {
+			return nil, err
+		}
+		cfg.Routes[routeName] = route
+	}
 	if logger == nil {
 		logger = zap.NewNop()
 	}
-	r := &Router{cfg: cfg, db: NewStore(db, cfg.Database.Driver), client: &http.Client{}, states: map[string]*state{}, limiters: map[string]chan struct{}{}, next: map[string]int{}, registry: prometheus.NewRegistry(), logger: logger, retryBackoff: exponentialBackoff}
-	configuredLimits := make(map[string]int)
+	r := &Router{cfg: cfg, db: NewStoreWithConfig(db, cfg.Database), client: newUpstreamHTTPClient(), states: map[string]*state{}, limiters: map[string]*candidateLimiter{}, admission: newAdmissionController(cfg.Backpressure), retryBudgets: map[string]*retryBudget{}, next: map[string]int{}, registry: prometheus.NewRegistry(), logger: logger, retryWait: waitForRetry, maxRetries: *cfg.Retry.MaxRateLimitRetries}
+	r.retryBackoff = func(retry int) time.Duration {
+		return jitteredExponentialBackoff(retry, cfg.Retry.BaseDelay, cfg.Retry.MaxDelay)
+	}
+	configuredLimits := make(map[string]Candidate)
 	for routeName, route := range cfg.Routes {
+		if budget := newRetryBudget(route.RetryBudget); budget != nil {
+			r.retryBudgets[routeName] = budget
+		}
 		for _, candidate := range route.Candidates {
-			if candidate.MaxConcurrency < 0 || candidate.QueueTimeout < 0 || (candidate.MaxConcurrency == 0 && candidate.QueueTimeout > 0) {
+			if candidate.MaxConcurrency < 0 || candidate.QueueTimeout < 0 || candidate.AttemptTimeout < 0 || (candidate.MaxConcurrency == 0 && candidate.QueueTimeout > 0) {
 				return nil, fmt.Errorf("route %q candidate %q has invalid concurrency limit", routeName, candidate.ID)
+			}
+			if candidate.AdaptiveConcurrency && (candidate.MaxConcurrency <= 0 || candidate.MinConcurrency < 0 || candidate.MinConcurrency > candidate.MaxConcurrency || candidate.TargetTTFB < 0) {
+				return nil, fmt.Errorf("route %q candidate %q has invalid adaptive concurrency settings", routeName, candidate.ID)
 			}
 			if candidate.MaxTokensLimit < 0 {
 				return nil, fmt.Errorf("route %q candidate %q has negative max_tokens_limit", routeName, candidate.ID)
 			}
-			if limit, exists := configuredLimits[candidate.ID]; exists && limit != candidate.MaxConcurrency {
-				return nil, fmt.Errorf("candidate %q has conflicting max_concurrency values", candidate.ID)
+			if configured, exists := configuredLimits[candidate.ID]; exists && (configured.MaxConcurrency != candidate.MaxConcurrency || configured.AdaptiveConcurrency != candidate.AdaptiveConcurrency || configured.MinConcurrency != candidate.MinConcurrency || configured.TargetTTFB != candidate.TargetTTFB) {
+				return nil, fmt.Errorf("candidate %q has conflicting concurrency settings", candidate.ID)
 			}
-			configuredLimits[candidate.ID] = candidate.MaxConcurrency
+			configuredLimits[candidate.ID] = candidate
 			if candidate.MaxConcurrency == 0 {
 				continue
 			}
 			if _, exists := r.limiters[candidate.ID]; exists {
 				continue
 			}
-			r.limiters[candidate.ID] = make(chan struct{}, candidate.MaxConcurrency)
+			r.limiters[candidate.ID] = newCandidateLimiter(candidate)
 		}
 	}
 	r.requests = prometheus.NewCounterVec(prometheus.CounterOpts{Name: "nanorouter_requests_total", Help: "Upstream attempts"}, []string{"route", "upstream", "endpoint", "status"})
 	r.tokens = prometheus.NewCounterVec(prometheus.CounterOpts{Name: "nanorouter_tokens_total", Help: "Reported tokens"}, []string{"route", "upstream", "type"})
 	r.failovers = prometheus.NewCounterVec(prometheus.CounterOpts{Name: "nanorouter_failovers_total", Help: "Retries sent to another upstream"}, []string{"route", "reason"})
-	r.registry.MustRegister(r.requests, r.tokens, r.failovers)
+	r.ttfb = prometheus.NewHistogramVec(prometheus.HistogramOpts{Name: "nanorouter_upstream_ttfb_seconds", Help: "Time from upstream attempt start until response headers or transport error", Buckets: prometheus.DefBuckets}, []string{"route", "upstream", "endpoint"})
+	r.queueWait = prometheus.NewHistogramVec(prometheus.HistogramOpts{Name: "nanorouter_upstream_queue_seconds", Help: "Time waiting for a candidate concurrency slot", Buckets: []float64{0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30}}, []string{"route", "upstream", "endpoint", "outcome"})
+	r.retryWaits = prometheus.NewHistogramVec(prometheus.HistogramOpts{Name: "nanorouter_retry_delay_seconds", Help: "Actual delay scheduled before an internal retry", Buckets: []float64{0, 0.1, 0.25, 0.5, 1, 2, 4, 8, 16, 30, 60}}, []string{"route", "endpoint", "reason"})
+	r.inflight = prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: "nanorouter_upstream_inflight", Help: "Requests currently occupying an upstream concurrency slot"}, []string{"route", "upstream", "endpoint"})
+	r.concurrency = prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: "nanorouter_upstream_concurrency_limit", Help: "Current fixed or adaptive concurrency limit"}, []string{"upstream"})
+	r.admissionRejected = prometheus.NewCounterVec(prometheus.CounterOpts{Name: "nanorouter_backpressure_rejected_total", Help: "Requests rejected by global admission control"}, []string{"reason"})
+	r.retryBudgetDenied = prometheus.NewCounterVec(prometheus.CounterOpts{Name: "nanorouter_retry_budget_denied_total", Help: "Additional upstream attempts denied by the route retry budget"}, []string{"route"})
+	r.retryBudgetTokens = prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: "nanorouter_retry_budget_tokens", Help: "Currently available route retry tokens"}, []string{"route"})
+	ledgerDropped := prometheus.NewCounterFunc(prometheus.CounterOpts{Name: "nanorouter_ledger_dropped_total", Help: "Ledger records dropped because the async queue was full or closed"}, func() float64 { return float64(r.db.Dropped()) })
+	ledgerErrors := prometheus.NewCounterFunc(prometheus.CounterOpts{Name: "nanorouter_ledger_write_errors_total", Help: "Ledger records affected by database write failures"}, func() float64 { return float64(r.db.WriteErrors()) })
+	for id, limiter := range r.limiters {
+		r.concurrency.WithLabelValues(id).Set(float64(limiter.currentLimit()))
+	}
+	for routeName, budget := range r.retryBudgets {
+		r.retryBudgetTokens.WithLabelValues(routeName).Set(budget.available())
+	}
+	collectors := []prometheus.Collector{r.requests, r.tokens, r.failovers, r.ttfb, r.queueWait, r.retryWaits, r.inflight, r.concurrency, r.admissionRejected, r.retryBudgetDenied, r.retryBudgetTokens, ledgerDropped, ledgerErrors}
+	if r.admission != nil {
+		collectors = append(collectors,
+			prometheus.NewGaugeFunc(prometheus.GaugeOpts{Name: "nanorouter_backpressure_inflight", Help: "Requests admitted by global backpressure control"}, func() float64 { return float64(r.admission.inflight.Load()) }),
+			prometheus.NewGaugeFunc(prometheus.GaugeOpts{Name: "nanorouter_backpressure_queued", Help: "Requests waiting for global admission"}, func() float64 { return float64(r.admission.queued.Load()) }),
+		)
+	}
+	r.registry.MustRegister(collectors...)
 	return r, nil
 }
 func (r *Router) Handler() http.Handler {
 	mux := chi.NewRouter()
 	mux.Get("/healthz", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) })
 	mux.Handle("/metrics", promhttp.HandlerFor(r.registry, promhttp.HandlerOpts{}))
+	if r.cfg.Profiling.Enabled {
+		mountPprof(mux)
+	}
 	mux.Get("/v1/models", r.models)
 	mux.Post("/v1/chat/completions", r.proxy("chat_completions"))
 	mux.Post("/v1/responses", r.proxy("responses"))
 	return r.auth(mux)
+}
+
+func mountPprof(mux *chi.Mux) {
+	mux.HandleFunc("/debug/pprof/", pprof.Index)
+	mux.HandleFunc("/debug/pprof/cmdline", pprof.Cmdline)
+	mux.HandleFunc("/debug/pprof/profile", pprof.Profile)
+	mux.HandleFunc("/debug/pprof/symbol", pprof.Symbol)
+	mux.HandleFunc("/debug/pprof/trace", pprof.Trace)
+	for _, name := range []string{"allocs", "block", "goroutine", "heap", "mutex", "threadcreate"} {
+		mux.Handle("/debug/pprof/"+name, pprof.Handler(name))
+	}
+}
+
+func (r *Router) Close(ctx context.Context) error {
+	return r.db.Close(ctx)
 }
 func (r *Router) auth(next http.Handler) http.Handler {
 	expected := os.Getenv(r.cfg.AuthEnv)
@@ -144,7 +226,35 @@ func (r *Router) proxy(endpoint string) http.HandlerFunc {
 		startedAt := time.Now()
 		requestID := requestID(q)
 		w.Header().Set("X-Request-ID", requestID)
-		r.logger.Info(r.logMessage("request_started"), eventFields("request_started", requestStartLogFields(q, requestID, endpoint)...)...)
+		ctx, cancelRequest := context.WithTimeout(q.Context(), r.cfg.RequestTimeout)
+		defer cancelRequest()
+		if r.admission != nil {
+			releaseAdmission, outcome := r.admission.acquire(ctx)
+			if outcome != admissionAcquired {
+				if outcome == admissionCanceled && q.Context().Err() != nil {
+					return
+				}
+				status := http.StatusTooManyRequests
+				message := "gateway is at capacity"
+				code := "gateway_overloaded"
+				if outcome == admissionCanceled {
+					status = http.StatusGatewayTimeout
+					message = "request deadline exceeded while waiting for admission"
+					code = "request_timeout"
+				}
+				if status == http.StatusTooManyRequests {
+					w.Header().Set("Retry-After", "1")
+				}
+				r.admissionRejected.WithLabelValues(string(outcome)).Inc()
+				writeAPIError(w, status, message, code)
+				r.logRequestFailed(requestID, endpoint, "", false, status, 0, time.Since(startedAt), string(outcome))
+				return
+			}
+			defer releaseAdmission()
+		}
+		if r.logger.Core().Enabled(zap.InfoLevel) {
+			r.logger.Info(r.logMessage("request_started"), eventFields("request_started", requestStartLogFields(q, requestID, endpoint)...)...)
+		}
 
 		body, err := io.ReadAll(http.MaxBytesReader(w, q.Body, maxRequestBody))
 		if err != nil {
@@ -167,30 +277,39 @@ func (r *Router) proxy(endpoint string) http.HandlerFunc {
 		}
 		streamed, _ := payload["stream"].(bool)
 		sessionAffinity := strings.TrimSpace(q.Header.Get(sessionAffinityHeader))
-		ctx, cancelRequest := context.WithTimeout(q.Context(), r.cfg.RequestTimeout)
-		defer cancelRequest()
+		budget := r.retryBudgets[routeName]
+		if budget != nil {
+			r.retryBudgetTokens.WithLabelValues(routeName).Set(budget.credit())
+		}
 		concurrencyLimited := false
 		rateLimited := false
-		retryDelay := time.Duration(0)
+		var retryAt time.Time
 		retries := 0
 		attempt := 0
+		upstreamAttempts := 0
 		attempted := make(map[string]bool, len(route.Candidates))
 		// 只修改 model 字段，其他 OpenAI/Responses 字段透明保留，
 		// 因而 tools、图片、response_format 等新字段不需要网关逐一适配。
 		for {
 			u, ok := r.pick(routeName, route, endpoint, attempted, sessionAffinity)
 			if !ok {
-				if rateLimited && retries < maxRateLimitRetries {
+				if rateLimited && retries < r.maxRetries {
 					retries++
-					delay := retryDelay
-					retryFields := append(requestOutcomeLogFields(requestID, routeName, endpoint, streamed, attempt, time.Since(startedAt)),
-						zap.Int("retry", retries),
-						zap.Int("max_retries", maxRateLimitRetries),
-						zap.Int("retry_delay_ms", int(delay.Milliseconds())),
-						zap.String("retry_reason", "upstream_rate_limit"),
-					)
-					r.logger.Warn(r.logMessage("retry_scheduled"), eventFields("retry_scheduled", retryFields...)...)
-					if !waitForRetry(ctx, delay) {
+					delay := time.Until(retryAt)
+					if retryAt.IsZero() || delay < 0 {
+						delay = 0
+					}
+					if r.logger.Core().Enabled(zap.WarnLevel) {
+						retryFields := append(requestOutcomeLogFields(requestID, routeName, endpoint, streamed, attempt, time.Since(startedAt)),
+							zap.Int("retry", retries),
+							zap.Int("max_retries", r.maxRetries),
+							zap.Int("retry_delay_ms", int(delay.Milliseconds())),
+							zap.String("retry_reason", "upstream_rate_limit"),
+						)
+						r.logger.Warn(r.logMessage("retry_scheduled"), eventFields("retry_scheduled", retryFields...)...)
+					}
+					r.retryWaits.WithLabelValues(routeName, endpoint, "upstream_rate_limit").Observe(delay.Seconds())
+					if !r.retryWait(ctx, delay) {
 						if q.Context().Err() != nil {
 							r.logRequestFailed(requestID, endpoint, routeName, streamed, 499, attempt, time.Since(startedAt), "client_canceled")
 							return
@@ -200,7 +319,7 @@ func (r *Router) proxy(endpoint string) http.HandlerFunc {
 						return
 					}
 					attempted = make(map[string]bool, len(route.Candidates))
-					retryDelay = 0
+					retryAt = time.Time{}
 					continue
 				}
 				if rateLimited {
@@ -225,6 +344,7 @@ func (r *Router) proxy(endpoint string) http.HandlerFunc {
 			if adaptedResponses {
 				p, err = responsesToChatCompletions(payload, u.ChatMaxTokensField)
 				if err != nil {
+					r.releaseProbe(u)
 					writeAPIError(w, http.StatusBadRequest, err.Error(), "unsupported_response_feature")
 					r.logRequestFailed(requestID, endpoint, routeName, streamed, http.StatusBadRequest, attempt, time.Since(startedAt), "unsupported_response_feature")
 					return
@@ -232,11 +352,11 @@ func (r *Router) proxy(endpoint string) http.HandlerFunc {
 				upstreamEndpoint = "chat_completions"
 			}
 			p, dropped := sanitizeRequest(p, u)
-			if len(dropped) > 0 {
+			if len(dropped) > 0 && r.logger.Core().Enabled(zap.DebugLevel) {
 				r.logger.Debug(r.logMessage("request_sanitized"), eventFields("request_sanitized", zap.String("request_id", requestID), zap.String("route", routeName), zap.String("upstream", u.ID), zap.Strings("removed_fields", dropped))...)
 			}
 			p, clamped := clampRequestMaxTokens(p, u)
-			if len(clamped) > 0 {
+			if len(clamped) > 0 && r.logger.Core().Enabled(zap.DebugLevel) {
 				r.logger.Debug(r.logMessage("request_tokens_clamped"), eventFields("request_tokens_clamped", zap.String("request_id", requestID), zap.String("route", routeName), zap.String("upstream", u.ID), zap.Strings("fields", clamped), zap.Int("max_tokens_limit", u.MaxTokensLimit))...)
 			}
 			p["model"] = u.Model
@@ -244,88 +364,181 @@ func (r *Router) proxy(endpoint string) http.HandlerFunc {
 			queueStart := time.Now()
 			release, acquired := r.acquire(ctx, u)
 			if !acquired {
+				r.releaseProbe(u)
 				concurrencyLimited = true
 				queueLatency := int(time.Since(queueStart).Milliseconds())
+				r.queueWait.WithLabelValues(routeName, u.ID, endpoint, "timeout").Observe(time.Since(queueStart).Seconds())
 				r.record(q.Context(), routeName, u, endpoint, http.StatusTooManyRequests, queueLatency, streamed, attempt, Usage{Source: "unavailable"}, "concurrency")
 				r.failovers.WithLabelValues(routeName, "concurrency_limit").Inc()
-				r.logger.Warn(r.logMessage("upstream_attempt_finished"), eventFields("upstream_attempt_finished", append(failureLogFields(requestID, routeName, u, endpoint, attempt, queueLatency, streamed, http.StatusTooManyRequests, "concurrency_limit", true), zap.String("attempt_phase", "queue"))...)...)
+				if r.logger.Core().Enabled(zap.WarnLevel) {
+					r.logger.Warn(r.logMessage("upstream_attempt_finished"), eventFields("upstream_attempt_finished", append(failureLogFields(requestID, routeName, u, endpoint, attempt, queueLatency, streamed, http.StatusTooManyRequests, "concurrency_limit", true), zap.String("attempt_phase", "queue"))...)...)
+				}
 				attempt++
 				continue
+			}
+			queueDuration := time.Since(queueStart)
+			r.queueWait.WithLabelValues(routeName, u.ID, endpoint, "acquired").Observe(queueDuration.Seconds())
+			inflight := r.inflight.WithLabelValues(routeName, u.ID, endpoint)
+			inflight.Inc()
+			releaseSlot := release
+			release = func() {
+				releaseSlot()
+				inflight.Dec()
+			}
+			if upstreamAttempts > 0 && budget != nil {
+				allowed, tokens := budget.consume()
+				r.retryBudgetTokens.WithLabelValues(routeName).Set(tokens)
+				if !allowed {
+					release()
+					r.releaseProbe(u)
+					r.retryBudgetDenied.WithLabelValues(routeName).Inc()
+					writeAPIError(w, http.StatusTooManyRequests, "route retry budget exhausted", "retry_budget_exhausted")
+					r.logRequestFailed(requestID, endpoint, routeName, streamed, http.StatusTooManyRequests, attempt, time.Since(startedAt), "retry_budget_exhausted")
+					return
+				}
 			}
 			start := time.Now()
-			r.logger.Info(r.logMessage("upstream_attempt_started"), eventFields("upstream_attempt_started", append(requestLogFields(requestID, routeName, u, endpoint, attempt, 0, streamed, 0), zap.Int("retry", retries))...)...)
-			resp, err := r.do(ctx, u, upstreamEndpoint, encoded)
-			latency := int(time.Since(start).Milliseconds())
+			if r.logger.Core().Enabled(zap.InfoLevel) {
+				r.logger.Info(r.logMessage("upstream_attempt_started"), eventFields("upstream_attempt_started", append(requestLogFields(requestID, routeName, u, endpoint, attempt, 0, streamed, 0), zap.Int("retry", retries))...)...)
+			}
+			attemptCtx, cancelAttempt := candidateAttemptContext(ctx, u.AttemptTimeout)
+			upstreamAttempts++
+			resp, err := r.do(attemptCtx, u, upstreamEndpoint, encoded)
+			ttfbDuration := time.Since(start)
+			latency := int(ttfbDuration.Milliseconds())
+			r.ttfb.WithLabelValues(routeName, u.ID, endpoint).Observe(ttfbDuration.Seconds())
 			if err != nil {
+				attemptTimedOut := errors.Is(attemptCtx.Err(), context.DeadlineExceeded) && ctx.Err() == nil
+				cancelAttempt()
 				release()
-				r.record(q.Context(), routeName, u, endpoint, 0, latency, streamed, attempt, Usage{Source: "unavailable"}, "network")
+				status := 0
+				kind := "network"
+				outcome := "network_error"
+				if attemptTimedOut {
+					status = http.StatusGatewayTimeout
+					kind = "attempt_timeout"
+					outcome = "attempt_timeout"
+				}
+				r.observeConcurrency(u, status, ttfbDuration, queueDuration > time.Millisecond)
+				r.record(q.Context(), routeName, u, endpoint, status, latency, streamed, attempt, Usage{Source: "unavailable"}, kind)
 				r.fail(routeName, u, 30*time.Second)
-				r.failovers.WithLabelValues(routeName, "network").Inc()
-				fields := failureLogFields(requestID, routeName, u, endpoint, attempt, latency, streamed, 0, "network_error", true)
-				fields = append(fields, zap.Error(err))
-				r.logger.Warn(r.logMessage("upstream_attempt_finished"), eventFields("upstream_attempt_finished", fields...)...)
+				r.failovers.WithLabelValues(routeName, kind).Inc()
+				if r.logger.Core().Enabled(zap.WarnLevel) {
+					fields := failureLogFields(requestID, routeName, u, endpoint, attempt, latency, streamed, status, outcome, true)
+					fields = append(fields, zap.Error(err))
+					r.logger.Warn(r.logMessage("upstream_attempt_finished"), eventFields("upstream_attempt_finished", fields...)...)
+				}
+				if ctx.Err() != nil {
+					if q.Context().Err() != nil {
+						r.logRequestFailed(requestID, endpoint, routeName, streamed, 499, attempt+1, time.Since(startedAt), "client_canceled")
+						return
+					}
+					writeAPIError(w, http.StatusGatewayTimeout, "request deadline exceeded", "request_timeout")
+					r.logRequestFailed(requestID, endpoint, routeName, streamed, http.StatusGatewayTimeout, attempt+1, time.Since(startedAt), "request_timeout")
+					return
+				}
 				attempt++
 				continue
 			}
+			r.observeConcurrency(u, resp.StatusCode, ttfbDuration, queueDuration > time.Millisecond)
 			// 收到上游响应头后立即记录下游请求到上游返回的完整等待时间，
 			// 包含请求解析、选路、排队及此前的回退耗时。
-			responseFields := requestLogFields(requestID, routeName, u, endpoint, attempt, latency, streamed, resp.StatusCode)
-			responseFields = append(responseFields, zap.Int("request_to_upstream_response_ms", int(time.Since(startedAt).Milliseconds())))
-			r.logger.Info(r.logMessage("upstream_response_received"), eventFields("upstream_response_received", responseFields...)...)
+			if r.logger.Core().Enabled(zap.InfoLevel) {
+				responseFields := requestLogFields(requestID, routeName, u, endpoint, attempt, latency, streamed, resp.StatusCode)
+				responseFields = append(responseFields, zap.Int("request_to_upstream_response_ms", int(time.Since(startedAt).Milliseconds())))
+				r.logger.Info(r.logMessage("upstream_response_received"), eventFields("upstream_response_received", responseFields...)...)
+			}
 			if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 				// expose_as 代表明确指定某个上游；此时不能用通用 503 掩盖
 				// 上游诊断，须原样交给下游。普通路由只对候选认证、模型失效或
 				// 临时服务错误切换，避免 400/422 参数错误误触发模型轮转。
 				directUpstream := routeName == u.ExposeAs && u.ExposeAs != ""
 				if directUpstream || !failoverEligible(resp.StatusCode) {
+					if failoverEligible(resp.StatusCode) {
+						if resp.StatusCode == http.StatusTooManyRequests {
+							r.failUntil(u, time.Now().Add(maxDuration(r.retryBackoff(retries+1), retryAfter(resp))))
+						} else {
+							r.fail(routeName, u, cooldown(resp))
+						}
+					} else {
+						r.success(u)
+					}
 					upstreamError := r.copyErrorResponse(w, resp)
+					cancelAttempt()
 					release()
 					r.record(q.Context(), routeName, u, endpoint, resp.StatusCode, latency, streamed, attempt, Usage{Source: "unavailable"}, "client")
-					fields := failureLogFields(requestID, routeName, u, endpoint, attempt, latency, streamed, resp.StatusCode, "upstream_rejected", false)
-					fields = append(fields, upstreamError.logFields(true)...)
-					r.logger.Warn(r.logMessage("upstream_attempt_finished"), eventFields("upstream_attempt_finished", fields...)...)
+					if r.logger.Core().Enabled(zap.WarnLevel) {
+						fields := failureLogFields(requestID, routeName, u, endpoint, attempt, latency, streamed, resp.StatusCode, "upstream_rejected", false)
+						fields = append(fields, upstreamError.logFields(true)...)
+						r.logger.Warn(r.logMessage("upstream_attempt_finished"), eventFields("upstream_attempt_finished", fields...)...)
+					}
 					r.logRequestFailed(requestID, endpoint, routeName, streamed, resp.StatusCode, attempt+1, time.Since(startedAt), "upstream_rejected")
 					return
 				}
 
 				upstreamError := readUpstreamError(resp)
+				cancelAttempt()
 				release()
 				if resp.StatusCode == http.StatusTooManyRequests {
 					rateLimited = true
 					backoff := r.retryBackoff(retries + 1)
 					cooldown := maxDuration(backoff, retryAfter(resp))
-					retryDelay = maxDuration(retryDelay, cooldown)
-					r.fail(routeName, u, cooldown)
+					candidateRetryAt := time.Now().Add(cooldown)
+					if retryAt.IsZero() || candidateRetryAt.Before(retryAt) {
+						retryAt = candidateRetryAt
+					}
+					r.failUntil(u, candidateRetryAt)
 				} else {
 					r.fail(routeName, u, cooldown(resp))
 				}
 				r.record(q.Context(), routeName, u, endpoint, resp.StatusCode, latency, streamed, attempt, Usage{Source: "unavailable"}, "upstream")
 				r.failovers.WithLabelValues(routeName, http.StatusText(resp.StatusCode)).Inc()
-				fields := failureLogFields(requestID, routeName, u, endpoint, attempt, latency, streamed, resp.StatusCode, "upstream_unavailable", true)
-				fields = append(fields, upstreamError.logFields(true)...)
-				r.logger.Warn(r.logMessage("upstream_attempt_finished"), eventFields("upstream_attempt_finished", fields...)...)
+				if r.logger.Core().Enabled(zap.WarnLevel) {
+					fields := failureLogFields(requestID, routeName, u, endpoint, attempt, latency, streamed, resp.StatusCode, "upstream_unavailable", true)
+					fields = append(fields, upstreamError.logFields(true)...)
+					r.logger.Warn(r.logMessage("upstream_attempt_finished"), eventFields("upstream_attempt_finished", fields...)...)
+				}
 				attempt++
 				continue
 			}
-			r.success(u)
 			w.Header().Set("X-Nanorouter-Route", routeName)
 			w.Header().Set("X-Nanorouter-Upstream", u.ID)
 			w.Header().Set("X-Nanorouter-Attempts", fmt.Sprint(attempt+1))
 			if streamed {
 				usage := Usage{Source: "unavailable"}
+				var streamErr error
 				if adaptedResponses {
-					usage = r.streamChatAsResponses(w, resp, routeName)
+					usage, streamErr = r.streamChatAsResponses(w, resp, routeName)
 				} else {
-					usage = r.stream(w, resp)
+					usage, streamErr = r.stream(w, resp)
 				}
+				cancelAttempt()
 				release()
 				duration := int(time.Since(start).Milliseconds())
+				if streamErr != nil {
+					r.fail(routeName, u, 30*time.Second)
+					r.record(q.Context(), routeName, u, endpoint, 0, duration, true, attempt, usage, "stream")
+					r.logRequestFailed(requestID, endpoint, routeName, true, 0, attempt+1, time.Since(startedAt), "stream_interrupted")
+					return
+				}
+				r.success(u)
 				r.record(q.Context(), routeName, u, endpoint, resp.StatusCode, duration, true, attempt, usage, "")
-				r.logger.Info(r.logMessage("upstream_attempt_finished"), eventFields("upstream_attempt_finished", successLogFields(requestID, routeName, u, endpoint, attempt, latency, duration, true, resp.StatusCode, usage)...)...)
+				if r.logger.Core().Enabled(zap.InfoLevel) {
+					r.logger.Info(r.logMessage("upstream_attempt_finished"), eventFields("upstream_attempt_finished", successLogFields(requestID, routeName, u, endpoint, attempt, latency, duration, true, resp.StatusCode, usage)...)...)
+				}
 				r.logRequestCompleted(requestID, endpoint, routeName, u, true, attempt+1, time.Since(startedAt), usage)
 			} else {
-				b, _ := io.ReadAll(resp.Body)
+				b, readErr := io.ReadAll(resp.Body)
 				resp.Body.Close()
+				cancelAttempt()
+				if readErr != nil {
+					release()
+					r.fail(routeName, u, 30*time.Second)
+					r.record(q.Context(), routeName, u, endpoint, http.StatusGatewayTimeout, int(time.Since(start).Milliseconds()), false, attempt, Usage{Source: "unavailable"}, "attempt_timeout")
+					attempt++
+					continue
+				}
+				r.success(u)
 				if adaptedResponses {
 					b, err = chatCompletionToResponse(b, routeName)
 					if err != nil {
@@ -345,7 +558,9 @@ func (r *Router) proxy(endpoint string) http.HandlerFunc {
 				usage := usageFromJSON(b)
 				duration := int(time.Since(start).Milliseconds())
 				r.record(q.Context(), routeName, u, endpoint, resp.StatusCode, duration, false, attempt, usage, "")
-				r.logger.Info(r.logMessage("upstream_attempt_finished"), eventFields("upstream_attempt_finished", successLogFields(requestID, routeName, u, endpoint, attempt, latency, duration, false, resp.StatusCode, usage)...)...)
+				if r.logger.Core().Enabled(zap.InfoLevel) {
+					r.logger.Info(r.logMessage("upstream_attempt_finished"), eventFields("upstream_attempt_finished", successLogFields(requestID, routeName, u, endpoint, attempt, latency, duration, false, resp.StatusCode, usage)...)...)
+				}
 				r.logRequestCompleted(requestID, endpoint, routeName, u, false, attempt+1, time.Since(startedAt), usage)
 			}
 			return
@@ -360,21 +575,20 @@ func (r *Router) acquire(ctx context.Context, u Candidate) (func(), bool) {
 	if limiter == nil {
 		return func() {}, true
 	}
-	if u.QueueTimeout == 0 {
-		select {
-		case limiter <- struct{}{}:
-			return func() { <-limiter }, true
-		default:
-			return nil, false
-		}
+	return limiter.acquire(ctx, u.QueueTimeout)
+}
+
+func candidateAttemptContext(parent context.Context, timeout time.Duration) (context.Context, context.CancelFunc) {
+	if timeout > 0 {
+		return context.WithTimeout(parent, timeout)
 	}
-	queueCtx, cancel := context.WithTimeout(ctx, u.QueueTimeout)
-	defer cancel()
-	select {
-	case limiter <- struct{}{}:
-		return func() { <-limiter }, true
-	case <-queueCtx.Done():
-		return nil, false
+	return parent, func() {}
+}
+
+func (r *Router) observeConcurrency(u Candidate, status int, ttfb time.Duration, queued bool) {
+	if limiter := r.limiters[u.ID]; limiter != nil {
+		limit := limiter.observe(status, ttfb, queued)
+		r.concurrency.WithLabelValues(u.ID).Set(float64(limit))
 	}
 }
 
@@ -468,6 +682,9 @@ func requestOutcomeLogFields(requestID, route, endpoint string, streamed bool, a
 }
 
 func (r *Router) logRequestCompleted(requestID, endpoint, route string, u Candidate, streamed bool, attempts int, duration time.Duration, usage Usage) {
+	if !r.logger.Core().Enabled(zap.InfoLevel) {
+		return
+	}
 	fields := requestOutcomeLogFields(requestID, route, endpoint, streamed, attempts, duration)
 	fields = append(fields,
 		zap.String("outcome", "success"),
@@ -482,6 +699,9 @@ func (r *Router) logRequestCompleted(requestID, endpoint, route string, u Candid
 }
 
 func (r *Router) logRequestFailed(requestID, endpoint, route string, streamed bool, status, attempts int, duration time.Duration, outcome string) {
+	if !r.logger.Core().Enabled(zap.WarnLevel) {
+		return
+	}
 	fields := requestOutcomeLogFields(requestID, route, endpoint, streamed, attempts, duration)
 	fields = append(fields, zap.Int("status", status), zap.String("outcome", outcome))
 	r.logger.Warn(r.logMessage("request_failed"), eventFields("request_failed", fields...)...)
@@ -549,37 +769,76 @@ func (r *Router) do(ctx context.Context, u Candidate, endpoint string, body []by
 	}
 	return r.client.Do(req)
 }
+
+func newUpstreamHTTPClient() *http.Client {
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	// 网关的并发通常集中到少量上游；扩大空闲池可复用 TLS/HTTP2 连接，减少握手和端口抖动。
+	transport.MaxIdleConns = upstreamMaxIdleConns
+	transport.MaxIdleConnsPerHost = upstreamMaxIdleConnsPerHost
+	return &http.Client{Transport: transport}
+}
+
 func (r *Router) pick(name string, route Route, endpoint string, excluded map[string]bool, sessionAffinity string) (Candidate, bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	// 将权重展开为候选槽位，例如 weight=3 的上游在轮转序列中占三个槽位。
+	// 用累计权重定位槽位，避免为大 weight 展开重复候选切片。
 	// 同时过滤正在冷却、或未声明支持 Responses API 的候选。
-	eligible := []Candidate{}
+	totalWeight := 0
+	now := time.Now()
 	for _, u := range route.Candidates {
-		if !u.IsEnabled() || excluded[u.ID] {
-			continue
-		}
-		if endpoint == "responses" && !u.Responses && !u.ResponsesViaChatCompletions {
-			continue
-		}
-		st := r.states[u.ID]
-		if st == nil || !time.Now().Before(st.until) {
-			for i := 0; i < max(1, u.Weight); i++ {
-				eligible = append(eligible, u)
-			}
+		if r.candidateEligible(u, endpoint, excluded, now) {
+			totalWeight += max(1, u.Weight)
 		}
 	}
-	if len(eligible) == 0 {
+	if totalWeight == 0 {
 		return Candidate{}, false
 	}
+	slot := 0
 	if sessionAffinity != "" {
 		// 下游提供会话键时使用稳定哈希，同一会话在候选集合不变时固定到同一上游。
 		// 候选冷却或本次请求已尝试失败时，eligible 会变化，从而仍可故障切换。
-		return eligible[affinitySlot(name, sessionAffinity, len(eligible))], true
+		slot = affinitySlot(name, sessionAffinity, totalWeight)
+	} else {
+		slot = r.next[name] % totalWeight
+		r.next[name]++
 	}
-	u := eligible[r.next[name]%len(eligible)]
-	r.next[name]++
-	return u, true
+	for _, u := range route.Candidates {
+		if !r.candidateEligible(u, endpoint, excluded, now) {
+			continue
+		}
+		weight := max(1, u.Weight)
+		if slot < weight {
+			r.reserveProbeLocked(u, now)
+			return u, true
+		}
+		slot -= weight
+	}
+	return Candidate{}, false
+}
+
+func (r *Router) candidateEligible(u Candidate, endpoint string, excluded map[string]bool, now time.Time) bool {
+	if !u.IsEnabled() || excluded[u.ID] {
+		return false
+	}
+	if endpoint == "responses" && !u.Responses && !u.ResponsesViaChatCompletions {
+		return false
+	}
+	st := r.states[u.ID]
+	return st == nil || (!st.probing && !now.Before(st.until))
+}
+
+func (r *Router) reserveProbeLocked(u Candidate, now time.Time) {
+	if st := r.states[u.ID]; st != nil && st.failures > 0 && !now.Before(st.until) {
+		st.probing = true
+	}
+}
+
+func (r *Router) releaseProbe(u Candidate) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if st := r.states[u.ID]; st != nil {
+		st.probing = false
+	}
 }
 
 func affinitySlot(routeName, sessionAffinity string, slots int) int {
@@ -599,6 +858,10 @@ func hasEnabledAggregateCandidate(route Route) bool {
 	return false
 }
 func (r *Router) fail(_ string, u Candidate, d time.Duration) {
+	r.failUntil(u, time.Now().Add(d))
+}
+
+func (r *Router) failUntil(u Candidate, until time.Time) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	s := r.states[u.ID]
@@ -607,7 +870,8 @@ func (r *Router) fail(_ string, u Candidate, d time.Duration) {
 		r.states[u.ID] = s
 	}
 	s.failures++
-	s.until = time.Now().Add(d)
+	s.until = until
+	s.probing = false
 }
 func (r *Router) success(u Candidate) {
 	r.mu.Lock()
@@ -615,6 +879,7 @@ func (r *Router) success(u Candidate) {
 	if s := r.states[u.ID]; s != nil {
 		s.failures = 0
 		s.until = time.Time{}
+		s.probing = false
 	}
 }
 func (r *Router) record(ctx context.Context, route string, u Candidate, ep string, status, latency int, stream bool, attempt int, usage Usage, kind string) {
@@ -658,13 +923,14 @@ func (r *Router) copyHeaders(w http.ResponseWriter, h http.Header) {
 		}
 	}
 }
-func (r *Router) stream(w http.ResponseWriter, resp *http.Response) Usage {
+func (r *Router) stream(w http.ResponseWriter, resp *http.Response) (Usage, error) {
 	defer resp.Body.Close()
 	r.copyHeaders(w, resp.Header)
 	w.WriteHeader(resp.StatusCode)
 	f, _ := w.(http.Flusher)
 	// 逐行转发 SSE，避免为了统计 usage 而把长输出完整缓存在内存中。
-	reader := bufio.NewReader(resp.Body)
+	reader := acquireSSEReader(resp.Body)
+	defer releaseSSEReader(reader)
 	usage := Usage{Source: "unavailable"}
 	for {
 		line, err := reader.ReadBytes('\n')
@@ -681,7 +947,10 @@ func (r *Router) stream(w http.ResponseWriter, resp *http.Response) Usage {
 			}
 		}
 		if err != nil {
-			return usage
+			if err == io.EOF {
+				return usage, nil
+			}
+			return usage, err
 		}
 	}
 }
@@ -712,10 +981,35 @@ func retryAfter(resp *http.Response) time.Duration {
 }
 
 func exponentialBackoff(retry int) time.Duration {
-	if retry <= 1 {
-		return time.Second
+	return boundedExponentialBackoff(retry, time.Second, 16*time.Second)
+}
+
+func boundedExponentialBackoff(retry int, base, maximum time.Duration) time.Duration {
+	delay := base
+	for step := 1; step < retry && delay < maximum; step++ {
+		if delay > maximum/2 {
+			return maximum
+		}
+		delay *= 2
 	}
-	return time.Second * time.Duration(1<<min(retry-1, 30))
+	if delay > maximum {
+		return maximum
+	}
+	return delay
+}
+
+func jitteredExponentialBackoff(retry int, base, maximum time.Duration) time.Duration {
+	upper := boundedExponentialBackoff(retry, base, maximum)
+	lower := upper / 2
+	span := upper - lower
+	if span <= 0 {
+		return upper
+	}
+	var random [8]byte
+	if _, err := rand.Read(random[:]); err != nil {
+		return upper
+	}
+	return lower + time.Duration(binary.LittleEndian.Uint64(random[:])%uint64(span+1))
 }
 
 func waitForRetry(ctx context.Context, delay time.Duration) bool {

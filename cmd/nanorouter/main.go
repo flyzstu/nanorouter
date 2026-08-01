@@ -7,6 +7,8 @@ import (
 	"flag"
 	"net/http"
 	"os"
+	"os/signal"
+	"syscall"
 	"time"
 	_ "time/tzdata"
 
@@ -58,9 +60,27 @@ func main() {
 	}
 	server := &http.Server{Addr: cfg.Listen, Handler: srv.Handler(), ReadHeaderTimeout: 10 * time.Second}
 	logger.Info(message("nanorouter started", "nanorouter 已启动"), zap.String("listen", cfg.Listen), zap.String("database_driver", cfg.Database.Driver))
-	if err := server.ListenAndServe(); !errors.Is(err, http.ErrServerClosed) {
-		logger.Fatal(message("server stopped unexpectedly", "服务器意外停止"), zap.Error(err))
+	runErr := make(chan error, 1)
+	go func() { runErr <- server.ListenAndServe() }()
+	shutdownSignal, stopSignals := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stopSignals()
+	select {
+	case err := <-runErr:
+		if !errors.Is(err, http.ErrServerClosed) {
+			logger.Error(message("server stopped unexpectedly", "服务器意外停止"), zap.Error(err))
+		}
+	case <-shutdownSignal.Done():
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		if err := server.Shutdown(shutdownCtx); err != nil {
+			logger.Error(message("HTTP shutdown failed", "HTTP 服务关闭失败"), zap.Error(err))
+		}
+		cancel()
 	}
+	ledgerCtx, cancelLedger := context.WithTimeout(context.Background(), 5*time.Second)
+	if err := srv.Close(ledgerCtx); err != nil {
+		logger.Error(message("ledger flush failed", "账本排空失败"), zap.Error(err))
+	}
+	cancelLedger()
 }
 
 func newLogger(levelName, format string, color, debug bool) (*zap.Logger, error) {

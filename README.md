@@ -142,6 +142,30 @@ Responses→Chat 适配。若部署的 llama-server 已验证原生 Responses �
   queue_timeout: 30s
 ```
 
+`attempt_timeout` 限制一次候选调用的完整生命周期，包括等待响应头、非流式正文和 SSE 流。超时发生在尚未向下游发送内容前时可继续故障切换；SSE 已经开始后只能终止该流，不能安全拼接另一模型。`0s` 表示只使用全局 `request_timeout`。
+
+可选的自适应并发使用 AIMD：出现排队且 TTFB 达标时逐步加一，收到 429 或 TTFB 超过目标两倍时减半，并始终限制在 `min_concurrency` 与 `max_concurrency` 之间：
+
+```yaml
+max_concurrency: 32
+queue_timeout: 2s
+attempt_timeout: 60s
+adaptive_concurrency: true
+min_concurrency: 2
+target_ttfb: 2s
+```
+
+## 全局背压
+
+候选并发限制保护单个上游，全局背压保护网关进程。它在读取请求体前占用准入槽，因此上游整体变慢时，最多只有 `max_inflight + max_queue` 个生成请求占用网关资源。队列已满或等待超过 `queue_timeout` 时返回 `429 gateway_overloaded` 并带 `Retry-After: 1`；`max_inflight: 0`（默认）表示关闭。
+
+```yaml
+backpressure:
+  max_inflight: 512
+  max_queue: 128
+  queue_timeout: 1s
+```
+
 ## SenseNova 的 Responses 适配
 
 SenseNova 候选使用 `responses_via_chat_completions: true` 时，下游可以照常请求 `/v1/responses`，网关会向上游调用 Chat Completions，并把结果包装回 Responses 格式。
@@ -169,7 +193,7 @@ SenseNova 目前推荐使用 `token.sensenova.cn/v1` 端点，该端点为标准
   max_tokens_limit: 65536
 ```
 
-两个模型均支持 `reasoning_effort`（`"low"` / `"medium"` / `"high"` / `"none"`）。DeepSeek V4 Flash 思考模式下响应中会额外包含 `reasoning_content` 字段（推理过程），网关直接透传给下游。
+两个模型均支持 `reasoning_effort`（`"low"` / `"medium"` / `"high"` / `"none"`）。DeepSeek V4 Flash 思考模式下 Chat Completions 响应中会额外包含 `reasoning_content` 字段（推理过程），普通 Chat 请求会直接透传；Responses 适配无法把它伪装成原生 reasoning Item。
 
 `max_tokens_limit` 会在选中候选后，把 Chat Completions 的 `max_tokens` /
 `max_completion_tokens`、Responses 的 `max_output_tokens`，以及适配器生成的自定义 token
@@ -178,7 +202,9 @@ SenseNova 目前推荐使用 `token.sensenova.cn/v1` 端点，该端点为标准
 
 若路由中同时存在不支持 `reasoning_effort` 的其他候选（如 Groq、Agnes、Mistral、Cerebras），应在那些候选上配置 `drop_request_fields: [reasoning_effort]`。清洗在选中候选后不影响故障转移时其他候选接收该字段的能力。
 
-适配器支持：`input`（文本/图片消息）、`instructions`、`temperature`、`top_p`、`max_output_tokens`、流式与 usage。`tools`、`tool_choice`、`previous_response_id`、`background` 等字段会返回 `400 unsupported_response_feature`，不会静默降级。
+适配器支持：`input`（文本/图片消息及手动回传的 `output_text`）、`instructions`、常用采样参数、`max_output_tokens`、`reasoning.effort`、`text.verbosity`、`text.format` 结构化输出、自定义函数 `tools` / `tool_choice` / `parallel_tool_calls`、`function_call` / `function_call_output`、流式事件与 usage。Chat 返回的函数调用、拒绝和 token 截断状态也会转换为对应 Responses Item 或状态。
+
+这不是 100% 的 API 等价层。`web_search`、`file_search`、Code Interpreter、MCP 等 OpenAI 托管工具，`previous_response_id` / Conversations 状态链、`background`、prompt 模板和 reasoning summary 没有纯 Chat Completions 等价物，会返回 `400 unsupported_response_feature`，不会静默丢弃。各上游对函数调用、严格 JSON Schema、推理参数的支持仍可能不同，可用候选级字段清洗处理无副作用的参数差异；需要完整 Responses 语义时应使用 `responses: true` 的原生候选。
 
 Mistral Medium 3.5 使用 `https://api.mistral.ai/v1`、模型 ID `mistral-medium-3-5`，原生支持 Chat Completions；示例为其开启 Responses→Chat 适配。所有候选均可设置 `enabled: false` 临时下线，无需删除密钥或配置。未设置 `enabled` 时默认启用；全部候选均禁用的路由不会出现在 `/v1/models`。
 
@@ -186,7 +212,7 @@ Cerebras 的 `gpt-oss-120b` 使用 `https://api.cerebras.ai/v1`，原生支持 C
 
 ## 智谱 GLM 上游
 
-`zhipu-agent` 示例使用智谱通用端点 `https://open.bigmodel.cn/api/paas/v4` 和 `ZHIPUAI_API_KEY`。请将示例模型替换为账户实际可用的模型 ID。它原生使用 Chat Completions；`/v1/responses` 请求会经过受限适配，因此含工具调用或 `previous_response_id` 的 Responses 请求会明确返回 `400`。使用智谱 Coding 套餐时，应把 `base_url` 改为 `https://open.bigmodel.cn/api/coding/paas/v4`。
+`zhipu-agent` 示例使用智谱通用端点 `https://open.bigmodel.cn/api/paas/v4` 和 `ZHIPUAI_API_KEY`。请将示例模型替换为账户实际可用的模型 ID。它原生使用 Chat Completions；`/v1/responses` 请求会经过受限适配，自定义函数调用可转换，但内建工具或 `previous_response_id` 会明确返回 `400`。使用智谱 Coding 套餐时，应把 `base_url` 改为 `https://open.bigmodel.cn/api/coding/paas/v4`。
 
 OpenCode 会向部分 OpenAI 兼容上游发送 `promptCacheKey`。智谱候选默认删除该字段；智谱的上下文缓存由服务端按重复内容自动复用，不需要客户端传入该参数。
 
@@ -222,9 +248,30 @@ Model:    free-fast
 ## 429 重试与日志
 
 当某个上游返回 `429` 时，网关会先将它暂时冷却并尝试同一路由的其他候选；若一轮候选都不可用，
-网关会在**同一个下游请求**中最多重试 5 次，退避间隔依次为 1、2、4、8、16 秒。上游给出
-`Retry-After` 时，网关会采用不短于该值的等待时间。整个过程受 `request_timeout` 和客户端取消约束；
+网关默认在**同一个下游请求**中最多重试 5 次。指数退避上限依次为 1、2、4、8、16 秒，实际等待加入
+50%–100% 等抖动，避免大量请求同时苏醒。上游给出 `Retry-After` 时，它是该候选的最小冷却时间；
+多个候选同时限流时只等待最早可恢复的候选。整个过程受 `request_timeout` 和客户端取消约束；
 超过重试次数后才返回 `429 upstream_rate_limited`，无需下游重复提交同一请求。
+
+可通过全局配置调整流量放大与尾延迟；`max_rate_limit_retries: 0` 会禁用请求内重试，但仍保留候选间故障切换：
+
+```yaml
+retry:
+  max_rate_limit_retries: 5
+  base_delay: 1s
+  max_delay: 16s
+```
+
+聚合路由还可启用 Retry Budget，限制故障切换造成的请求放大。每个初始请求补充 `ratio` 个令牌，第二次及以后真正发往上游的调用各消耗一个；令牌最多积累到 `burst`。预算耗尽时返回 `429 retry_budget_exhausted`。本地候选排队失败不扣令牌；默认关闭以保持兼容。
+
+```yaml
+routes:
+  free-fast:
+    retry_budget:
+      enabled: true
+      ratio: 0.1
+      burst: 10
+```
 
 每个 Chat Completions / Responses 请求会按 `request_started`、`upstream_attempt_started`、
 `upstream_response_received`、`upstream_attempt_finished`、`retry_scheduled`、`request_completed`
@@ -254,11 +301,48 @@ GROUP BY upstream_id, upstream_model
 ORDER BY total_tokens DESC;'
 ```
 
-Prometheus 抓取 `GET /metrics`。仅记录供应商实际返回的 `usage`；缺失时标为 `unavailable`，不会伪造估算 token。
+Prometheus 抓取 `GET /metrics`。除请求数、故障切换和 token 外，还提供：
 
-日志默认写到标准错误输出，采用 Zap 的 JSON 格式；只包含路由、上游、模型、状态、耗时和用量，绝不输出 prompt、模型回复或 API Key。
+- `nanorouter_upstream_ttfb_seconds`：上游首字节/响应头延迟；
+- `nanorouter_upstream_queue_seconds`：候选并发槽排队时间；
+- `nanorouter_retry_delay_seconds`：实际安排的内部退避时间；
+- `nanorouter_upstream_inflight`：各路由和上游当前在途量。
+- `nanorouter_upstream_concurrency_limit`：当前固定或自适应并发窗口；
+- `nanorouter_backpressure_inflight` / `nanorouter_backpressure_queued`：全局准入在途量和排队量；
+- `nanorouter_backpressure_rejected_total`：按队列满、等待超时等原因统计的拒绝数；
+- `nanorouter_retry_budget_tokens` / `nanorouter_retry_budget_denied_total`：路由重试令牌和拒绝数；
+- `nanorouter_ledger_dropped_total` / `nanorouter_ledger_write_errors_total`：异步队列丢弃和数据库写入失败。
+
+仅记录供应商实际返回的 `usage`；缺失时标为 `unavailable`，不会伪造估算 token。
+
+日志默认写到标准错误输出，格式由 `logging.format` 控制；只包含路由、上游、模型、状态、耗时和用量，绝不输出 prompt、模型回复或 API Key。
 
 实现思路与关键权衡见[设计文档](docs/design.md)。
+
+## 异步账本与性能分析
+
+SQLite 高 QPS 部署可选择批量写入。关闭服务时 `nanorouter` 会先停止 HTTP 接流量，再最多等待 5 秒排空账本。异步队列满时不会阻塞生成请求，而是丢弃账本记录并增加 Prometheus 指标：
+
+```yaml
+database:
+  driver: sqlite
+  dsn: ./nanorouter.db
+  async_write: true
+  batch_size: 100
+  flush_interval: 100ms
+  queue_size: 4096
+```
+
+运行四种完整协议基准：
+
+```sh
+./scripts/bench.sh
+BENCHTIME=15s PROFILE_DIR=/tmp/nanorouter-profile ./scripts/profile.sh
+```
+
+在当前基准环境中，按 pprof 结果延迟构造关闭级别的日志字段、复用 SSE reader，并避免在未配置候选超时时创建额外 context 后，四类基准的分配空间下降约 26%–43%，分配次数下降 5%–11%。具体数值依 Go 版本、CPU 和上游响应大小变化，应以部署机器的 profile 为准。
+
+需要在线 pprof 时显式设置 `profiling.enabled: true`，然后访问 `/debug/pprof/`。该端点包含运行时信息，不应在未配置 `auth_env` 的公网实例开启。
 
 ## 流式限制
 

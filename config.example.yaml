@@ -2,6 +2,11 @@ listen: ":8080"
 database:
   driver: sqlite
   dsn: "./nanorouter.db"
+  # 高 QPS 时可异步批量写账本；队列满或进程崩溃可能丢失尚未落盘的记录。
+  async_write: false
+  batch_size: 100
+  flush_interval: 100ms
+  queue_size: 4096
 # 默认输出带颜色的 key=value 文本；采集系统需要 JSON 时设置 format: json。
 logging:
   language: zh-CN
@@ -12,6 +17,19 @@ logging:
 # 设定后，下游需使用 Authorization: Bearer $NANOROUTER_API_KEY。
 auth_env: NANOROUTER_API_KEY
 request_timeout: 90s
+# 429 会先切换其他候选；全部限流后按等抖动指数退避重试。
+retry:
+  max_rate_limit_retries: 5
+  base_delay: 1s
+  max_delay: 16s
+# 进程级准入在读取请求体之前生效；满载后只允许有限请求短暂排队。
+backpressure:
+  max_inflight: 512
+  max_queue: 128
+  queue_timeout: 1s
+# 默认关闭。开启后 /debug/pprof/* 与其他端点使用相同的 Bearer 鉴权。
+profiling:
+  enabled: false
 
 routes:
   # llama-server 使用服务根地址即可；llama_server: true 会自动补上 /v1。
@@ -28,6 +46,12 @@ routes:
         # 同时只向本地模型发送一个请求；其余请求最多排队 30 秒，随后返回 429。
         max_concurrency: 1
         queue_timeout: 30s
+        # 单次上游调用（包括完整 SSE）的截止时间；0 表示仅使用全局 request_timeout。
+        attempt_timeout: 60s
+        # 可选 AIMD：从 min_concurrency 起步，在 max_concurrency 内动态调整。
+        adaptive_concurrency: false
+        min_concurrency: 1
+        target_ttfb: 2s
         # llama-server 各版本均支持 Chat Completions；Responses 请求走受限适配。
         responses_via_chat_completions: true
         # 其他上游思考模型可能在对话历史中包含 reasoning_content，llama-server 不支持该字段。
@@ -55,6 +79,11 @@ routes:
 
   free-fast:
     strategy: weighted_round_robin
+    # 正常请求补充 10% 重试令牌；额外上游调用消耗一个，最多积累 10 个。
+    retry_budget:
+      enabled: true
+      ratio: 0.1
+      burst: 10
     candidates:
       # 保留 zhipu-agent 作为固定智谱路由；这里额外纳入 free-fast，
       # 让聚合路由可按权重选择智谱，并在其他上游失败时切换到它。
