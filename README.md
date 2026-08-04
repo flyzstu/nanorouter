@@ -210,6 +210,25 @@ Mistral Medium 3.5 使用 `https://api.mistral.ai/v1`、模型 ID `mistral-mediu
 
 Cerebras 的 `gpt-oss-120b` 使用 `https://api.cerebras.ai/v1`，原生支持 Chat Completions、流式、函数调用与结构化输出；示例为其启用 Responses→Chat 适配。普通 Chat 请求会完整透传工具调用；经适配的 Responses 请求仍只支持本文前述可无损映射的字段。
 
+## Nous Research Hermes 上游
+
+Nous Research 提供 OpenAI 兼容的 Chat Completions 接口，基础地址为
+`https://inference-api.nousresearch.com/v1`。示例接入 `Hermes-4.3-36B`，并使用
+`NOUS_API_KEY` 环境变量传入 API Key；下游请求 `/v1/responses` 时由网关适配到 Chat Completions：
+
+```yaml
+- id: nous-hermes-4-3-36b
+  base_url: https://inference-api.nousresearch.com/v1
+  api_key_env: NOUS_API_KEY
+  model: Hermes-4.3-36B
+  expose_as: hermes-4.3-36b
+  weight: 1
+  enabled: true
+  responses_via_chat_completions: true
+```
+
+Nous 的 Free 级别有独立的 RPM/TPM 限制；请先确认账户额度和 `NOUS_API_KEY` 有效，再将生产部署模板中的候选设为 `enabled: true`。
+
 ## 智谱 GLM 上游
 
 `zhipu-agent` 示例使用智谱通用端点 `https://open.bigmodel.cn/api/paas/v4` 和 `ZHIPUAI_API_KEY`。请将示例模型替换为账户实际可用的模型 ID。它原生使用 Chat Completions；`/v1/responses` 请求会经过受限适配，自定义函数调用可转换，但内建工具或 `previous_response_id` 会明确返回 `400`。使用智谱 Coding 套餐时，应把 `base_url` 改为 `https://open.bigmodel.cn/api/coding/paas/v4`。

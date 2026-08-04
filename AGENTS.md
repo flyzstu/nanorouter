@@ -4,6 +4,13 @@
 
 This is a Go OpenAI-compatible routing gateway. The executable entry point is `cmd/nanorouter/main.go`. Core routing, upstream adaptation, usage parsing, SQLite persistence, and request sanitization live in `internal/router/`. Tests sit beside implementation in `internal/router/*_test.go`. Keep user-facing setup in `README.md`, architectural decisions in `docs/design.md`, and runnable provider examples in `config.example.yaml`.
 
+## Design Reference
+
+Read [docs/design.md](docs/design.md) before changing routing, upstream protocol adaptation, retry or
+backpressure behavior, persistence, observability, deployment boundaries, or security assumptions. Keep
+that document updated when a change alters the architecture or one of its explicit trade-offs; avoid
+duplicating the full design rationale in this file.
+
 ## Build, Test, and Development Commands
 
 - `go run ./cmd/nanorouter -config config.yaml` — run the gateway locally.

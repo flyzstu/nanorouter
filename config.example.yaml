@@ -212,3 +212,13 @@ routes:
           - reasoning_effort
         drop_message_fields:
           - reasoning_content
+
+      # Nous Research Hermes 4.3 36B 只提供 Chat Completions；Responses 通过适配器提供。
+      - id: nous-hermes-4-3-36b
+        base_url: https://inference-api.nousresearch.com/v1
+        api_key_env: NOUS_API_KEY
+        model: Hermes-4.3-36B
+        expose_as: hermes-4.3-36b
+        weight: 1
+        enabled: true
+        responses_via_chat_completions: true
