@@ -226,8 +226,9 @@ PostgreSQL DSN，避免连接凭据进入 ConfigMap。
 
 SQLite 可选异步批量写：正常关闭会排空队列，队列溢出或异常退出可能丢失尚未提交的记录，因此
 生产环境应结合 `nanorouter_ledger_dropped_total` 和 `nanorouter_ledger_write_errors_total` 监控
-账本完整性。实时熔断、并发窗口、背压队列和 Retry Budget 当前都是单实例内存状态，数据库不会
-改变它们。
+账本完整性。账本写入失败（队列满、已关闭或数据库错误）会额外记录 `ledger_write_failed` 事件，
+携带 `request_id`、路由、上游和错误类别，便于按请求定位丢失的账本记录。实时熔断、并发窗口、
+背压队列和 Retry Budget 当前都是单实例内存状态，数据库不会改变它们。
 
 运行日志使用 Zap 的结构化 JSON；`-debug` 则用相同字段输出稳定的 `key=value` 文本。每个请求以
 `request_started` 开始，随后记录 `upstream_attempt_started`、`upstream_attempt_finished` 和必要时的

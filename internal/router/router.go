@@ -382,7 +382,7 @@ func (r *Router) proxy(endpoint string) http.HandlerFunc {
 				concurrencyLimited = true
 				queueLatency := int(time.Since(queueStart).Milliseconds())
 				r.queueWait.WithLabelValues(routeName, u.ID, endpoint, "timeout").Observe(time.Since(queueStart).Seconds())
-				r.record(q.Context(), routeName, u, endpoint, http.StatusTooManyRequests, queueLatency, streamed, attempt, Usage{Source: "unavailable"}, "concurrency")
+				r.record(q.Context(), requestID, routeName, u, endpoint, http.StatusTooManyRequests, queueLatency, streamed, attempt, Usage{Source: "unavailable"}, "concurrency")
 				r.failovers.WithLabelValues(routeName, "concurrency_limit").Inc()
 				if r.logger.Core().Enabled(zap.WarnLevel) {
 					r.logger.Warn(r.logMessage("upstream_attempt_finished"), eventFields("upstream_attempt_finished", append(failureLogFields(requestID, routeName, u, endpoint, attempt, queueLatency, streamed, http.StatusTooManyRequests, "concurrency_limit", true), zap.String("attempt_phase", "queue"))...)...)
@@ -434,7 +434,7 @@ func (r *Router) proxy(endpoint string) http.HandlerFunc {
 					outcome = "attempt_timeout"
 				}
 				r.observeConcurrency(u, status, ttfbDuration, queueDuration > time.Millisecond)
-				r.record(q.Context(), routeName, u, endpoint, status, latency, streamed, attempt, Usage{Source: "unavailable"}, kind)
+				r.record(q.Context(), requestID, routeName, u, endpoint, status, latency, streamed, attempt, Usage{Source: "unavailable"}, kind)
 				r.fail(routeName, u, 30*time.Second)
 				r.failovers.WithLabelValues(routeName, kind).Inc()
 				if r.logger.Core().Enabled(zap.WarnLevel) {
@@ -478,7 +478,7 @@ func (r *Router) proxy(endpoint string) http.HandlerFunc {
 					upstreamError := r.copyErrorResponse(w, resp)
 					cancelAttempt()
 					release()
-					r.record(q.Context(), routeName, u, endpoint, resp.StatusCode, latency, streamed, attempt, Usage{Source: "unavailable"}, "client")
+					r.record(q.Context(), requestID, routeName, u, endpoint, resp.StatusCode, latency, streamed, attempt, Usage{Source: "unavailable"}, "client")
 					if r.logger.Core().Enabled(zap.WarnLevel) {
 						fields := failureLogFields(requestID, routeName, u, endpoint, attempt, latency, streamed, resp.StatusCode, "upstream_rejected", false)
 						fields = append(fields, upstreamError.logFields(true)...)
@@ -507,7 +507,7 @@ func (r *Router) proxy(endpoint string) http.HandlerFunc {
 				} else {
 					r.fail(routeName, u, cooldown(resp))
 				}
-				r.record(q.Context(), routeName, u, endpoint, resp.StatusCode, latency, streamed, attempt, Usage{Source: "unavailable"}, "upstream")
+				r.record(q.Context(), requestID, routeName, u, endpoint, resp.StatusCode, latency, streamed, attempt, Usage{Source: "unavailable"}, "upstream")
 				r.failovers.WithLabelValues(routeName, http.StatusText(resp.StatusCode)).Inc()
 				if r.logger.Core().Enabled(zap.WarnLevel) {
 					fields := failureLogFields(requestID, routeName, u, endpoint, attempt, latency, streamed, resp.StatusCode, "upstream_unavailable", true)
@@ -533,12 +533,12 @@ func (r *Router) proxy(endpoint string) http.HandlerFunc {
 				duration := int(time.Since(start).Milliseconds())
 				if streamErr != nil {
 					r.fail(routeName, u, 30*time.Second)
-					r.record(q.Context(), routeName, u, endpoint, 0, duration, true, attempt, usage, "stream")
+					r.record(q.Context(), requestID, routeName, u, endpoint, 0, duration, true, attempt, usage, "stream")
 					r.logRequestFailed(requestID, endpoint, routeName, true, 0, attempt+1, time.Since(startedAt), "stream_interrupted")
 					return
 				}
 				r.success(u)
-				r.record(q.Context(), routeName, u, endpoint, resp.StatusCode, duration, true, attempt, usage, "")
+				r.record(q.Context(), requestID, routeName, u, endpoint, resp.StatusCode, duration, true, attempt, usage, "")
 				if r.logger.Core().Enabled(zap.InfoLevel) {
 					r.logger.Info(r.logMessage("upstream_attempt_finished"), eventFields("upstream_attempt_finished", successLogFields(requestID, routeName, u, endpoint, attempt, latency, duration, true, resp.StatusCode, usage)...)...)
 				}
@@ -550,7 +550,7 @@ func (r *Router) proxy(endpoint string) http.HandlerFunc {
 				if readErr != nil {
 					release()
 					r.fail(routeName, u, 30*time.Second)
-					r.record(q.Context(), routeName, u, endpoint, http.StatusGatewayTimeout, int(time.Since(start).Milliseconds()), false, attempt, Usage{Source: "unavailable"}, "attempt_timeout")
+					r.record(q.Context(), requestID, routeName, u, endpoint, http.StatusGatewayTimeout, int(time.Since(start).Milliseconds()), false, attempt, Usage{Source: "unavailable"}, "attempt_timeout")
 					attempt++
 					continue
 				}
@@ -560,7 +560,7 @@ func (r *Router) proxy(endpoint string) http.HandlerFunc {
 					if err != nil {
 						release()
 						writeAPIError(w, http.StatusBadGateway, "cannot adapt upstream chat response: "+err.Error(), "upstream_error")
-						r.record(q.Context(), routeName, u, endpoint, resp.StatusCode, latency, false, attempt, Usage{Source: "unavailable"}, "upstream")
+						r.record(q.Context(), requestID, routeName, u, endpoint, resp.StatusCode, latency, false, attempt, Usage{Source: "unavailable"}, "upstream")
 						r.logRequestFailed(requestID, endpoint, routeName, false, http.StatusBadGateway, attempt+1, time.Since(startedAt), "response_adaptation_failed")
 						return
 					}
@@ -573,7 +573,7 @@ func (r *Router) proxy(endpoint string) http.HandlerFunc {
 				release()
 				usage := usageFromJSON(b)
 				duration := int(time.Since(start).Milliseconds())
-				r.record(q.Context(), routeName, u, endpoint, resp.StatusCode, duration, false, attempt, usage, "")
+				r.record(q.Context(), requestID, routeName, u, endpoint, resp.StatusCode, duration, false, attempt, usage, "")
 				if r.logger.Core().Enabled(zap.InfoLevel) {
 					r.logger.Info(r.logMessage("upstream_attempt_finished"), eventFields("upstream_attempt_finished", successLogFields(requestID, routeName, u, endpoint, attempt, latency, duration, false, resp.StatusCode, usage)...)...)
 				}
@@ -743,6 +743,7 @@ var chineseLogMessages = map[string]string{
 	"retry_scheduled":            "已安排上游重试",
 	"request_completed":          "请求处理完成",
 	"request_failed":             "请求处理失败",
+	"ledger_write_failed":        "账本写入失败",
 }
 
 func eventFields(event string, fields ...zap.Field) []zap.Field {
@@ -898,8 +899,25 @@ func (r *Router) success(u Candidate) {
 		s.probing = false
 	}
 }
-func (r *Router) record(ctx context.Context, route string, u Candidate, ep string, status, latency int, stream bool, attempt int, usage Usage, kind string) {
-	r.db.Insert(ctx, Record{newID(), route, u.ID, u.Model, ep, kind, status, latency, attempt, stream, usage})
+func (r *Router) record(ctx context.Context, requestID, route string, u Candidate, ep string, status, latency int, stream bool, attempt int, usage Usage, kind string) {
+	// 账本写入失败（队列满、已关闭或数据库错误）不阻塞请求本身，
+	// 但必须留下带 request_id 的日志，否则只能靠聚合指标定位丢失。
+	if err := r.db.Insert(ctx, Record{
+		ID: newID(), Route: route, UpstreamID: u.ID, UpstreamModel: u.Model,
+		Endpoint: ep, ErrorKind: kind, Status: status, LatencyMS: latency,
+		Attempt: attempt, Streamed: stream, Usage: usage,
+	}); err != nil && r.logger.Core().Enabled(zap.WarnLevel) {
+		r.logger.Warn(r.logMessage("ledger_write_failed"), eventFields("ledger_write_failed",
+			zap.String("request_id", requestID),
+			zap.String("route", route),
+			zap.String("upstream", u.ID),
+			zap.String("endpoint", ep),
+			zap.Int("status", status),
+			zap.Int("attempt", attempt+1),
+			zap.String("error_kind", kind),
+			zap.Error(err),
+		)...)
+	}
 	r.requests.WithLabelValues(route, u.ID, ep, fmt.Sprint(status)).Inc()
 	if usage.Source == "upstream" {
 		r.tokens.WithLabelValues(route, u.ID, "prompt").Add(float64(usage.Prompt))

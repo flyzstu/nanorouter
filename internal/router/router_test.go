@@ -1755,3 +1755,41 @@ func TestReasoningContentStrippedFromAssistantMessages(t *testing.T) {
 		t.Fatalf("content was altered: %v", assistant["content"])
 	}
 }
+
+func TestLedgerWriteFailureIsLogged(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"usage":{"prompt_tokens":1,"completion_tokens":2,"total_tokens":3}}`))
+	}))
+	defer upstream.Close()
+	db, err := sql.Open("sqlite3", ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := Migrate(context.Background(), db); err != nil {
+		t.Fatal(err)
+	}
+	core, observed := observer.New(zap.InfoLevel)
+	r, err := NewWithLogger(Config{Routes: map[string]Route{"free": {Candidates: []Candidate{{ID: "u", BaseURL: upstream.URL, Model: "up"}}}}}, db, zap.New(core))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 账本数据库不可用时，请求本身仍应成功，但写入失败必须留下可定位的日志。
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"free","messages":[]}`))
+	req.Header.Set("X-Request-ID", "call-123")
+	rec := httptest.NewRecorder()
+	r.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	entries := observed.FilterMessage("ledger_write_failed").All()
+	if len(entries) != 1 {
+		t.Fatalf("ledger_write_failed logs=%v", observed.All())
+	}
+	fields := entries[0].ContextMap()
+	if fields["request_id"] != "call-123" || fields["route"] != "free" || fields["upstream"] != "u" || fields["event"] != "ledger_write_failed" {
+		t.Fatalf("fields=%v", fields)
+	}
+}

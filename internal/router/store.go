@@ -38,9 +38,14 @@ type Record struct {
 	Status, LatencyMS, Attempt                                int
 	Streamed                                                  bool
 	Usage                                                     Usage
+	// CreatedAt 在记录生成时确定，避免异步批量落盘时时间戳整体后移。
+	CreatedAt time.Time
 }
 
 func (s *Store) Insert(ctx context.Context, r Record) error {
+	if r.CreatedAt.IsZero() {
+		r.CreatedAt = time.Now()
+	}
 	if s.queue == nil {
 		_, err := s.db.ExecContext(ctx, s.insertQuery, recordArgs(r)...)
 		if err != nil {
@@ -64,7 +69,7 @@ func (s *Store) Insert(ctx context.Context, r Record) error {
 }
 
 func recordArgs(r Record) []any {
-	return []any{r.ID, time.Now().UTC().Format(time.RFC3339Nano), r.Route, r.UpstreamID, r.UpstreamModel, r.Endpoint, r.Status, r.LatencyMS, boolInt(r.Streamed), r.Attempt, r.Usage.Prompt, r.Usage.Completion, r.Usage.Total, r.Usage.Source, r.ErrorKind}
+	return []any{r.ID, r.CreatedAt.UTC().Format(time.RFC3339Nano), r.Route, r.UpstreamID, r.UpstreamModel, r.Endpoint, r.Status, r.LatencyMS, boolInt(r.Streamed), r.Attempt, r.Usage.Prompt, r.Usage.Completion, r.Usage.Total, r.Usage.Source, r.ErrorKind}
 }
 func boolInt(v bool) int {
 	if v {
