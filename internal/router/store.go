@@ -44,7 +44,7 @@ type Record struct {
 
 func (s *Store) Insert(ctx context.Context, r Record) error {
 	if r.CreatedAt.IsZero() {
-		r.CreatedAt = time.Now()
+		r.CreatedAt = s.now()
 	}
 	if s.queue == nil {
 		_, err := s.db.ExecContext(ctx, s.insertQuery, recordArgs(r)...)
@@ -90,6 +90,7 @@ type Store struct {
 	enqueueMu   sync.RWMutex
 	batchSize   int
 	flushEvery  time.Duration
+	now         func() time.Time
 	dropped     atomic.Uint64
 	writeErrors atomic.Uint64
 	closed      atomic.Bool
@@ -101,7 +102,7 @@ func NewStore(db *sql.DB, driver string) *Store {
 
 func NewStoreWithConfig(db *sql.DB, cfg DatabaseConfig) *Store {
 	driver := cfg.Driver
-	store := &Store{db: db, rebind: func(query string) string { return query }}
+	store := &Store{db: db, now: time.Now, rebind: func(query string) string { return query }}
 	if driver == "postgres" {
 		store.rebind = postgresPlaceholders
 	}

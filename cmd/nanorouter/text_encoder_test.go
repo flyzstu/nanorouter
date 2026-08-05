@@ -38,6 +38,27 @@ func TestTextEncoderColorsLevel(t *testing.T) {
 	}
 }
 
+func TestTextEncoderPrioritizesAndColorsModelFields(t *testing.T) {
+	encoder := newTextEncoder(true)
+	buf, err := encoder.EncodeEntry(
+		zapcore.Entry{Time: time.Now(), Level: zapcore.InfoLevel, Message: "attempt"},
+		[]zapcore.Field{
+			zap.Int("attempt", 1),
+			zap.String("upstream_model", "deepseek-chat"),
+			zap.String("route", "free-fast"),
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := buf.String()
+	// upstream_model 与 route 需优先且带颜色打印，upstream_model 位于最前面
+	expected := "upstream_model=\x1b[36;1m\"deepseek-chat\"\x1b[0m route=\x1b[36;1m\"free-fast\"\x1b[0m attempt=1"
+	if !strings.Contains(got, expected) {
+		t.Fatalf("expected log to contain %q, got %q", expected, got)
+	}
+}
+
 func TestLoggerUsesConfiguredLevel(t *testing.T) {
 	logger, err := newLogger("WARN", "text", true, false)
 	if err != nil {

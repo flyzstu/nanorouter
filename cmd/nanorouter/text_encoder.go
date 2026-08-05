@@ -40,9 +40,30 @@ func (e *textEncoder) EncodeEntry(entry zapcore.Entry, fields []zapcore.Field) (
 	buf.AppendString(e.level(entry.Level))
 	buf.AppendByte('\t')
 	buf.AppendString(entry.Message)
+	// 优先提取 upstream_model 等模型与路由字段，使其置于日志头部并使用 ANSI 彩色高亮显示
+	priorityKeys := []string{"upstream_model", "route", "model", "requested_model"}
+	printedPriority := make(map[string]bool, len(priorityKeys))
+	for _, key := range priorityKeys {
+		if val, ok := clone.fields.Fields[key]; ok {
+			printedPriority[key] = true
+			buf.AppendByte(' ')
+			buf.AppendString(key)
+			buf.AppendByte('=')
+			if e.colored {
+				buf.AppendString("\x1b[36;1m") // 青色高亮
+				buf.AppendString(formatLogValue(val))
+				buf.AppendString("\x1b[0m")
+			} else {
+				buf.AppendString(formatLogValue(val))
+			}
+		}
+	}
+
 	keys := make([]string, 0, len(clone.fields.Fields))
 	for key := range clone.fields.Fields {
-		keys = append(keys, key)
+		if !printedPriority[key] {
+			keys = append(keys, key)
+		}
 	}
 	sort.Strings(keys)
 	for _, key := range keys {

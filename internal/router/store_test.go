@@ -22,13 +22,14 @@ func TestAsyncLedgerKeepsInsertTime(t *testing.T) {
 	}
 	// FlushInterval 足够大，保证记录入队后、Close 排空前不会因 ticker 提前落库。
 	store := NewStoreWithConfig(db, DatabaseConfig{Driver: "sqlite", AsyncWrite: true, BatchSize: 100, FlushInterval: 5 * time.Second, QueueSize: 10})
-	enqueuedAt := time.Now()
+	enqueuedAt := time.Date(2026, 8, 4, 12, 0, 0, 123000000, time.UTC)
+	store.now = func() time.Time { return enqueuedAt }
 	if err := store.Insert(context.Background(), Record{ID: "r1", Route: "free", UpstreamID: "u", UpstreamModel: "up", Endpoint: "chat_completions", Status: 200, LatencyMS: 10, Usage: Usage{Source: "unavailable"}}); err != nil {
 		t.Fatal(err)
 	}
-	// 制造入队与排空（flush）之间足够大的时间差，使两种实现可被区分。
-	time.Sleep(2 * time.Second)
-	// Close 触发排空，flush 发生在入队 2 秒之后。
+	// 模拟 flush 时钟已经前进；如果 recordArgs 重新取当前时间，测试会失败。
+	store.now = func() time.Time { return enqueuedAt.Add(2 * time.Second) }
+	// Close 触发排空。
 	if err := store.Close(context.Background()); err != nil {
 		t.Fatal(err)
 	}
@@ -40,8 +41,7 @@ func TestAsyncLedgerKeepsInsertTime(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// 时间戳应接近入队时刻；若取自 flush 时刻，会晚约 2 秒以上。
-	if diff := createdAt.Sub(enqueuedAt); diff < -time.Second || diff > time.Second {
-		t.Fatalf("created_at=%s 偏离入队时刻 %s 达 %s，疑似取自 flush 时刻", createdAt, enqueuedAt, diff)
+	if !createdAt.Equal(enqueuedAt) {
+		t.Fatalf("created_at=%s want=%s, timestamp was changed during flush", createdAt, enqueuedAt)
 	}
 }

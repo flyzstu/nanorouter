@@ -1,6 +1,6 @@
 # Local build artifacts
 bin/
-nanorouter
+/nanorouter
 
 # Local configuration and runtime data
 config.yaml
