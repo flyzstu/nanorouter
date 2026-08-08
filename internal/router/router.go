@@ -31,6 +31,10 @@ import (
 const maxRequestBody = 16 << 20
 const maxUpstreamErrorBody = 8 << 10
 const maxUpstreamErrorMessage = 512
+
+// ledgerWriteTimeout 限制单次同步账本写入的时长。客户端取消请求时请求 context 会被取消，
+// 账本写入必须使用独立 context，否则取消会导致记录丢失并刷出无谓的 ledger_write_failed。
+const ledgerWriteTimeout = 5 * time.Second
 const maxRateLimitRetries = 5
 const sessionAffinityHeader = "X-Session-Affinity"
 const upstreamMaxIdleConns = 256
@@ -113,17 +117,8 @@ func NewWithLogger(cfg Config, db *sql.DB, logger *zap.Logger) (*Router, error) 
 			}
 		}
 		for _, candidate := range route.Candidates {
-			if candidate.MaxConcurrency < 0 || candidate.QueueTimeout < 0 || candidate.AttemptTimeout < 0 || (candidate.MaxConcurrency == 0 && candidate.QueueTimeout > 0) {
-				return nil, fmt.Errorf("route %q candidate %q has invalid concurrency limit", routeName, candidate.ID)
-			}
-			if candidate.AdaptiveConcurrency && (candidate.MaxConcurrency <= 0 || candidate.MinConcurrency < 0 || candidate.MinConcurrency > candidate.MaxConcurrency || candidate.TargetTTFB < 0) {
-				return nil, fmt.Errorf("route %q candidate %q has invalid adaptive concurrency settings", routeName, candidate.ID)
-			}
-			if candidate.MaxTokensLimit < 0 {
-				return nil, fmt.Errorf("route %q candidate %q has negative max_tokens_limit", routeName, candidate.ID)
-			}
-			if _, err := candidate.Retry.resolve(cfg.Retry); err != nil {
-				return nil, fmt.Errorf("route %q candidate %q has invalid retry settings: %w", routeName, candidate.ID, err)
+			if err := candidate.validate(cfg.Retry); err != nil {
+				return nil, fmt.Errorf("route %q candidate %q: %w", routeName, candidate.ID, err)
 			}
 			if configured, exists := configuredLimits[candidate.ID]; exists && (configured.MaxConcurrency != candidate.MaxConcurrency || configured.AdaptiveConcurrency != candidate.AdaptiveConcurrency || configured.MinConcurrency != candidate.MinConcurrency || configured.TargetTTFB != candidate.TargetTTFB) {
 				return nil, fmt.Errorf("candidate %q has conflicting concurrency settings", candidate.ID)
@@ -382,7 +377,7 @@ func (r *Router) proxy(endpoint string) http.HandlerFunc {
 				concurrencyLimited = true
 				queueLatency := int(time.Since(queueStart).Milliseconds())
 				r.queueWait.WithLabelValues(routeName, u.ID, endpoint, "timeout").Observe(time.Since(queueStart).Seconds())
-				r.record(q.Context(), requestID, routeName, u, endpoint, http.StatusTooManyRequests, queueLatency, streamed, attempt, Usage{Source: "unavailable"}, "concurrency")
+				r.record(requestID, routeName, u, endpoint, http.StatusTooManyRequests, queueLatency, streamed, attempt, Usage{Source: "unavailable"}, "concurrency")
 				r.failovers.WithLabelValues(routeName, "concurrency_limit").Inc()
 				if r.logger.Core().Enabled(zap.WarnLevel) {
 					r.logger.Warn(r.logMessage("upstream_attempt_finished"), eventFields("upstream_attempt_finished", append(failureLogFields(requestID, routeName, u, endpoint, attempt, queueLatency, streamed, http.StatusTooManyRequests, "concurrency_limit", true), zap.String("attempt_phase", "queue"))...)...)
@@ -434,7 +429,20 @@ func (r *Router) proxy(endpoint string) http.HandlerFunc {
 					outcome = "attempt_timeout"
 				}
 				r.observeConcurrency(u, status, ttfbDuration, queueDuration > time.Millisecond)
-				r.record(q.Context(), requestID, routeName, u, endpoint, status, latency, streamed, attempt, Usage{Source: "unavailable"}, kind)
+				// 客户端断开会取消请求 context；请求根本没发完，不能把它当成上游故障冷却。
+				clientCanceled := q.Context().Err() != nil
+				if clientCanceled {
+					status, kind, outcome = 499, "client_canceled", "client_canceled"
+				}
+				r.record(requestID, routeName, u, endpoint, status, latency, streamed, attempt, Usage{Source: "unavailable"}, kind)
+				if clientCanceled {
+					if ctx.Err() != nil {
+						r.logRequestFailed(requestID, endpoint, routeName, streamed, 499, attempt+1, time.Since(startedAt), "client_canceled")
+						return
+					}
+					attempt++
+					continue
+				}
 				r.fail(routeName, u, 30*time.Second)
 				r.failovers.WithLabelValues(routeName, kind).Inc()
 				if r.logger.Core().Enabled(zap.WarnLevel) {
@@ -478,7 +486,7 @@ func (r *Router) proxy(endpoint string) http.HandlerFunc {
 					upstreamError := r.copyErrorResponse(w, resp)
 					cancelAttempt()
 					release()
-					r.record(q.Context(), requestID, routeName, u, endpoint, resp.StatusCode, latency, streamed, attempt, Usage{Source: "unavailable"}, "client")
+					r.record(requestID, routeName, u, endpoint, resp.StatusCode, latency, streamed, attempt, Usage{Source: "unavailable"}, "client")
 					if r.logger.Core().Enabled(zap.WarnLevel) {
 						fields := failureLogFields(requestID, routeName, u, endpoint, attempt, latency, streamed, resp.StatusCode, "upstream_rejected", false)
 						fields = append(fields, upstreamError.logFields(true)...)
@@ -507,7 +515,7 @@ func (r *Router) proxy(endpoint string) http.HandlerFunc {
 				} else {
 					r.fail(routeName, u, cooldown(resp))
 				}
-				r.record(q.Context(), requestID, routeName, u, endpoint, resp.StatusCode, latency, streamed, attempt, Usage{Source: "unavailable"}, "upstream")
+				r.record(requestID, routeName, u, endpoint, resp.StatusCode, latency, streamed, attempt, Usage{Source: "unavailable"}, "upstream")
 				r.failovers.WithLabelValues(routeName, http.StatusText(resp.StatusCode)).Inc()
 				if r.logger.Core().Enabled(zap.WarnLevel) {
 					fields := failureLogFields(requestID, routeName, u, endpoint, attempt, latency, streamed, resp.StatusCode, "upstream_unavailable", true)
@@ -532,13 +540,22 @@ func (r *Router) proxy(endpoint string) http.HandlerFunc {
 				release()
 				duration := int(time.Since(start).Milliseconds())
 				if streamErr != nil {
-					r.fail(routeName, u, 30*time.Second)
-					r.record(q.Context(), requestID, routeName, u, endpoint, 0, duration, true, attempt, usage, "stream")
-					r.logRequestFailed(requestID, endpoint, routeName, true, 0, attempt+1, time.Since(startedAt), "stream_interrupted")
+					// 客户端断开会取消请求 context，进而中断对上游流的读取；
+					// 此时上游并非故障，冷却它会让同一路由陷入无谓的 503 窗口。
+					// 只有真正的上游流错误才需要冷却并计入故障切换。
+					clientCanceled := q.Context().Err() != nil
+					kind, outcome, status := "stream", "stream_interrupted", 0
+					if clientCanceled {
+						kind, outcome, status = "client_canceled", "client_canceled", 499
+					} else {
+						r.fail(routeName, u, 30*time.Second)
+					}
+					r.record(requestID, routeName, u, endpoint, status, duration, true, attempt, usage, kind)
+					r.logRequestFailed(requestID, endpoint, routeName, true, status, attempt+1, time.Since(startedAt), outcome)
 					return
 				}
 				r.success(u)
-				r.record(q.Context(), requestID, routeName, u, endpoint, resp.StatusCode, duration, true, attempt, usage, "")
+				r.record(requestID, routeName, u, endpoint, resp.StatusCode, duration, true, attempt, usage, "")
 				if r.logger.Core().Enabled(zap.InfoLevel) {
 					r.logger.Info(r.logMessage("upstream_attempt_finished"), eventFields("upstream_attempt_finished", successLogFields(requestID, routeName, u, endpoint, attempt, latency, duration, true, resp.StatusCode, usage)...)...)
 				}
@@ -550,7 +567,7 @@ func (r *Router) proxy(endpoint string) http.HandlerFunc {
 				if readErr != nil {
 					release()
 					r.fail(routeName, u, 30*time.Second)
-					r.record(q.Context(), requestID, routeName, u, endpoint, http.StatusGatewayTimeout, int(time.Since(start).Milliseconds()), false, attempt, Usage{Source: "unavailable"}, "attempt_timeout")
+					r.record(requestID, routeName, u, endpoint, http.StatusGatewayTimeout, int(time.Since(start).Milliseconds()), false, attempt, Usage{Source: "unavailable"}, "attempt_timeout")
 					attempt++
 					continue
 				}
@@ -560,7 +577,7 @@ func (r *Router) proxy(endpoint string) http.HandlerFunc {
 					if err != nil {
 						release()
 						writeAPIError(w, http.StatusBadGateway, "cannot adapt upstream chat response: "+err.Error(), "upstream_error")
-						r.record(q.Context(), requestID, routeName, u, endpoint, resp.StatusCode, latency, false, attempt, Usage{Source: "unavailable"}, "upstream")
+						r.record(requestID, routeName, u, endpoint, resp.StatusCode, latency, false, attempt, Usage{Source: "unavailable"}, "upstream")
 						r.logRequestFailed(requestID, endpoint, routeName, false, http.StatusBadGateway, attempt+1, time.Since(startedAt), "response_adaptation_failed")
 						return
 					}
@@ -573,7 +590,7 @@ func (r *Router) proxy(endpoint string) http.HandlerFunc {
 				release()
 				usage := usageFromJSON(b)
 				duration := int(time.Since(start).Milliseconds())
-				r.record(q.Context(), requestID, routeName, u, endpoint, resp.StatusCode, duration, false, attempt, usage, "")
+				r.record(requestID, routeName, u, endpoint, resp.StatusCode, duration, false, attempt, usage, "")
 				if r.logger.Core().Enabled(zap.InfoLevel) {
 					r.logger.Info(r.logMessage("upstream_attempt_finished"), eventFields("upstream_attempt_finished", successLogFields(requestID, routeName, u, endpoint, attempt, latency, duration, false, resp.StatusCode, usage)...)...)
 				}
@@ -878,6 +895,9 @@ func (r *Router) fail(_ string, u Candidate, d time.Duration) {
 	r.failUntil(u, time.Now().Add(d))
 }
 
+// failUntil 记录候选冷却到 until。这个时间与请求内重试调度（pendingRetries）会同时维护：
+// states[].until 供所有并发请求的 pick() 过滤候选；pendingRetries[].At 只服务当前请求的
+// earliestPendingRetry 等待。两者的恢复时间由调用方通过 failUntil(u, retryAt) 保持同步。
 func (r *Router) failUntil(u Candidate, until time.Time) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -899,9 +919,12 @@ func (r *Router) success(u Candidate) {
 		s.probing = false
 	}
 }
-func (r *Router) record(ctx context.Context, requestID, route string, u Candidate, ep string, status, latency int, stream bool, attempt int, usage Usage, kind string) {
+func (r *Router) record(requestID, route string, u Candidate, ep string, status, latency int, stream bool, attempt int, usage Usage, kind string) {
 	// 账本写入失败（队列满、已关闭或数据库错误）不阻塞请求本身，
 	// 但必须留下带 request_id 的日志，否则只能靠聚合指标定位丢失。
+	// 写入使用独立的有界 context，不受请求上下文取消（例如客户端断开）影响。
+	ctx, cancel := context.WithTimeout(context.Background(), ledgerWriteTimeout)
+	defer cancel()
 	if err := r.db.Insert(ctx, Record{
 		ID: newID(), Route: route, UpstreamID: u.ID, UpstreamModel: u.Model,
 		Endpoint: ep, ErrorKind: kind, Status: status, LatencyMS: latency,
@@ -924,28 +947,30 @@ func (r *Router) record(ctx context.Context, requestID, route string, u Candidat
 		r.tokens.WithLabelValues(route, u.ID, "completion").Add(float64(usage.Completion))
 	}
 }
-func (r *Router) copyResponse(w http.ResponseWriter, resp *http.Response) {
-	defer resp.Body.Close()
-	r.copyHeaders(w, resp.Header)
-	w.WriteHeader(resp.StatusCode)
-	io.Copy(w, resp.Body)
+
+// readUpstreamErrorPrefix 读取并解析上游错误体的有限前缀，供直接回传（copyErrorResponse）
+// 或切换候选前诊断（readUpstreamError）复用。
+func readUpstreamErrorPrefix(resp *http.Response) ([]byte, upstreamError) {
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, maxUpstreamErrorBody+1))
+	return body, parseUpstreamError(body)
 }
+
 func (r *Router) copyErrorResponse(w http.ResponseWriter, resp *http.Response) upstreamError {
 	defer resp.Body.Close()
 	// 只缓存有限的错误前缀用于提取诊断字段，剩余响应继续透明转发给下游。
-	body, _ := io.ReadAll(io.LimitReader(resp.Body, maxUpstreamErrorBody+1))
+	body, ue := readUpstreamErrorPrefix(resp)
 	r.copyHeaders(w, resp.Header)
 	w.WriteHeader(resp.StatusCode)
 	_, _ = w.Write(body)
 	_, _ = io.Copy(w, resp.Body)
-	return parseUpstreamError(body)
+	return ue
 }
 
 func readUpstreamError(resp *http.Response) upstreamError {
 	defer resp.Body.Close()
 	// 切换候选前只读取有限错误前缀：足以提取诊断信息，又不会缓存大响应。
-	body, _ := io.ReadAll(io.LimitReader(resp.Body, maxUpstreamErrorBody+1))
-	return parseUpstreamError(body)
+	_, ue := readUpstreamErrorPrefix(resp)
+	return ue
 }
 func (r *Router) copyHeaders(w http.ResponseWriter, h http.Header) {
 	for k, v := range h {
@@ -1046,10 +1071,8 @@ func retryAfter(resp *http.Response) time.Duration {
 	return 0
 }
 
-func exponentialBackoff(retry int) time.Duration {
-	return boundedExponentialBackoff(retry, time.Second, 16*time.Second)
-}
-
+// boundedExponentialBackoff 计算第 retry 次的指数退避延迟（上限 maximum）。
+// 默认 1s→16s 的调度由全局 RetryConfig 的 BaseDelay/MaxDelay 提供，无需固定参数别名。
 func boundedExponentialBackoff(retry int, base, maximum time.Duration) time.Duration {
 	delay := base
 	for step := 1; step < retry && delay < maximum; step++ {

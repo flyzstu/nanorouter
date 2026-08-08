@@ -1049,7 +1049,7 @@ func TestExponentialBackoff(t *testing.T) {
 		4: 8 * time.Second,
 		5: 16 * time.Second,
 	} {
-		if got := exponentialBackoff(retry); got != want {
+		if got := boundedExponentialBackoff(retry, time.Second, 16*time.Second); got != want {
 			t.Fatalf("retry=%d backoff=%s want=%s", retry, got, want)
 		}
 	}
@@ -1057,7 +1057,7 @@ func TestExponentialBackoff(t *testing.T) {
 
 func TestJitteredExponentialBackoffStaysWithinEqualJitterWindow(t *testing.T) {
 	for retry := 1; retry <= maxRateLimitRetries; retry++ {
-		upper := exponentialBackoff(retry)
+		upper := boundedExponentialBackoff(retry, time.Second, 16*time.Second)
 		lower := upper / 2
 		for sample := 0; sample < 100; sample++ {
 			got := jitteredExponentialBackoff(retry, time.Second, 16*time.Second)

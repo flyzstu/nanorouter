@@ -357,6 +357,45 @@ func (c Candidate) IsAggregateEnabled() bool {
 	return c.AggregateEnabled == nil || *c.AggregateEnabled
 }
 
+// validate 校验候选的独立配置项。LoadConfig 与 NewWithLogger 共用同一套规则，
+// 避免两处维护导致规则漂移；调用方补充路由与候选 ID 的定位信息。
+func (u Candidate) validate(global RetryConfig) error {
+	if u.MaxConcurrency < 0 {
+		return fmt.Errorf("negative max_concurrency")
+	}
+	if u.MaxTokensLimit < 0 {
+		return fmt.Errorf("negative max_tokens_limit")
+	}
+	if _, err := u.Retry.resolve(global); err != nil {
+		return fmt.Errorf("invalid retry settings: %w", err)
+	}
+	if u.QueueTimeout < 0 {
+		return fmt.Errorf("negative queue_timeout")
+	}
+	if u.AttemptTimeout < 0 {
+		return fmt.Errorf("negative attempt_timeout")
+	}
+	if u.AdaptiveConcurrency {
+		if u.MaxConcurrency <= 0 {
+			return fmt.Errorf("adaptive_concurrency requires max_concurrency")
+		}
+		minimum := u.MinConcurrency
+		if minimum == 0 {
+			minimum = 1
+		}
+		if minimum < 1 || minimum > u.MaxConcurrency {
+			return fmt.Errorf("invalid min_concurrency")
+		}
+		if u.TargetTTFB < 0 {
+			return fmt.Errorf("negative target_ttfb")
+		}
+	}
+	if u.MaxConcurrency == 0 && u.QueueTimeout > 0 {
+		return fmt.Errorf("queue_timeout requires max_concurrency")
+	}
+	return nil
+}
+
 func LoadConfig(path string) (Config, error) {
 	b, err := os.ReadFile(path)
 	if err != nil {
@@ -403,38 +442,8 @@ func LoadConfig(path string) (Config, error) {
 			if u.ID == "" || u.BaseURL == "" || u.Model == "" {
 				return c, fmt.Errorf("route %q has an incomplete candidate", name)
 			}
-			if u.MaxConcurrency < 0 {
-				return c, fmt.Errorf("candidate %q in route %q has negative max_concurrency", u.ID, name)
-			}
-			if u.MaxTokensLimit < 0 {
-				return c, fmt.Errorf("candidate %q in route %q has negative max_tokens_limit", u.ID, name)
-			}
-			if _, err := u.Retry.resolve(c.Retry); err != nil {
-				return c, fmt.Errorf("candidate %q in route %q has invalid retry settings: %w", u.ID, name, err)
-			}
-			if u.QueueTimeout < 0 {
-				return c, fmt.Errorf("candidate %q in route %q has negative queue_timeout", u.ID, name)
-			}
-			if u.AttemptTimeout < 0 {
-				return c, fmt.Errorf("candidate %q in route %q has negative attempt_timeout", u.ID, name)
-			}
-			if u.AdaptiveConcurrency {
-				if u.MaxConcurrency <= 0 {
-					return c, fmt.Errorf("candidate %q in route %q enables adaptive_concurrency without max_concurrency", u.ID, name)
-				}
-				minimum := u.MinConcurrency
-				if minimum == 0 {
-					minimum = 1
-				}
-				if minimum < 1 || minimum > u.MaxConcurrency {
-					return c, fmt.Errorf("candidate %q in route %q has invalid min_concurrency", u.ID, name)
-				}
-				if u.TargetTTFB < 0 {
-					return c, fmt.Errorf("candidate %q in route %q has negative target_ttfb", u.ID, name)
-				}
-			}
-			if u.MaxConcurrency == 0 && u.QueueTimeout > 0 {
-				return c, fmt.Errorf("candidate %q in route %q sets queue_timeout without max_concurrency", u.ID, name)
+			if err := u.validate(c.Retry); err != nil {
+				return c, fmt.Errorf("candidate %q in route %q: %w", u.ID, name, err)
 			}
 			if u.ExposeAs == "" {
 				continue

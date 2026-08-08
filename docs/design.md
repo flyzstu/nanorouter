@@ -201,6 +201,8 @@ SSE 首字节发给下游后不能再安全换模型：会重复文字，或破�
 
 实现按行读取 SSE，不将长回答完整缓存在内存；它观察 `data:` 内 JSON，最后采集到的 `usage` 写入账本，但绝不改写下游收到的事件。
 
+下游客户端取消（断开连接）会取消请求 context，使对上游流的读取中断，但这不代表上游故障：网关区分 `client_canceled` 与真正的上游流错误，只有后者才会冷却候选并计入故障切换，避免一次客户端取消导致该路由在 30 秒内全部 503。
+
 ## go-json 的位置
 
 `github.com/goccy/go-json` 是 `encoding/json` 兼容实现，项目将它用在请求解码、真实模型名重编码、模型列表和 usage 解析这些热路径。HTTP/SSE 和数据库驱动仍各自使用专用库，故替换 JSON 库不会改变 API 行为。
@@ -219,15 +221,17 @@ PostgreSQL DSN，避免连接凭据进入 ConfigMap。
 - `upstream_id` / `upstream_model`：实际落点；
 - `attempt`：第几次候选尝试；
 - `usage_source`：`upstream` 或 `unavailable`；
-- `error_kind`：常见值包括 `network`、`attempt_timeout`、`upstream`、`client`、`stream` 和
-  `concurrency`；它描述网关观察到的失败阶段，不等同于供应商的完整错误类型。
+- `error_kind`：常见值包括 `network`、`attempt_timeout`、`upstream`、`client`、`stream`、
+  `concurrency` 和 `client_canceled`；它描述网关观察到的失败阶段，不等同于供应商的完整错误类型。
+  `client_canceled` 表示下游客户端在请求完成前断开了连接，不触发候选冷却。
 
 账本不保存 prompt、回复正文或 API Key，避免用户内容和密钥落入普通运维数据库。Prometheus 用于实时请求率、失败率、token 速率，以及上游 TTFB、并发槽排队、内部退避、动态并发窗口、全局背压和重试预算观测；数据库用于按模型汇总历史使用量。数据库记录的是上游实际返回的 usage；缺失时标为 `unavailable`，不把本地估算值伪装成真实用量。
 
 SQLite 可选异步批量写：正常关闭会排空队列，队列溢出或异常退出可能丢失尚未提交的记录，因此
 生产环境应结合 `nanorouter_ledger_dropped_total` 和 `nanorouter_ledger_write_errors_total` 监控
 账本完整性。账本写入失败（队列满、已关闭或数据库错误）会额外记录 `ledger_write_failed` 事件，
-携带 `request_id`、路由、上游和错误类别，便于按请求定位丢失的账本记录。实时熔断、并发窗口、
+携带 `request_id`、路由、上游和错误类别，便于按请求定位丢失的账本记录。同步账本写入使用独立的
+有界 context（不受客户端取消影响），因此下游断开连接时记录仍会落库。实时熔断、并发窗口、
 背压队列和 Retry Budget 当前都是单实例内存状态，数据库不会改变它们。
 
 运行日志使用 Zap 的结构化 JSON；`-debug` 则用相同字段输出稳定的 `key=value` 文本。每个请求以
