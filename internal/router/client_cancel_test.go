@@ -177,3 +177,83 @@ func TestClientCanceledUpstreamAttemptDoesNotCooldown(t *testing.T) {
 	// 第二个请求留下的 keep-alive 连接，显式关闭以免阻塞测试结尾的 upstream.Close()。
 	upstream.CloseClientConnections()
 }
+
+// TestAttemptTimeoutStreamDoesNotCooldownUpstream 验证：候选 attempt_timeout 在流式途中
+// 触发（网关自己的调用预算，不是上游故障）时，候选不应被冷却。
+func TestAttemptTimeoutStreamDoesNotCooldownUpstream(t *testing.T) {
+	var calls atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if calls.Add(1) == 1 {
+			// 第一个请求持续流式输出，直到网关因 attempt_timeout 中断对上游流的读取。
+			w.Header().Set("Content-Type", "text/event-stream")
+			flusher, _ := w.(http.Flusher)
+			for i := 0; ; i++ {
+				_, _ = fmt.Fprintf(w, "data: {\"choices\":[{\"delta\":{\"content\":\"chunk-%d\"}}]}\n\n", i)
+				if flusher != nil {
+					flusher.Flush()
+				}
+				select {
+				case <-r.Context().Done():
+					return
+				case <-time.After(5 * time.Millisecond):
+				}
+			}
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"ok-2","choices":[],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}`))
+	}))
+	defer upstream.Close()
+
+	db, err := sql.Open("sqlite3", ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := Migrate(context.Background(), db); err != nil {
+		t.Fatal(err)
+	}
+	r, err := New(Config{
+		RequestTimeout: 10 * time.Second,
+		Routes: map[string]Route{"free": {Candidates: []Candidate{
+			{ID: "u", BaseURL: upstream.URL, Model: "up", AttemptTimeout: 100 * time.Millisecond},
+		}}},
+	}, db)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"free","messages":[],"stream":true}`))
+	rec := &signalWriter{ResponseRecorder: httptest.NewRecorder(), started: make(chan struct{})}
+	done := make(chan struct{})
+	go func() {
+		r.Handler().ServeHTTP(rec, req)
+		close(done)
+	}()
+	select {
+	case <-rec.started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("stream did not start")
+	}
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("handler did not return after attempt timeout")
+	}
+
+	// 超时是候选级调用预算，不是上游故障：账本记录 attempt_timeout 且写入成功。
+	var kind string
+	var status int
+	if err := db.QueryRow(`SELECT error_kind, status_code FROM llm_requests`).Scan(&kind, &status); err != nil {
+		t.Fatalf("ledger row missing: %v", err)
+	}
+	if kind != "attempt_timeout" || status != http.StatusGatewayTimeout {
+		t.Fatalf("ledger kind=%q status=%d", kind, status)
+	}
+
+	// 候选未被冷却：紧随其后的请求应立即成功，而不是 503 upstreams_unavailable。
+	rec2 := httptest.NewRecorder()
+	r.Handler().ServeHTTP(rec2, httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"free","messages":[]}`)))
+	if rec2.Code != http.StatusOK {
+		t.Fatalf("second request status=%d body=%s", rec2.Code, rec2.Body.String())
+	}
+}

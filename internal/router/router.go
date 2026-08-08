@@ -536,18 +536,25 @@ func (r *Router) proxy(endpoint string) http.HandlerFunc {
 				} else {
 					usage, streamErr = r.stream(w, resp)
 				}
+				// cancelAttempt 会置空 attemptCtx 的 deadline，必须先判定再取消。
+				attemptTimedOut := errors.Is(attemptCtx.Err(), context.DeadlineExceeded) && ctx.Err() == nil
 				cancelAttempt()
 				release()
 				duration := int(time.Since(start).Milliseconds())
 				if streamErr != nil {
-					// 客户端断开会取消请求 context，进而中断对上游流的读取；
-					// 此时上游并非故障，冷却它会让同一路由陷入无谓的 503 窗口。
+					// 客户端取消或候选/全局超时都会中断对上游流的读取，但这些都不是
+					// 上游故障；冷却它们会让同一路由陷入无谓的 503 窗口。
 					// 只有真正的上游流错误才需要冷却并计入故障切换。
 					clientCanceled := q.Context().Err() != nil
 					kind, outcome, status := "stream", "stream_interrupted", 0
-					if clientCanceled {
+					switch {
+					case clientCanceled:
 						kind, outcome, status = "client_canceled", "client_canceled", 499
-					} else {
+					case attemptTimedOut:
+						kind, outcome, status = "attempt_timeout", "attempt_timeout", http.StatusGatewayTimeout
+					case ctx.Err() != nil:
+						kind, outcome, status = "request_timeout", "request_timeout", http.StatusGatewayTimeout
+					default:
 						r.fail(routeName, u, 30*time.Second)
 					}
 					r.record(requestID, routeName, u, endpoint, status, duration, true, attempt, usage, kind)
