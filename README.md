@@ -235,6 +235,35 @@ Nous 的 Free 级别有独立的 RPM/TPM 限制；请先确认账户额度和 `N
 
 OpenCode 会向部分 OpenAI 兼容上游发送 `promptCacheKey`。智谱候选默认删除该字段；智谱的上下文缓存由服务端按重复内容自动复用，不需要客户端传入该参数。
 
+## OpenCode Go 上游
+
+[OpenCode Go](https://opencode.ai/docs/zh-cn/go/) 是低成本的编程模型订阅服务（首月 5 美元，之后每月 10 美元），提供一批经基准测试的开源编程模型。在 [opencode.ai/auth](https://opencode.ai/auth) 订阅并复制 API 密钥，由 `OPENCODE_GO_API_KEY` 注入：
+
+```yaml
+routes:
+  opencode-go:
+    strategy: weighted_round_robin
+    candidates:
+      - id: opencode-go-deepseek-v4-flash
+        base_url: https://opencode.ai/zen/go/v1
+        api_key_env: OPENCODE_GO_API_KEY
+        model: deepseek-v4-flash
+        expose_as: opencode-go-deepseek-v4-flash
+        weight: 3
+      - id: opencode-go-gpt-5-6-luna
+        base_url: https://opencode.ai/zen/go/v1
+        api_key_env: OPENCODE_GO_API_KEY
+        model: gpt-5.6-luna
+        expose_as: opencode-go-gpt-5-6-luna
+        responses: true
+```
+
+OpenCode Go 的模型大多通过 OpenAI 兼容的 `chat/completions` 提供，按普通候选接入即可；`gpt-5.6-luna` 使用原生 `/v1/responses`，需声明 `responses: true`。当前模型 ID 包括 `grok-4.5`、`glm-5.2`、`glm-5.1`、`kimi-k3`、`kimi-k2.7-code`、`kimi-k2.6`、`deepseek-v4-pro`、`deepseek-v4-flash`、`mimo-v2.5`、`mimo-v2.5-pro`、`hy3`（chat/completions）和 `gpt-5.6-luna`（responses），完整列表见 `https://opencode.ai/zen/go/v1/models`。
+
+MiniMax（`minimax-m3`、`minimax-m2.7`、`minimax-m2.5`）与 Qwen（`qwen3.8-max`、`qwen3.7-max`、`qwen3.7-plus`、`qwen3.6-plus`）仅暴露 Anthropic 的 `/v1/messages` 端点，本网关目前不支持 Anthropic 协议，无法接入。
+
+订阅包含 5 小时（12 美元）、每周（30 美元）与每月（60 美元）用量限制，实际请求数取决于所用模型；可通过 `max_concurrency` 限制并发，或在达到额度时让聚合路由切换到其他候选。
+
 ## 上游字段兼容性清洗
 
 每个候选可用 `drop_request_fields` 删除不支持的顶层字段，用 `drop_message_fields` 删除消息对象内字段。清洗在选择上游后进行，故不会影响故障切换到其他上游时的原始请求。Groq 示例默认删除其文档列出的 `logprobs`、`logit_bias`、`top_logprobs` 与 `messages[].name`，并去除标为暂不支持的 `metadata`、`store`。

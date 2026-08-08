@@ -77,6 +77,43 @@ routes:
         drop_message_fields:
           - reasoning_content
 
+  # OpenCode Go：低成本的编程模型订阅服务，在 opencode.ai/auth 订阅并复制 API 密钥。
+  # 多数模型走 OpenAI 兼容的 chat/completions；gpt-5.6-luna 使用原生 /responses。
+  # MiniMax、Qwen 等只暴露 Anthropic /v1/messages 的模型无法接入本网关。
+  opencode-go:
+    strategy: weighted_round_robin
+    candidates:
+      - id: opencode-go-deepseek-v4-flash
+        base_url: https://opencode.ai/zen/go/v1
+        api_key_env: OPENCODE_GO_API_KEY
+        model: deepseek-v4-flash
+        expose_as: opencode-go-deepseek-v4-flash
+        weight: 3
+        enabled: true
+      - id: opencode-go-deepseek-v4-pro
+        base_url: https://opencode.ai/zen/go/v1
+        api_key_env: OPENCODE_GO_API_KEY
+        model: deepseek-v4-pro
+        expose_as: opencode-go-deepseek-v4-pro
+        weight: 1
+        enabled: true
+      - id: opencode-go-kimi-k2-7-code
+        base_url: https://opencode.ai/zen/go/v1
+        api_key_env: OPENCODE_GO_API_KEY
+        model: kimi-k2.7-code
+        expose_as: opencode-go-kimi-k2-7-code
+        weight: 1
+        enabled: true
+      # gpt-5.6-luna 是唯一通过原生 /v1/responses 提供的模型，需声明 responses: true。
+      - id: opencode-go-gpt-5-6-luna
+        base_url: https://opencode.ai/zen/go/v1
+        api_key_env: OPENCODE_GO_API_KEY
+        model: gpt-5.6-luna
+        expose_as: opencode-go-gpt-5-6-luna
+        weight: 1
+        enabled: true
+        responses: true
+
   free-fast:
     strategy: weighted_round_robin
     # 正常请求补充 10% 重试令牌；额外上游调用消耗一个，最多积累 10 个。
