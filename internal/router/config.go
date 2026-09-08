@@ -18,7 +18,11 @@ type Config struct {
 	Retry          RetryConfig        `yaml:"retry"`
 	Backpressure   BackpressureConfig `yaml:"backpressure"`
 	Profiling      ProfilingConfig    `yaml:"profiling"`
-	Routes         map[string]Route   `yaml:"routes"`
+	// UserAgent 全局覆盖转发到上游的 User-Agent。候选的 user_agent 优先于全局值；
+	// 两者都未配置时使用 Go 默认的 Go-http-client/x.x。部分上游的 Cloudflare WAF
+	// 会拦截该默认 UA，可在此配置常规客户端 UA（例如 opencode/1.18.25）统一绕过。
+	UserAgent string           `yaml:"user_agent"`
+	Routes    map[string]Route `yaml:"routes"`
 }
 
 // BackpressureConfig 对所有生成请求设置进程级准入上限，避免上游变慢时请求和请求体无限堆积。
@@ -308,6 +312,10 @@ type Candidate struct {
 	BaseURL   string `yaml:"base_url"`
 	APIKeyEnv string `yaml:"api_key_env"`
 	Model     string `yaml:"model"`
+	// UserAgent 覆盖转发到上游的 User-Agent。留空时使用 Go 默认 Go-http-client/x.x；
+	// 部分上游（如 Nous Research 的 Cloudflare WAF）会拦截该默认 UA，可配置为
+	// 常规客户端 UA（例如 opencode/1.18.25）绕过。
+	UserAgent string `yaml:"user_agent"`
 	// LlamaServer 表示上游是 llama.cpp 的 llama-server。此时 base_url 可填写服务根地址，
 	// 网关会自动补上其 OpenAI 兼容 API 的 /v1 前缀。
 	LlamaServer bool `yaml:"llama_server"`

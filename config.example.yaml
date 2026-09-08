@@ -17,6 +17,10 @@ logging:
 # 设定后，下游需使用 Authorization: Bearer $NANOROUTER_API_KEY。
 auth_env: NANOROUTER_API_KEY
 request_timeout: 90s
+# 全局覆盖转发到上游的 User-Agent。默认 Go-http-client/x.x 会被部分上游
+# （如 Nous Research 的 Cloudflare WAF）拦截并返回 403；可设为常规客户端 UA，
+# 例如 opencode/1.18.25。单个候选也可用 user_agent 覆盖此全局值。
+# user_agent: opencode/1.18.25
 # 429 会先切换其他候选；全部限流后按等抖动指数退避重试。
 retry:
   max_rate_limit_retries: 5
@@ -259,3 +263,6 @@ routes:
         weight: 1
         enabled: true
         responses_via_chat_completions: true
+        # 部分上游（如 Nous Research 的 Cloudflare WAF）会拦截 Go 客户端默认的
+        # Go-http-client/x.x User-Agent。遇到 403 时可用常规客户端 UA 覆盖，例如：
+        # user_agent: opencode/1.18.25

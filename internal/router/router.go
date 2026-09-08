@@ -44,6 +44,7 @@ type Router struct {
 	cfg               Config
 	db                *Store
 	client            *http.Client
+	userAgent         string
 	states            map[string]*state
 	limiters          map[string]*candidateLimiter
 	admission         *admissionController
@@ -102,7 +103,7 @@ func NewWithLogger(cfg Config, db *sql.DB, logger *zap.Logger) (*Router, error) 
 	if logger == nil {
 		logger = zap.NewNop()
 	}
-	r := &Router{cfg: cfg, db: NewStoreWithConfig(db, cfg.Database), client: newUpstreamHTTPClient(), states: map[string]*state{}, limiters: map[string]*candidateLimiter{}, admission: newAdmissionController(cfg.Backpressure), retryBudgets: map[string]*retryBudget{}, next: map[string]int{}, registry: prometheus.NewRegistry(), logger: logger, retryWait: waitForRetry}
+	r := &Router{cfg: cfg, db: NewStoreWithConfig(db, cfg.Database), client: newUpstreamHTTPClient(), userAgent: cfg.UserAgent, states: map[string]*state{}, limiters: map[string]*candidateLimiter{}, admission: newAdmissionController(cfg.Backpressure), retryBudgets: map[string]*retryBudget{}, next: map[string]int{}, registry: prometheus.NewRegistry(), logger: logger, retryWait: waitForRetry}
 	r.retryBackoff = func(retry int) time.Duration {
 		return jitteredExponentialBackoff(retry, cfg.Retry.BaseDelay, cfg.Retry.MaxDelay)
 	}
@@ -805,6 +806,13 @@ func (r *Router) do(ctx context.Context, u Candidate, endpoint string, body []by
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json, text/event-stream")
+	ua := u.UserAgent
+	if ua == "" {
+		ua = r.userAgent
+	}
+	if ua != "" {
+		req.Header.Set("User-Agent", ua)
+	}
 	if key := os.Getenv(u.APIKeyEnv); key != "" {
 		req.Header.Set("Authorization", "Bearer "+key)
 	}
