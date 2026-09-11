@@ -62,28 +62,10 @@ routes:
         drop_message_fields:
           - reasoning_content
 
-  # 智谱通用 API 只提供 Chat Completions；需要 Responses 的下游请求会使用
-  # 受限的 Responses→Chat 适配。Coding 套餐请改用智谱专属 coding 端点。
-  zhipu-agent:
-    strategy: weighted_round_robin
-    candidates:
-      - id: zhipu-glm
-        base_url: https://open.bigmodel.cn/api/paas/v4
-        api_key_env: ZHIPUAI_API_KEY
-        model: "<智谱实际模型 ID，例如 glm-5.1>"
-        responses_via_chat_completions: true
-        enabled: true
-        # OpenCode 的 OpenAI SDK 会注入此缓存路由参数；智谱使用自动上下文缓存，
-        # 因此在其不支持该扩展字段时由网关删除，避免 400。
-        drop_request_fields:
-          - promptCacheKey
-          - prompt_cache_key
-        drop_message_fields:
-          - reasoning_content
-
   # 智谱 AI Coding Plan：专属编码套餐路由，全面模拟 OpenCode 客户端行为。
   # 自动设置 User-Agent: opencode/1.18.30，注入 thinking 与流式 include_usage，
   # 补全 X-Session-Affinity/X-Session-Id，并保留 reasoning_content 保持推理连贯。
+  # 下游可访问 /v1/chat/completions (model: zhipuaicoding) 或专属端点 /zhipu-aicoding 与 /zhipuaicoding。
   zhipuaicoding:
     strategy: weighted_round_robin
     candidates:
@@ -158,24 +140,6 @@ routes:
       ratio: 0.1
       burst: 10
     candidates:
-      # 保留 zhipu-agent 作为固定智谱路由；这里额外纳入 free-fast，
-      # 让聚合路由可按权重选择智谱，并在其他上游失败时切换到它。
-      - id: zhipu-glm-free-fast
-        base_url: https://open.bigmodel.cn/api/paas/v4
-        api_key_env: ZHIPUAI_API_KEY
-        model: "<智谱实际模型 ID，例如 glm-5.1>"
-        expose_as: zhipu-glm
-        # 可设为 false，使候选只通过 expose_as 开放而不参与 free-fast。
-        aggregate_enabled: true
-        weight: 1
-        responses_via_chat_completions: true
-        enabled: true
-        # 智谱使用自动上下文缓存，不支持 OpenCode 注入的此扩展字段。
-        drop_request_fields:
-          - promptCacheKey
-          - prompt_cache_key
-        drop_message_fields:
-          - reasoning_content
       - id: openrouter-deepseek
         base_url: https://openrouter.ai/api/v1
         api_key_env: OPENROUTER_API_KEY

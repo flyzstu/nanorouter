@@ -180,15 +180,17 @@ func (r *Router) Handler() http.Handler {
 	mux.Post("/chat/completions", r.proxy("chat_completions"))
 	mux.Post("/responses", r.proxy("responses"))
 
-	// zhipuaicoding 专属端点路径：允许将客户端 Base URL 直接配置为 /zhipuaicoding 或 /zhipuaicoding/v1
-	mux.Route("/zhipuaicoding", func(sub chi.Router) {
+	// zhipu-aicoding 专属端点路径：允许将客户端 Base URL 直接配置为 /zhipu-aicoding 或 /zhipuaicoding
+	mountZhipu := func(sub chi.Router) {
 		sub.Get("/models", r.models)
 		sub.Get("/v1/models", r.models)
-		sub.Post("/chat/completions", r.proxy("chat_completions", "zhipuaicoding"))
-		sub.Post("/v1/chat/completions", r.proxy("chat_completions", "zhipuaicoding"))
-		sub.Post("/responses", r.proxy("responses", "zhipuaicoding"))
-		sub.Post("/v1/responses", r.proxy("responses", "zhipuaicoding"))
-	})
+		sub.Post("/chat/completions", r.proxy("chat_completions", "zhipu-aicoding", "zhipuaicoding"))
+		sub.Post("/v1/chat/completions", r.proxy("chat_completions", "zhipu-aicoding", "zhipuaicoding"))
+		sub.Post("/responses", r.proxy("responses", "zhipu-aicoding", "zhipuaicoding"))
+		sub.Post("/v1/responses", r.proxy("responses", "zhipu-aicoding", "zhipuaicoding"))
+	}
+	mux.Route("/zhipu-aicoding", mountZhipu)
+	mux.Route("/zhipuaicoding", mountZhipu)
 	return r.auth(mux)
 }
 
@@ -289,11 +291,17 @@ func (r *Router) proxy(endpoint string, defaultRoutes ...string) http.HandlerFun
 		}
 		routeName, _ := payload["model"].(string)
 		route, ok := r.routeForModel(routeName)
-		if !ok && len(defaultRoutes) > 0 && defaultRoutes[0] != "" {
-			if defRoute, defOk := r.routeForModel(defaultRoutes[0]); defOk {
-				route = defRoute
-				routeName = defaultRoutes[0]
-				ok = true
+		if !ok {
+			for _, def := range defaultRoutes {
+				if def == "" {
+					continue
+				}
+				if defRoute, defOk := r.routeForModel(def); defOk {
+					route = defRoute
+					routeName = def
+					ok = true
+					break
+				}
 			}
 		}
 		if !ok {

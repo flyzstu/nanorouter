@@ -229,11 +229,9 @@ Nous Research 提供 OpenAI 兼容的 Chat Completions 接口，基础地址为
 
 Nous 的 Free 级别有独立的 RPM/TPM 限制；请先确认账户额度和 `NOUS_API_KEY` 有效，再将生产部署模板中的候选设为 `enabled: true`。
 
-## 智谱 GLM 上游
+## 智谱 GLM 上游（AI Coding Plan）
 
-`zhipu-agent` 示例使用智谱通用端点 `https://open.bigmodel.cn/api/paas/v4` 和 `ZHIPUAI_API_KEY`。请将示例模型替换为账户实际可用的模型 ID。它原生使用 Chat Completions；`/v1/responses` 请求会经过受限适配，自定义函数调用可转换，但内建工具或 `previous_response_id` 会明确返回 `400`。使用智谱 Coding 套餐时，应把 `base_url` 改为 `https://open.bigmodel.cn/api/coding/paas/v4`。
-
-OpenCode 会向部分 OpenAI 兼容上游发送 `promptCacheKey`。智谱候选默认删除该字段；智谱的上下文缓存由服务端按重复内容自动复用，不需要客户端传入该参数。
+网关全面接入智谱专有编码端点 `https://open.bigmodel.cn/api/coding/paas/v4`，环境变量支持 `ZHIPU_API_KEY`（或 `ZHIPUAI_API_KEY`）。模型支持 `glm-5.3` 与 `glm-5.3-flash`，并深度模拟 OpenCode 客户端协议（伪装 User-Agent、自动注入 thinking 思维链与流式 include_usage、透传会话亲和性头，并剔除不支持的缓存字段）。下游可直接通过通用端点 `/v1/chat/completions`（指定 `model: glm-5.3` 或路由名 `zhipuaicoding`）访问，也可使用 `/zhipu-aicoding/v1`（或 `/zhipuaicoding/v1`）专属端点路径。
 
 ## OpenCode Go 上游
 

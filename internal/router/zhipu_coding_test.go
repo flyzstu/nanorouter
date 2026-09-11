@@ -234,6 +234,22 @@ func TestZhipuCodingDedicatedPathRouting(t *testing.T) {
 	if rec2.Code != http.StatusOK {
 		t.Fatalf("status=%d body=%s", rec2.Code, rec2.Body.String())
 	}
+
+	// 3. 通过带连字符的 /zhipu-aicoding/v1/chat/completions 访问
+	rec3 := httptest.NewRecorder()
+	req3 := httptest.NewRequest(http.MethodPost, "/zhipu-aicoding/v1/chat/completions", strings.NewReader(body))
+	r.Handler().ServeHTTP(rec3, req3)
+	if rec3.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rec3.Code, rec3.Body.String())
+	}
+
+	// 4. 通过通用端点 /v1/chat/completions 访问（显式指定 model: zhipuaicoding）
+	rec4 := httptest.NewRecorder()
+	req4 := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"zhipuaicoding","messages":[{"role":"user","content":"hi"}]}`))
+	r.Handler().ServeHTTP(rec4, req4)
+	if rec4.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rec4.Code, rec4.Body.String())
+	}
 }
 
 func TestZhipuCodingStreamingSSEReasoning(t *testing.T) {
