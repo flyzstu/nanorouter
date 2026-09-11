@@ -63,6 +63,11 @@ type Router struct {
 	admissionRejected *prometheus.CounterVec
 	retryBudgetDenied *prometheus.CounterVec
 	retryBudgetTokens *prometheus.GaugeVec
+	probes            *prometheus.CounterVec
+	candidates        map[string]Candidate
+	allCandidates     []Candidate
+	proberCancel      context.CancelFunc
+	proberDone        chan struct{}
 	registry          *prometheus.Registry
 	logger            *zap.Logger
 	retryBackoff      func(int) time.Duration
@@ -72,9 +77,12 @@ type Router struct {
 // state 是单个上游的熔断状态。冷却期内不再向它发送新请求，
 // 让 429 配额或短暂的服务故障有机会恢复。
 type state struct {
-	until    time.Time
-	failures int
-	probing  bool
+	until         time.Time
+	failures      int
+	probing       bool
+	probeInflight bool
+	lastProbeAt   time.Time
+	lastProbeErr  string
 }
 
 func New(cfg Config, db *sql.DB) (*Router, error) {
@@ -95,6 +103,9 @@ func NewWithLogger(cfg Config, db *sql.DB, logger *zap.Logger) (*Router, error) 
 	if err := cfg.Backpressure.normalize(); err != nil {
 		return nil, err
 	}
+	if err := cfg.HealthCheck.normalize(); err != nil {
+		return nil, err
+	}
 	for routeName, route := range cfg.Routes {
 		if err := route.RetryBudget.normalize(routeName); err != nil {
 			return nil, err
@@ -104,7 +115,7 @@ func NewWithLogger(cfg Config, db *sql.DB, logger *zap.Logger) (*Router, error) 
 	if logger == nil {
 		logger = zap.NewNop()
 	}
-	r := &Router{cfg: cfg, db: NewStoreWithConfig(db, cfg.Database), client: newUpstreamHTTPClient(), userAgent: cfg.UserAgent, states: map[string]*state{}, limiters: map[string]*candidateLimiter{}, admission: newAdmissionController(cfg.Backpressure), retryBudgets: map[string]*retryBudget{}, next: map[string]int{}, registry: prometheus.NewRegistry(), logger: logger, retryWait: waitForRetry}
+	r := &Router{cfg: cfg, db: NewStoreWithConfig(db, cfg.Database), client: newUpstreamHTTPClient(), userAgent: cfg.UserAgent, states: map[string]*state{}, limiters: map[string]*candidateLimiter{}, admission: newAdmissionController(cfg.Backpressure), retryBudgets: map[string]*retryBudget{}, next: map[string]int{}, registry: prometheus.NewRegistry(), logger: logger, retryWait: waitForRetry, candidates: map[string]Candidate{}}
 	r.retryBackoff = func(retry int) time.Duration {
 		return jitteredExponentialBackoff(retry, cfg.Retry.BaseDelay, cfg.Retry.MaxDelay)
 	}
@@ -126,6 +137,7 @@ func NewWithLogger(cfg Config, db *sql.DB, logger *zap.Logger) (*Router, error) 
 				return nil, fmt.Errorf("candidate %q has conflicting concurrency settings", candidate.ID)
 			}
 			configuredLimits[candidate.ID] = candidate
+			r.candidates[candidate.ID] = candidate
 			if candidate.MaxConcurrency == 0 {
 				continue
 			}
@@ -135,6 +147,11 @@ func NewWithLogger(cfg Config, db *sql.DB, logger *zap.Logger) (*Router, error) 
 			r.limiters[candidate.ID] = newCandidateLimiter(candidate)
 		}
 	}
+	r.allCandidates = make([]Candidate, 0, len(r.candidates))
+	for _, c := range r.candidates {
+		r.allCandidates = append(r.allCandidates, c)
+	}
+	r.probes = prometheus.NewCounterVec(prometheus.CounterOpts{Name: "nanorouter_probes_total", Help: "Background health probe attempts"}, []string{"upstream", "outcome"})
 	r.requests = prometheus.NewCounterVec(prometheus.CounterOpts{Name: "nanorouter_requests_total", Help: "Upstream attempts"}, []string{"route", "upstream", "endpoint", "status"})
 	r.tokens = prometheus.NewCounterVec(prometheus.CounterOpts{Name: "nanorouter_tokens_total", Help: "Reported tokens"}, []string{"route", "upstream", "type"})
 	r.failovers = prometheus.NewCounterVec(prometheus.CounterOpts{Name: "nanorouter_failovers_total", Help: "Retries sent to another upstream"}, []string{"route", "reason"})
@@ -154,7 +171,7 @@ func NewWithLogger(cfg Config, db *sql.DB, logger *zap.Logger) (*Router, error) 
 	for routeName, budget := range r.retryBudgets {
 		r.retryBudgetTokens.WithLabelValues(routeName).Set(budget.available())
 	}
-	collectors := []prometheus.Collector{r.requests, r.tokens, r.failovers, r.ttfb, r.queueWait, r.retryWaits, r.inflight, r.concurrency, r.admissionRejected, r.retryBudgetDenied, r.retryBudgetTokens, ledgerDropped, ledgerErrors}
+	collectors := []prometheus.Collector{r.requests, r.tokens, r.failovers, r.ttfb, r.queueWait, r.retryWaits, r.inflight, r.concurrency, r.admissionRejected, r.retryBudgetDenied, r.retryBudgetTokens, r.probes, ledgerDropped, ledgerErrors}
 	if r.admission != nil {
 		collectors = append(collectors,
 			prometheus.NewGaugeFunc(prometheus.GaugeOpts{Name: "nanorouter_backpressure_inflight", Help: "Requests admitted by global backpressure control"}, func() float64 { return float64(r.admission.inflight.Load()) }),
@@ -162,6 +179,12 @@ func NewWithLogger(cfg Config, db *sql.DB, logger *zap.Logger) (*Router, error) 
 		)
 	}
 	r.registry.MustRegister(collectors...)
+	if r.hasProbeCandidates() {
+		ctx, cancel := context.WithCancel(context.Background())
+		r.proberCancel = cancel
+		r.proberDone = make(chan struct{})
+		go r.runProber(ctx)
+	}
 	return r, nil
 }
 func (r *Router) Handler() http.Handler {
@@ -206,6 +229,13 @@ func mountPprof(mux *chi.Mux) {
 }
 
 func (r *Router) Close(ctx context.Context) error {
+	if r.proberCancel != nil {
+		r.proberCancel()
+		select {
+		case <-r.proberDone:
+		case <-ctx.Done():
+		}
+	}
 	return r.db.Close(ctx)
 }
 func (r *Router) auth(next http.Handler) http.Handler {
@@ -803,6 +833,8 @@ var chineseLogMessages = map[string]string{
 	"request_completed":          "请求处理完成",
 	"request_failed":             "请求处理失败",
 	"ledger_write_failed":        "账本写入失败",
+	"upstream_probe_recovered":   "上游健康探活成功并恢复",
+	"upstream_probe_failed":      "上游健康探活失败",
 }
 
 func eventFields(event string, fields ...zap.Field) []zap.Field {
@@ -971,7 +1003,13 @@ func (r *Router) candidateEligible(u Candidate, endpoint string, excluded map[st
 		return false
 	}
 	st := r.states[u.ID]
-	return st == nil || (!st.probing && !now.Before(st.until))
+	if st == nil {
+		return true
+	}
+	if r.isProbeEnabled(u) {
+		return st.failures == 0
+	}
+	return !st.probing && !now.Before(st.until)
 }
 
 func (r *Router) reserveProbeLocked(u Candidate, now time.Time) {

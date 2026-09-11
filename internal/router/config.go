@@ -18,6 +18,7 @@ type Config struct {
 	Retry          RetryConfig        `yaml:"retry"`
 	Backpressure   BackpressureConfig `yaml:"backpressure"`
 	Profiling      ProfilingConfig    `yaml:"profiling"`
+	HealthCheck    HealthCheckConfig  `yaml:"health_check"`
 	// UserAgent 全局覆盖转发到上游的 User-Agent。候选的 user_agent 优先于全局值；
 	// 两者都未配置时使用 Go 默认的 Go-http-client/x.x。部分上游的 Cloudflare WAF
 	// 会拦截该默认 UA，可在此配置常规客户端 UA（例如 opencode/1.18.25）统一绕过。
@@ -53,6 +54,31 @@ func (c *BackpressureConfig) normalize() error {
 
 type ProfilingConfig struct {
 	Enabled bool `yaml:"enabled"`
+}
+
+// HealthCheckConfig 控制熔断后的后台异步探活机制。
+// 仅在候选因 503、网络错误或超时进入冷却熔断后触发，健康状态下不发请求，零额外额度消耗。
+type HealthCheckConfig struct {
+	Enabled      bool          `yaml:"enabled"`
+	ProbeTimeout time.Duration `yaml:"probe_timeout"`
+	Interval     time.Duration `yaml:"interval"`
+	MaxBackoff   time.Duration `yaml:"max_backoff"`
+}
+
+func (c *HealthCheckConfig) normalize() error {
+	if c.ProbeTimeout < 0 || c.Interval < 0 || c.MaxBackoff < 0 {
+		return fmt.Errorf("health_check settings must not be negative")
+	}
+	if c.ProbeTimeout == 0 {
+		c.ProbeTimeout = 5 * time.Second
+	}
+	if c.Interval == 0 {
+		c.Interval = 2 * time.Second
+	}
+	if c.MaxBackoff == 0 {
+		c.MaxBackoff = 10 * time.Minute
+	}
+	return nil
 }
 
 type RetryConfig struct {
@@ -362,8 +388,9 @@ type Candidate struct {
 	// 2. 注入 thinking: {"type": "enabled", "clear_thinking": false}
 	// 3. 流式请求注入 stream_options: {"include_usage": true}
 	// 4. 补全会话头 X-Session-Affinity 与 X-Session-Id
-	// 5. 自动剔除智谱不兼容的 promptCacheKey/prompt_cache_key
 	SimulateOpenCode bool `yaml:"simulate_opencode"`
+	// Probe 显式控制该候选是否在熔断后开启后台异步探活；未配置时继承全局 health_check.enabled。
+	Probe *bool `yaml:"probe"`
 	// Headers 允许针对上游候选配置额外的自定义 HTTP 头（可覆盖默认头）。
 	Headers map[string]string `yaml:"headers"`
 }
@@ -372,6 +399,13 @@ func (c Candidate) IsEnabled() bool { return c.Enabled == nil || *c.Enabled }
 
 func (c Candidate) IsAggregateEnabled() bool {
 	return c.AggregateEnabled == nil || *c.AggregateEnabled
+}
+
+func (c Candidate) IsProbeEnabled(global HealthCheckConfig) bool {
+	if c.Probe != nil {
+		return *c.Probe
+	}
+	return global.Enabled
 }
 
 // validate 校验候选的独立配置项。LoadConfig 与 NewWithLogger 共用同一套规则，
@@ -438,6 +472,9 @@ func LoadConfig(path string) (Config, error) {
 		return c, err
 	}
 	if err := c.Backpressure.normalize(); err != nil {
+		return c, err
+	}
+	if err := c.HealthCheck.normalize(); err != nil {
 		return c, err
 	}
 	if len(c.Routes) == 0 {

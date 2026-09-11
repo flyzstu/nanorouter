@@ -34,6 +34,14 @@ backpressure:
 # 默认关闭。开启后 /debug/pprof/* 与其他端点使用相同的 Bearer 鉴权。
 profiling:
   enabled: false
+# 熔断后后台异步探活（Ping-Pong Prober）：仅在候选因 503/网络错误熔断后触发，
+# 冷却期满时代替真实用户发极简 Ping 验证存活，健康期内零心跳、零额度消耗。
+# 全局默认关闭，推荐在不稳定的免费模型候选上单独设置 probe: true。
+health_check:
+  enabled: false
+  probe_timeout: 5s
+  interval: 2s
+  max_backoff: 10m
 
 routes:
   # llama-server 使用服务根地址即可；llama_server: true 会自动补上 /v1。
@@ -148,6 +156,9 @@ routes:
         weight: 3
         responses: true
         enabled: true
+        attempt_timeout: 5s
+        # 针对容易 503 的免费模型开启熔断后后台 Ping-Pong 探活，避免真实用户探雷。
+        probe: true
         # 候选级配置覆盖全局 retry；expose_as 入口只重试自身。
         retry:
           max_retries: 5
