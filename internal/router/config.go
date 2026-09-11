@@ -357,6 +357,15 @@ type Candidate struct {
 	TargetTTFB          time.Duration `yaml:"target_ttfb"`
 	// Retry 覆盖全局内部重试参数；默认仅重试 429/502/503/504。
 	Retry CandidateRetryConfig `yaml:"retry"`
+	// SimulateOpenCode 开启对 OpenCode 客户端行为的全面仿真：
+	// 1. 发送 User-Agent: opencode/1.18.30
+	// 2. 注入 thinking: {"type": "enabled", "clear_thinking": false}
+	// 3. 流式请求注入 stream_options: {"include_usage": true}
+	// 4. 补全会话头 X-Session-Affinity 与 X-Session-Id
+	// 5. 自动剔除智谱不兼容的 promptCacheKey/prompt_cache_key
+	SimulateOpenCode bool `yaml:"simulate_opencode"`
+	// Headers 允许针对上游候选配置额外的自定义 HTTP 头（可覆盖默认头）。
+	Headers map[string]string `yaml:"headers"`
 }
 
 func (c Candidate) IsEnabled() bool { return c.Enabled == nil || *c.Enabled }

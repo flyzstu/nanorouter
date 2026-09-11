@@ -191,9 +191,15 @@ reasoning summary 没有纯 Chat Completions 等价表示，必须返回 400，�
 
 Cerebras `gpt-oss-120b` 与 Mistral 一样使用原生 Chat Completions 加 Responses 适配的组合。它的普通 Chat 路径可保留工具调用与结构化输出；若下游一定需要完整的 Responses 工具/状态语义，应优先路由到 Groq 或 OpenRouter 的原生 Responses 候选。
 
-## 上游参数清洗
+## 上游参数清洗与客户端仿真
 
 兼容不等于每个字段都支持。候选可声明 `drop_request_fields` 与 `drop_message_fields`，网关仅在请求已选定该候选后删除这些字段。这样 Groq 的不支持字段不会导致 400，同时切换到其他供应商时仍保留原请求。清洗适合无副作用的观测、日志概率或元数据字段；会改变结果数量、工具执行或状态机行为的字段不应自动改写。
+
+对于智谱 AI Coding Plan（GLM Coding Plan，聚焦 `glm-5.3` 与 `glm-5.3-flash`）这类具备严格客户端准入白名单和特化思维链交互的上游，候选可配置 `simulate_opencode: true`：
+1. **Header 级白名单仿真**：自动发送 `User-Agent: opencode/1.18.30`，避免被智谱网关识别为非法代理或爬虫而拒绝请求；自动生成并传递 `X-Session-Affinity` 与 `X-Session-Id` 会话跟踪头（下游有传递时透明透传，未提供 Affinity 时自动回退使用 `X-Session-Id`），并透传子 Agent 树状调用所需的 `X-Parent-Session-Id`。支持候选级 `headers` 覆盖或增加自定义头。
+2. **思维链（Thinking）载荷补齐与适配**：与 OpenCode 的 `ProviderTransform` 行为对齐，在请求未提供 `thinking` 时自动注入 `thinking: {"type": "enabled", "clear_thinking": false}`；若下游显式传入 OpenAI 规范的 `reasoning_effort: "none"`，自动转换为 `thinking: {"type": "disabled"}` 关闭思维链；并在多轮 Agent 对话中完整保留历史 assistant 消息中的 `reasoning_content`，避免长程推理思路断裂。
+3. **流式统计与严格参数清洗**：流式请求自动补全 `stream_options: {"include_usage": true}` 以捕获真实用量；自动清洗智谱不支持的缓存键（`promptCacheKey`/`prompt_cache_key`）、OpenAI SDK 默认注入的 `store` 字段以及原生 `reasoning_effort` 参数，防止智谱网关报 400 校验错误。
+4. **灵活端点接入**：下游既可在标准 `/v1/chat/completions` 指定 `model: zhipuaicoding`（或暴露出的真实模型如 `glm-5.3`、`glm-5.3-flash`），也可直接将客户端 Base URL 设为 `/zhipuaicoding` 或 `/zhipuaicoding/v1`，网关会在路径层面自动绑定默认路由。
 
 ## 流式响应的边界
 

@@ -81,6 +81,38 @@ routes:
         drop_message_fields:
           - reasoning_content
 
+  # 智谱 AI Coding Plan：专属编码套餐路由，全面模拟 OpenCode 客户端行为。
+  # 自动设置 User-Agent: opencode/1.18.30，注入 thinking 与流式 include_usage，
+  # 补全 X-Session-Affinity/X-Session-Id，并保留 reasoning_content 保持推理连贯。
+  zhipuaicoding:
+    strategy: weighted_round_robin
+    candidates:
+      - id: zhipuaicoding-glm-5-3
+        base_url: https://open.bigmodel.cn/api/coding/paas/v4
+        api_key_env: ZHIPU_API_KEY
+        model: glm-5.3
+        expose_as: glm-5.3
+        simulate_opencode: true
+        enabled: true
+        responses_via_chat_completions: true
+        attempt_timeout: 90s
+        drop_request_fields:
+          - promptCacheKey
+          - prompt_cache_key
+      - id: zhipuaicoding-glm-5-3-flash
+        base_url: https://open.bigmodel.cn/api/coding/paas/v4
+        api_key_env: ZHIPU_API_KEY
+        model: glm-5.3-flash
+        expose_as: glm-5.3-flash
+        simulate_opencode: true
+        aggregate_enabled: false
+        enabled: true
+        responses_via_chat_completions: true
+        attempt_timeout: 90s
+        drop_request_fields:
+          - promptCacheKey
+          - prompt_cache_key
+
   # OpenCode Go：低成本的编程模型订阅服务，在 opencode.ai/auth 订阅并复制 API 密钥。
   # 多数模型走 OpenAI 兼容的 chat/completions；gpt-5.6-luna 使用原生 /responses。
   # MiniMax、Qwen 等只暴露 Anthropic /v1/messages 的模型无法接入本网关。

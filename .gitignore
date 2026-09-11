@@ -10,3 +10,4 @@ nanorouter.db-*
 # Local environment files
 .env
 .env.*
+reasonix.toml

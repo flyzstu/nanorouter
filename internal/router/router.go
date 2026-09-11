@@ -39,6 +39,7 @@ const maxRateLimitRetries = 5
 const sessionAffinityHeader = "X-Session-Affinity"
 const upstreamMaxIdleConns = 256
 const upstreamMaxIdleConnsPerHost = 64
+const defaultOpenCodeUserAgent = "opencode/1.18.30"
 
 type Router struct {
 	cfg               Config
@@ -173,6 +174,21 @@ func (r *Router) Handler() http.Handler {
 	mux.Get("/v1/models", r.models)
 	mux.Post("/v1/chat/completions", r.proxy("chat_completions"))
 	mux.Post("/v1/responses", r.proxy("responses"))
+
+	// 兼容端点路径：允许无 /v1 前缀调用
+	mux.Get("/models", r.models)
+	mux.Post("/chat/completions", r.proxy("chat_completions"))
+	mux.Post("/responses", r.proxy("responses"))
+
+	// zhipuaicoding 专属端点路径：允许将客户端 Base URL 直接配置为 /zhipuaicoding 或 /zhipuaicoding/v1
+	mux.Route("/zhipuaicoding", func(sub chi.Router) {
+		sub.Get("/models", r.models)
+		sub.Get("/v1/models", r.models)
+		sub.Post("/chat/completions", r.proxy("chat_completions", "zhipuaicoding"))
+		sub.Post("/v1/chat/completions", r.proxy("chat_completions", "zhipuaicoding"))
+		sub.Post("/responses", r.proxy("responses", "zhipuaicoding"))
+		sub.Post("/v1/responses", r.proxy("responses", "zhipuaicoding"))
+	})
 	return r.auth(mux)
 }
 
@@ -224,7 +240,7 @@ func (r *Router) models(w http.ResponseWriter, q *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]any{"object": "list", "data": data})
 }
-func (r *Router) proxy(endpoint string) http.HandlerFunc {
+func (r *Router) proxy(endpoint string, defaultRoutes ...string) http.HandlerFunc {
 	return func(w http.ResponseWriter, q *http.Request) {
 		startedAt := time.Now()
 		requestID := requestID(q)
@@ -273,6 +289,13 @@ func (r *Router) proxy(endpoint string) http.HandlerFunc {
 		}
 		routeName, _ := payload["model"].(string)
 		route, ok := r.routeForModel(routeName)
+		if !ok && len(defaultRoutes) > 0 && defaultRoutes[0] != "" {
+			if defRoute, defOk := r.routeForModel(defaultRoutes[0]); defOk {
+				route = defRoute
+				routeName = defaultRoutes[0]
+				ok = true
+			}
+		}
 		if !ok {
 			http.Error(w, `{"error":{"message":"unknown model route"}}`, 400)
 			r.logRequestFailed(requestID, endpoint, routeName, false, http.StatusBadRequest, 0, time.Since(startedAt), "unknown_model_route")
@@ -280,6 +303,9 @@ func (r *Router) proxy(endpoint string) http.HandlerFunc {
 		}
 		streamed, _ := payload["stream"].(bool)
 		sessionAffinity := strings.TrimSpace(q.Header.Get(sessionAffinityHeader))
+		if sessionAffinity == "" {
+			sessionAffinity = strings.TrimSpace(q.Header.Get("X-Session-Id"))
+		}
 		budget := r.retryBudgets[routeName]
 		if budget != nil {
 			r.retryBudgetTokens.WithLabelValues(routeName).Set(budget.credit())
@@ -413,7 +439,7 @@ func (r *Router) proxy(endpoint string) http.HandlerFunc {
 			}
 			attemptCtx, cancelAttempt := candidateAttemptContext(ctx, u.AttemptTimeout)
 			upstreamAttempts++
-			resp, err := r.do(attemptCtx, u, upstreamEndpoint, encoded)
+			resp, err := r.do(attemptCtx, u, upstreamEndpoint, encoded, q)
 			ttfbDuration := time.Since(start)
 			latency := int(ttfbDuration.Milliseconds())
 			r.ttfb.WithLabelValues(routeName, u.ID, endpoint).Observe(ttfbDuration.Seconds())
@@ -790,7 +816,7 @@ func successLogFields(requestID, route string, u Candidate, endpoint string, att
 		zap.String("usage_source", usage.Source),
 	)
 }
-func (r *Router) do(ctx context.Context, u Candidate, endpoint string, body []byte) (*http.Response, error) {
+func (r *Router) do(ctx context.Context, u Candidate, endpoint string, body []byte, incomingReq *http.Request) (*http.Response, error) {
 	base := strings.TrimRight(u.BaseURL, "/")
 	// llama-server 的监听地址通常不带 /v1；保持其他 OpenAI 兼容上游的 base_url 语义不变。
 	if u.LlamaServer && !strings.HasSuffix(strings.ToLower(base), "/v1") {
@@ -807,16 +833,80 @@ func (r *Router) do(ctx context.Context, u Candidate, endpoint string, body []by
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json, text/event-stream")
 	ua := u.UserAgent
-	if ua == "" {
+	if ua == "" && u.SimulateOpenCode {
+		ua = defaultOpenCodeUserAgent
+	} else if ua == "" {
 		ua = r.userAgent
 	}
 	if ua != "" {
 		req.Header.Set("User-Agent", ua)
 	}
-	if key := os.Getenv(u.APIKeyEnv); key != "" {
+	if key := resolveAPIKey(u.APIKeyEnv); key != "" {
 		req.Header.Set("Authorization", "Bearer "+key)
 	}
+
+	// 模拟 OpenCode 客户端行为（会话头）
+	if u.SimulateOpenCode {
+		sessionID := ""
+		if incomingReq != nil {
+			sessionID = strings.TrimSpace(incomingReq.Header.Get(sessionAffinityHeader))
+			if sessionID == "" {
+				sessionID = strings.TrimSpace(incomingReq.Header.Get("X-Session-Id"))
+			}
+		}
+		if sessionID == "" {
+			sessionID = generateSessionID()
+		}
+		req.Header.Set(sessionAffinityHeader, sessionID)
+		req.Header.Set("X-Session-Id", sessionID)
+		if incomingReq != nil {
+			if pid := strings.TrimSpace(incomingReq.Header.Get("X-Parent-Session-Id")); pid != "" {
+				req.Header.Set("X-Parent-Session-Id", pid)
+			}
+		}
+	} else if incomingReq != nil {
+		if aff := incomingReq.Header.Get(sessionAffinityHeader); aff != "" {
+			req.Header.Set(sessionAffinityHeader, aff)
+		}
+		if sid := incomingReq.Header.Get("X-Session-Id"); sid != "" {
+			req.Header.Set("X-Session-Id", sid)
+		}
+		if pid := strings.TrimSpace(incomingReq.Header.Get("X-Parent-Session-Id")); pid != "" {
+			req.Header.Set("X-Parent-Session-Id", pid)
+		}
+	}
+
+	// 注入候选自定义 Headers（显式配置可覆盖默认值）
+	for k, v := range u.Headers {
+		req.Header.Set(k, v)
+	}
+
 	return r.client.Do(req)
+}
+
+func resolveAPIKey(envName string) string {
+	if envName == "" {
+		return ""
+	}
+	if key := os.Getenv(envName); key != "" {
+		return key
+	}
+	// 智谱 API Key 常见环境变量名互备容错
+	if envName == "ZHIPU_API_KEY" {
+		return os.Getenv("ZHIPUAI_API_KEY")
+	}
+	if envName == "ZHIPUAI_API_KEY" {
+		return os.Getenv("ZHIPU_API_KEY")
+	}
+	return ""
+}
+
+func generateSessionID() string {
+	b := make([]byte, 12)
+	if _, err := rand.Read(b); err != nil {
+		return fmt.Sprintf("ses_%d", time.Now().UnixNano())
+	}
+	return "ses_" + hex.EncodeToString(b)
 }
 
 func newUpstreamHTTPClient() *http.Client {
