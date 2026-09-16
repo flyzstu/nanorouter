@@ -204,7 +204,6 @@ func (r *Router) onProbeSuccess(u Candidate, duration time.Duration) {
 	if st != nil {
 		st.failures = 0
 		st.until = time.Time{}
-		st.probing = false
 		st.probeInflight = false
 		st.lastProbeAt = time.Now()
 		st.lastProbeErr = ""

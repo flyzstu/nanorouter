@@ -257,3 +257,80 @@ func TestAttemptTimeoutStreamDoesNotCooldownUpstream(t *testing.T) {
 		t.Fatalf("second request status=%d body=%s", rec2.Code, rec2.Body.String())
 	}
 }
+
+// TestClientCanceledDuringPassiveProbeReleasesProbeLease 验证：熔断冷却到期后的探活请求在
+// 等待上游期间被下游客户端取消，探活租约被正确释放，紧随其后的正常请求应立即成功，不能死锁为 503。
+func TestClientCanceledDuringPassiveProbeReleasesProbeLease(t *testing.T) {
+	begin := make(chan struct{})
+	var calls atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch calls.Add(1) {
+		case 1:
+			// 1. 模拟上游故障，返回 502 Bad Gateway 触发熔断
+			w.WriteHeader(http.StatusBadGateway)
+			_, _ = w.Write([]byte(`{"error":"bad gateway"}`))
+		case 2:
+			// 2. 探活请求：阻塞等待下游客户端取消
+			close(begin)
+			select {
+			case <-r.Context().Done():
+			case <-time.After(500 * time.Millisecond):
+			}
+		default:
+			// 3. 后续请求：正常响应 200 OK
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"id":"ok","choices":[{"message":{"content":"ok"}}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}`))
+		}
+	}))
+	defer upstream.Close()
+
+	db, err := sql.Open("sqlite3", ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := Migrate(context.Background(), db); err != nil {
+		t.Fatal(err)
+	}
+
+	r, err := New(Config{
+		HealthCheck: HealthCheckConfig{Enabled: false},
+		Routes: map[string]Route{"test": {Candidates: []Candidate{
+			{ID: "u1", BaseURL: upstream.URL, Model: "m1"},
+		}}},
+	}, db)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 第 1 步：发起第 1 次请求，上游返回 502，u1 进入冷却状态
+	rec1 := httptest.NewRecorder()
+	r.Handler().ServeHTTP(rec1, httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"test","messages":[]}`)))
+
+	// 第 2 步：将 until 设置为过去，模拟冷却期已结束，准备被动探活
+	r.mu.Lock()
+	r.states["u1"].until = time.Now().Add(-1 * time.Second)
+	r.mu.Unlock()
+
+	// 第 3 步：发起第 2 次请求，进入被动探活租约，期间客户端主动断开
+	ctx2, cancel2 := context.WithCancel(context.Background())
+	req2 := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"test","messages":[]}`)).WithContext(ctx2)
+	rec2 := httptest.NewRecorder()
+	done2 := make(chan struct{})
+	go func() {
+		r.Handler().ServeHTTP(rec2, req2)
+		close(done2)
+	}()
+	<-begin
+	cancel2()
+	<-done2
+	upstream.CloseClientConnections()
+
+	// 第 4 步：发起第 3 次请求，候选必须可以正常接客返回 200，绝不能是 503 upstreams_unavailable
+	rec3 := httptest.NewRecorder()
+	r.Handler().ServeHTTP(rec3, httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"test","messages":[]}`)))
+	if rec3.Code != http.StatusOK {
+		t.Fatalf("expected status 200 on 3rd request after client cancel, got %d body=%s", rec3.Code, rec3.Body.String())
+	}
+}
+

@@ -79,7 +79,6 @@ type Router struct {
 type state struct {
 	until         time.Time
 	failures      int
-	probing       bool
 	probeInflight bool
 	lastProbeAt   time.Time
 	lastProbeErr  string
@@ -501,6 +500,7 @@ func (r *Router) proxy(endpoint string, defaultRoutes ...string) http.HandlerFun
 				}
 				r.record(requestID, routeName, u, endpoint, status, latency, streamed, attempt, Usage{Source: "unavailable"}, kind)
 				if clientCanceled {
+					r.releaseProbe(u)
 					if ctx.Err() != nil {
 						r.logRequestFailed(requestID, endpoint, routeName, streamed, 499, attempt+1, time.Since(startedAt), "client_canceled")
 						return
@@ -622,6 +622,7 @@ func (r *Router) proxy(endpoint string, defaultRoutes ...string) http.HandlerFun
 					default:
 						r.fail(routeName, u, 30*time.Second)
 					}
+					r.releaseProbe(u)
 					r.record(requestID, routeName, u, endpoint, status, duration, true, attempt, usage, kind)
 					r.logRequestFailed(requestID, endpoint, routeName, true, status, attempt+1, time.Since(startedAt), outcome)
 					return
@@ -1009,20 +1010,24 @@ func (r *Router) candidateEligible(u Candidate, endpoint string, excluded map[st
 	if r.isProbeEnabled(u) {
 		return st.failures == 0
 	}
-	return !st.probing && !now.Before(st.until)
+	return !now.Before(st.until)
 }
 
 func (r *Router) reserveProbeLocked(u Candidate, now time.Time) {
 	if st := r.states[u.ID]; st != nil && st.failures > 0 && !now.Before(st.until) {
-		st.probing = true
+		lease := u.AttemptTimeout
+		if lease <= 0 || lease > 15*time.Second {
+			lease = 10 * time.Second
+		}
+		st.until = now.Add(lease)
 	}
 }
 
 func (r *Router) releaseProbe(u Candidate) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if st := r.states[u.ID]; st != nil {
-		st.probing = false
+	if st := r.states[u.ID]; st != nil && st.failures > 0 {
+		st.until = time.Time{}
 	}
 }
 
@@ -1059,7 +1064,6 @@ func (r *Router) failUntil(u Candidate, until time.Time) {
 	}
 	s.failures++
 	s.until = until
-	s.probing = false
 }
 func (r *Router) success(u Candidate) {
 	r.mu.Lock()
@@ -1067,7 +1071,6 @@ func (r *Router) success(u Candidate) {
 	if s := r.states[u.ID]; s != nil {
 		s.failures = 0
 		s.until = time.Time{}
-		s.probing = false
 	}
 }
 func (r *Router) record(requestID, route string, u Candidate, ep string, status, latency int, stream bool, attempt int, usage Usage, kind string) {
