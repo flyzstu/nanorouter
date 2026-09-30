@@ -7,80 +7,143 @@
 <title>nanorouter stats</title>
 <style>
   :root {
-    --bg: #0F172A; --card: #1B2336; --muted-surface: #272F42;
-    --fg: #F8FAFC; --muted: #94A3B8; --border: #475569;
-    --ok: #22C55E; --bad: #EF4444; --bar: #38BDF8;
-    --mono: ui-monospace, "SF Mono", "Cascadia Mono", "Fira Code", Consolas, monospace;
+    --bg: #08080D; --fg: #F4F4F8; --muted: #9A9AB0;
+    --card: rgba(255,255,255,.032); --card-solid: #101016;
+    --border: rgba(255,255,255,.085); --border-strong: rgba(255,255,255,.16);
+    --track: rgba(255,255,255,.06);
+    --accent-1: #818CF8; --accent-2: #C084FC;
+    --cyan: #22D3EE; --ok: #34D399; --bad: #FB7185;
+    --mono: ui-monospace, "SF Mono", "Cascadia Mono", "JetBrains Mono", Consolas, monospace;
     --sans: system-ui, -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
   }
   @media (prefers-color-scheme: light) {
     :root {
-      --bg: #F1F5F9; --card: #FFFFFF; --muted-surface: #E2E8F0;
-      --fg: #0F172A; --muted: #475569; --border: #CBD5E1; --bar: #0284C7;
+      --bg: #F4F5FA; --fg: #17171F; --muted: #6E6E85;
+      --card: #FFFFFF; --card-solid: #FFFFFF;
+      --border: #E5E5F0; --border-strong: #C9C9DC; --track: #ECECF4;
     }
   }
   * { box-sizing: border-box; }
+  html { -webkit-text-size-adjust: 100%; }
   body {
-    margin: 0; background: var(--bg); color: var(--fg);
-    font: 14px/1.5 var(--sans); padding: 20px;
+    margin: 0; min-height: 100vh; color: var(--fg);
+    font: 14px/1.55 var(--sans);
+    background:
+      radial-gradient(1100px 520px at 12% -8%, rgba(99,102,241,.16), transparent 60%),
+      radial-gradient(900px 480px at 96% 108%, rgba(34,211,238,.10), transparent 60%),
+      var(--bg);
+    background-attachment: fixed;
+    padding: 24px clamp(16px, 3vw, 36px) 28px;
   }
-  header { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; margin-bottom: 16px; }
-  h1 { font-size: 16px; margin: 0 auto 0 0; letter-spacing: .02em; }
-  h1 code { font-family: var(--mono); color: var(--muted); font-size: 13px; margin-left: 8px; }
-  .seg { display: inline-flex; border: 1px solid var(--border); border-radius: 8px; overflow: hidden; }
+  @media (prefers-color-scheme: light) {
+    body { background:
+      radial-gradient(1100px 520px at 12% -8%, rgba(99,102,241,.10), transparent 60%),
+      radial-gradient(900px 480px at 96% 108%, rgba(34,211,238,.08), transparent 60%),
+      var(--bg); }
+  }
+  header { display: flex; flex-wrap: wrap; gap: 14px; align-items: center; margin-bottom: 20px; }
+  .brand { display: flex; align-items: baseline; gap: 9px; margin-right: auto; }
+  .brand .dot {
+    width: 9px; height: 9px; border-radius: 50%; align-self: center;
+    background: linear-gradient(135deg, var(--accent-1), var(--accent-2));
+    box-shadow: 0 0 12px rgba(129,140,248,.8);
+  }
+  .brand h1 { font-size: 15px; font-weight: 650; margin: 0; letter-spacing: .01em; }
+  .brand code { font-family: var(--mono); color: var(--muted); font-size: 12px; }
+  .seg {
+    display: inline-flex; gap: 2px; padding: 3px; border-radius: 11px;
+    background: var(--card); border: 1px solid var(--border);
+  }
   .seg button {
     appearance: none; border: 0; background: transparent; color: var(--muted);
-    font: 600 13px var(--sans); padding: 6px 14px; cursor: pointer; min-height: 32px;
-    transition: background .15s, color .15s;
+    font: 600 12.5px var(--sans); padding: 5px 14px; border-radius: 8px; cursor: pointer;
+    transition: color .15s, background .15s, box-shadow .15s;
   }
-  .seg button + button { border-left: 1px solid var(--border); }
-  .seg button[aria-pressed="true"] { background: var(--muted-surface); color: var(--fg); }
-  .seg button:focus-visible { outline: 2px solid var(--bar); outline-offset: -2px; }
-  .refresh { display: inline-flex; gap: 6px; align-items: center; color: var(--muted); font-size: 13px; cursor: pointer; }
-  .refresh input { accent-color: var(--ok); width: 15px; height: 15px; }
-  #error { display: none; margin: 0 0 16px; padding: 10px 14px; border: 1px solid var(--bad);
-    border-radius: 8px; color: var(--bad); background: color-mix(in srgb, var(--bad) 8%, transparent); }
-  .kpis { display: grid; grid-template-columns: repeat(auto-fit, minmax(168px, 1fr)); gap: 12px; margin-bottom: 12px; }
-  .card { background: var(--card); border: 1px solid var(--border); border-radius: 10px; padding: 14px 16px; }
-  .kpi .label { color: var(--muted); font-size: 12px; margin-bottom: 4px; }
-  .kpi .value { font-family: var(--mono); font-size: 24px; font-weight: 600; letter-spacing: -.01em; }
-  .kpi .sub { color: var(--muted); font-size: 12px; margin-top: 2px; }
-  .kpi .value.ok { color: var(--ok); } .kpi .value.bad { color: var(--bad); }
-  section.card { margin-bottom: 12px; }
-  section.card > h2 { font-size: 13px; font-weight: 600; color: var(--muted); margin: 0 0 10px; text-transform: none; }
-  .grid2 { display: grid; grid-template-columns: 3fr 2fr; gap: 12px; }
-  @media (max-width: 900px) { .grid2 { grid-template-columns: 1fr; } body { padding: 12px; } }
+  .seg button:hover { color: var(--fg); }
+  .seg button[aria-pressed="true"] {
+    color: #fff; background: linear-gradient(135deg, var(--accent-1), var(--accent-2));
+    box-shadow: 0 2px 14px rgba(129,140,248,.35);
+  }
+  .seg button:focus-visible { outline: 2px solid var(--accent-1); outline-offset: 2px; }
+  .refresh { display: inline-flex; gap: 7px; align-items: center; color: var(--muted); font-size: 12.5px; cursor: pointer; user-select: none; }
+  .refresh input { accent-color: var(--accent-1); width: 14px; height: 14px; }
+  #error { display: none; margin: 0 0 16px; padding: 10px 14px; border-radius: 10px;
+    border: 1px solid rgba(251,113,133,.4); color: var(--bad); background: rgba(251,113,133,.07); }
+  .kpis { display: grid; grid-template-columns: repeat(auto-fit, minmax(178px, 1fr)); gap: 12px; margin-bottom: 14px; }
+  .card {
+    background: var(--card); border: 1px solid var(--border); border-radius: 16px;
+    padding: 16px 18px; position: relative; overflow: hidden;
+    box-shadow: 0 1px 0 rgba(255,255,255,.04) inset, 0 12px 32px -18px rgba(0,0,0,.55);
+  }
+  @media (prefers-color-scheme: light) {
+    .card { box-shadow: 0 1px 2px rgba(23,23,31,.04), 0 10px 28px -20px rgba(23,23,31,.18); }
+  }
+  section.card, .kpis .card { transition: border-color .18s, transform .18s; }
+  section.card:hover { border-color: var(--border-strong); }
+  .kpi .label {
+    color: var(--muted); font-size: 10.5px; font-weight: 650; letter-spacing: .14em;
+    text-transform: uppercase; margin-bottom: 7px;
+  }
+  .kpi .value {
+    font-family: var(--mono); font-size: 26px; font-weight: 650; letter-spacing: -.02em;
+    font-feature-settings: "tnum" 1; line-height: 1.15;
+  }
+  .kpi .value.grad {
+    background: linear-gradient(120deg, var(--accent-1), var(--accent-2) 55%, var(--cyan));
+    -webkit-background-clip: text; background-clip: text; color: transparent;
+  }
+  .kpi .sub { color: var(--muted); font-size: 12px; margin-top: 5px; display: flex; align-items: center; gap: 6px; }
+  .pill {
+    display: inline-flex; align-items: center; font-family: var(--mono); font-size: 11px;
+    padding: 1px 8px; border-radius: 99px; border: 1px solid var(--border); color: var(--muted);
+  }
+  .pill.ok { color: var(--ok); border-color: rgba(52,211,153,.35); background: rgba(52,211,153,.08); }
+  .pill.bad { color: var(--bad); border-color: rgba(251,113,133,.35); background: rgba(251,113,133,.08); }
+  .grid2 { display: grid; grid-template-columns: 1.9fr 1fr; gap: 12px; margin-bottom: 12px; }
+  @media (max-width: 960px) { .grid2 { grid-template-columns: 1fr; } }
+  section.card > h2 {
+    font-size: 11px; font-weight: 650; color: var(--muted); letter-spacing: .14em;
+    text-transform: uppercase; margin: 0 0 12px; display: flex; align-items: center; gap: 8px;
+  }
+  section.card > h2::before {
+    content: ""; width: 14px; height: 3px; border-radius: 2px;
+    background: linear-gradient(90deg, var(--accent-1), var(--cyan));
+  }
   svg#chart { width: 100%; height: auto; display: block; }
   svg#chart text { font: 10px var(--mono); fill: var(--muted); }
-  svg#chart .bar { fill: var(--bar); opacity: .82; }
-  svg#chart .failbar { fill: var(--bad); opacity: .9; }
-  svg#chart .rateline { fill: none; stroke: var(--ok); stroke-width: 2; }
-  svg#chart .grid { stroke: var(--border); stroke-width: .5; opacity: .5; }
-  svg#chart .axis { stroke: var(--border); stroke-width: 1; }
   table { width: 100%; border-collapse: collapse; font-size: 13px; }
-  th { color: var(--muted); font-weight: 600; text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--border); white-space: nowrap; }
-  td { padding: 6px 8px; border-bottom: 1px solid color-mix(in srgb, var(--border) 45%, transparent); }
-  td.num, th.num { text-align: right; font-family: var(--mono); white-space: nowrap; }
+  th { color: var(--muted); font-weight: 600; font-size: 11px; letter-spacing: .08em; text-transform: uppercase;
+       text-align: left; padding: 7px 10px; border-bottom: 1px solid var(--border); white-space: nowrap; }
+  td { padding: 8px 10px; border-bottom: 1px solid var(--track); }
+  tbody tr { transition: background .15s; }
+  tbody tr:hover { background: var(--card); }
+  @media (prefers-color-scheme: light) { tbody tr:hover { background: #F7F7FC; } }
   tr:last-child td { border-bottom: 0; }
+  td.num, th.num { text-align: right; font-family: var(--mono); white-space: nowrap; font-feature-settings: "tnum" 1; }
+  td code, .failbar-row code { font-family: var(--mono); font-size: 12.5px; }
   .barcell { position: relative; min-width: 120px; }
-  .barcell .fill { position: absolute; inset: 3px auto 3px 0; background: color-mix(in srgb, var(--bar) 22%, transparent); border-radius: 3px; }
+  .barcell .fill {
+    position: absolute; inset: 4px auto 4px 0; border-radius: 4px;
+    background: linear-gradient(90deg, rgba(129,140,248,.34), rgba(34,211,238,.18));
+  }
   .barcell span { position: relative; }
-  .ok-ratio { color: var(--ok); } .bad-ratio { color: var(--bad); }
-  .failbar-row { display: grid; grid-template-columns: minmax(110px, auto) 1fr auto; gap: 10px; align-items: center; padding: 5px 0; }
-  .failbar-track { height: 8px; background: var(--muted-surface); border-radius: 4px; overflow: hidden; }
-  .failbar-fill { height: 100%; background: var(--bad); border-radius: 4px; }
+  .rate-ok { color: var(--ok); } .rate-bad { color: var(--bad); }
+  .failbar-row { display: grid; grid-template-columns: minmax(112px, auto) 1fr auto; gap: 12px; align-items: center; padding: 7px 0; }
+  .failbar-track { height: 7px; background: var(--track); border-radius: 4px; overflow: hidden; }
+  .failbar-fill { height: 100%; border-radius: 4px; background: linear-gradient(90deg, #FB7185, #F43F5E); box-shadow: 0 0 10px rgba(251,113,133,.35); }
   .failbar-row .count { font-family: var(--mono); }
-  .failbar-row code { font-family: var(--mono); font-size: 12px; }
-  details { margin-top: 8px; color: var(--muted); }
+  details { margin-top: 10px; color: var(--muted); }
   details summary { cursor: pointer; font-size: 12px; }
-  .empty { color: var(--muted); padding: 18px 0; text-align: center; }
-  footer { color: var(--muted); font-size: 12px; margin-top: 4px; }
+  details summary:hover { color: var(--fg); }
+  .empty { color: var(--muted); padding: 26px 0; text-align: center; font-size: 13px; }
+  footer { color: var(--muted); font-size: 12px; margin-top: 14px; }
+  ::selection { background: rgba(129,140,248,.35); }
   @media (prefers-reduced-motion: reduce) { * { transition: none !important; } }
 </style>
 </head>
 <body>
 <header>
-  <h1>nanorouter <code>/stats</code></h1>
+  <div class="brand"><span class="dot" aria-hidden="true"></span><h1>nanorouter</h1><code>/stats</code></div>
   <div class="seg" role="group" aria-label="时间范围">
     <button type="button" data-range="1h" aria-pressed="false">1h</button>
     <button type="button" data-range="24h" aria-pressed="true">24h</button>
@@ -91,16 +154,16 @@
 </header>
 <div id="error" role="alert"></div>
 <div class="kpis">
-  <div class="card kpi"><div class="label">调用次数</div><div class="value" id="k-calls">–</div><div class="sub" id="k-calls-sub"></div></div>
+  <div class="card kpi"><div class="label">调用次数</div><div class="value grad" id="k-calls">–</div><div class="sub" id="k-calls-sub"></div></div>
   <div class="card kpi"><div class="label">成功率</div><div class="value" id="k-rate">–</div><div class="sub" id="k-rate-sub"></div></div>
   <div class="card kpi"><div class="label">Token 用量</div><div class="value" id="k-tokens">–</div><div class="sub" id="k-tokens-sub"></div></div>
-  <div class="card kpi"><div class="label">延迟</div><div class="value" id="k-latency">–</div><div class="sub">p50 / p95</div></div>
-  <div class="card kpi"><div class="label">带工具请求</div><div class="value" id="k-tools">–</div><div class="sub" id="k-tools-sub">请求侧 tools 数组</div></div>
+  <div class="card kpi"><div class="label">延迟 p50 / p95</div><div class="value" id="k-latency">–</div><div class="sub">全候选合计</div></div>
+  <div class="card kpi"><div class="label">带工具请求</div><div class="value" id="k-tools">–</div><div class="sub" id="k-tools-sub">请求侧 tools</div></div>
 </div>
 <div class="grid2">
   <section class="card">
     <h2>调用与成功率</h2>
-    <svg id="chart" viewBox="0 0 720 240" role="img" aria-label="按时间分桶的调用次数柱状图与成功率折线图"></svg>
+    <svg id="chart" viewBox="0 0 720 250" role="img" aria-label="按时间分桶的调用次数柱状图与成功率折线图"></svg>
     <details><summary>查看数据表</summary><table id="chart-table"><thead><tr><th>时间桶</th><th class="num">调用</th><th class="num">失败</th><th class="num">成功率</th></tr></thead><tbody></tbody></table></details>
   </section>
   <section class="card">
@@ -109,7 +172,7 @@
   </section>
 </div>
 <section class="card">
-  <h2>模型分布（route → upstream_model）</h2>
+  <h2>模型分布 · route → upstream_model</h2>
   <table id="models">
     <thead><tr><th>route</th><th>upstream_model</th><th class="num">调用</th><th class="num">成功率</th><th class="num">tokens</th><th class="num">平均延迟</th></tr></thead>
     <tbody></tbody>
@@ -120,6 +183,8 @@
 "use strict";
 const $ = (id) => document.getElementById(id);
 let state = { range: "24h", timer: null };
+
+const HEX = { cyan: "#22D3EE", indigo: "#818CF8", ok: "#34D399", bad: "#FB7185", grid: "rgba(154,154,176,.18)", label: "#9A9AB0" };
 
 function fmtInt(n) {
   return n >= 1000000 ? (n / 1000000).toFixed(1) + "M"
@@ -154,83 +219,106 @@ async function load() {
 function render(d) {
   const t = d.totals, failures = t.requests - t.success;
   $("k-calls").textContent = fmtInt(t.requests);
-  $("k-calls-sub").textContent = failures > 0 ? "失败 " + fmtInt(failures) : "全部成功";
-  const rate = fmtRate(t.success, t.requests);
-  $("k-rate").textContent = rate;
-  $("k-rate").className = "value " + (t.requests === 0 ? "" : failures === 0 ? "ok" : t.success * 100 / t.requests >= 95 ? "" : "bad");
-  $("k-rate-sub").textContent = "成功 " + fmtInt(t.success);
+  $("k-calls-sub").innerHTML = failures > 0
+    ? '<span class="pill bad">失败 ' + fmtInt(failures) + "</span>"
+    : '<span class="pill ok">全部成功</span>';
+  const ratePct = t.requests ? t.success * 100 / t.requests : 0;
+  $("k-rate").textContent = fmtRate(t.success, t.requests);
+  $("k-rate").className = "value " + (t.requests && failures === 0 ? "grad" : "");
+  $("k-rate-sub").innerHTML = '<span class="pill ' + (!t.requests ? "" : ratePct >= 95 ? "ok" : "bad") + '">成功 ' + fmtInt(t.success) + "</span>";
   $("k-tokens").textContent = fmtInt(t.total_tokens);
   $("k-tokens-sub").textContent = "输入 " + fmtInt(t.prompt_tokens) + " · 输出 " + fmtInt(t.completion_tokens);
   $("k-latency").textContent = t.requests ? t.latency_p50_ms + " / " + t.latency_p95_ms + "ms" : "–";
   $("k-tools").textContent = fmtInt(t.with_tools);
-  $("k-tools-sub").textContent = t.requests ? "占比 " + fmtRate(t.with_tools, t.requests) : "请求侧 tools 数组";
+  $("k-tools-sub").textContent = t.requests ? "占比 " + fmtRate(t.with_tools, t.requests) : "请求侧 tools";
   renderChart(d.series);
-  renderFailures(d.failures, failures);
-  renderModels(d.models, t.requests);
+  renderFailures(d.failures);
+  renderModels(d.models);
 }
 function renderChart(series) {
   const svg = $("chart");
+  const W = 720, H = 250, ML = 48, MR = 48, MT = 18, MB = 28;
+  const iw = W - ML - MR, ih = H - MT - MB;
+  const defs =
+    '<defs>'
+    + '<linearGradient id="gBar" x1="0" y1="0" x2="0" y2="1">'
+    + '<stop offset="0" stop-color="' + HEX.cyan + '" stop-opacity=".95"/>'
+    + '<stop offset="1" stop-color="' + HEX.indigo + '" stop-opacity=".30"/></linearGradient>'
+    + '<linearGradient id="gBarFail" x1="0" y1="0" x2="0" y2="1">'
+    + '<stop offset="0" stop-color="' + HEX.bad + '" stop-opacity=".9"/>'
+    + '<stop offset="1" stop-color="' + HEX.bad + '" stop-opacity=".55"/></linearGradient>'
+    + "</defs>";
   if (!series.length || series.every(p => p.calls === 0)) {
-    svg.innerHTML = '<text x="360" y="120" text-anchor="middle">该时间范围内没有请求</text>';
+    svg.innerHTML = defs + '<text x="360" y="125" text-anchor="middle">该时间范围内没有请求</text>';
     $("chart-table").querySelector("tbody").innerHTML = "";
     return;
   }
-  const W = 720, H = 240, ML = 46, MR = 46, MT = 14, MB = 26;
-  const iw = W - ML - MR, ih = H - MT - MB;
   const maxCalls = Math.max(...series.map(p => p.calls), 1);
   const bw = iw / series.length;
-  const y = (v) => MT + ih - (v / maxCalls) * ih;
   const x = (i) => ML + i * bw;
-  let bars = "", line = "", pts = [];
+  const y = (v) => MT + ih - (v / maxCalls) * ih;
+  let bars = "", pts = [];
   series.forEach((p, i) => {
     if (p.calls === 0) return;
     const okCalls = p.calls - p.failures;
-    const h = (p.calls / maxCalls) * ih;
-    bars += '<g><title>' + bucketLabel(p.bucket) + ' · 调用 ' + p.calls + ' · 失败 ' + p.failures + '</title>'
-      + '<rect class="bar" x="' + (x(i) + bw * 0.14).toFixed(1) + '" y="' + (MT + ih - h).toFixed(1)
-      + '" width="' + (bw * 0.72).toFixed(1) + '" height="' + h.toFixed(1) + '" rx="2"/>';
-    if (p.failures > 0) {
-      const fh = (p.failures / maxCalls) * ih;
-      bars += '<rect class="failbar" x="' + (x(i) + bw * 0.14).toFixed(1) + '" y="' + (MT + ih - fh).toFixed(1)
-        + '" width="' + (bw * 0.72).toFixed(1) + '" height="' + fh.toFixed(1) + '" rx="2"/>';
+    const hOk = (okCalls / maxCalls) * ih;
+    const xBar = (x(i) + bw * 0.16).toFixed(1), wBar = (bw * 0.68).toFixed(1);
+    bars += "<g><title>" + bucketLabel(p.bucket) + " · 调用 " + p.calls + " · 失败 " + p.failures + "</title>";
+    if (okCalls > 0) {
+      bars += '<rect x="' + xBar + '" y="' + (MT + ih - hOk).toFixed(1) + '" width="' + wBar + '" height="' + hOk.toFixed(1) + '" rx="3" fill="url(#gBar)"/>';
     }
-    bars += '</g>';
-    if (okCalls >= 0) pts.push([x(i) + bw / 2, MT + ih - (okCalls / p.calls) * ih]);
+    if (p.failures > 0) {
+      const hF = (p.failures / maxCalls) * ih;
+      bars += '<rect x="' + xBar + '" y="' + (MT + ih - hF).toFixed(1) + '" width="' + wBar + '" height="' + hF.toFixed(1) + '" rx="3" fill="url(#gBarFail)"/>';
+    }
+    bars += "</g>";
+    pts.push([x(i) + bw / 2, MT + ih - (okCalls / p.calls) * ih]);
   });
-  line = '<polyline class="rateline" points="' + pts.map(p => p[0].toFixed(1) + "," + p[1].toFixed(1)).join(" ") + '"/>';
-  let grid = "", labels = "";
+  let grid = "";
   [0, .5, 1].forEach(f => {
-    const gy = MT + ih - f * ih;
-    grid += '<line class="grid" x1="' + ML + '" y1="' + gy + '" x2="' + (W - MR) + '" y2="' + gy + '"/>';
-    grid += '<text x="' + (ML - 6) + '" y="' + (gy + 3) + '" text-anchor="end">' + fmtInt(maxCalls * f) + '</text>';
+    const gy = (MT + ih - f * ih).toFixed(1);
+    grid += '<line x1="' + ML + '" y1="' + gy + '" x2="' + (W - MR) + '" y2="' + gy + '" stroke="' + HEX.grid + '" stroke-dasharray="3 5"/>';
+    grid += '<text x="' + (ML - 8) + '" y="' + (Number(gy) + 3.5) + '" text-anchor="end" fill="' + HEX.label + '">' + fmtInt(maxCalls * f) + "</text>";
   });
+  let labels = "";
   const step = Math.ceil(series.length / 8);
   series.forEach((p, i) => {
-    if (i % step === 0) labels += '<text x="' + (x(i) + bw / 2) + '" y="' + (H - 8) + '" text-anchor="middle">' + bucketLabel(p.bucket) + '</text>';
+    if (i % step === 0) labels += '<text x="' + (x(i) + bw / 2) + '" y="' + (H - 8) + '" text-anchor="middle" fill="' + HEX.label + '">' + bucketLabel(p.bucket) + "</text>";
   });
-  svg.innerHTML = grid + bars + line
-    + '<line class="axis" x1="' + ML + '" y1="' + (MT + ih) + '" x2="' + (W - MR) + '" y2="' + (MT + ih) + '"/>'
-    + labels
-    + '<text x="' + (W - MR + 6) + '" y="' + (MT + 4) + '" fill="#22C55E">成功率</text>';
+  const line = pts.length > 1
+    ? '<polyline points="' + pts.map(p => p[0].toFixed(1) + "," + p[1].toFixed(1)).join(" ")
+      + '" fill="none" stroke="' + HEX.ok + '" stroke-width="2" stroke-linejoin="round" stroke-linecap="round" opacity=".92"/>'
+    : "";
+  const dots = pts.map(p => '<circle cx="' + p[0].toFixed(1) + '" cy="' + p[1].toFixed(1) + '" r="2.2" fill="' + HEX.ok + '"/>').join("");
+  const legend = '<g font-family="ui-monospace, monospace" font-size="10">'
+    + '<rect x="' + (W - MR - 118) + '" y="' + (MT - 10) + '" width="10" height="10" rx="2" fill="url(#gBar)"/>'
+    + '<text x="' + (W - MR - 104) + '" y="' + (MT - 1) + '">调用</text>'
+    + '<rect x="' + (W - MR - 66) + '" y="' + (MT - 10) + '" width="10" height="10" rx="2" fill="' + HEX.bad + '"/>'
+    + '<text x="' + (W - MR - 52) + '" y="' + (MT - 1) + '">失败</text>'
+    + '<circle cx="' + (W - MR - 12) + '" cy="' + (MT - 5) + '" r="3" fill="' + HEX.ok + '"/>'
+    + '<text x="' + (W - MR - 6) + '" y="' + (MT - 1) + '" fill="' + HEX.ok + '">成功率</text></g>';
+  svg.innerHTML = defs + grid + bars + line + dots
+    + '<line x1="' + ML + '" y1="' + (MT + ih) + '" x2="' + (W - MR) + '" y2="' + (MT + ih) + '" stroke="' + HEX.grid + '"/>'
+    + labels + legend;
   const tb = $("chart-table").querySelector("tbody");
   tb.innerHTML = series.map(p =>
     "<tr><td>" + p.bucket + "</td><td class=\"num\">" + p.calls + "</td><td class=\"num\">" + p.failures + "</td><td class=\"num\">" + fmtRate(p.calls - p.failures, p.calls) + "</td></tr>"
   ).join("");
 }
-function renderFailures(items, totalFailures) {
+function renderFailures(items) {
   const box = $("failures");
   if (!items.length) {
-    box.innerHTML = '<div class="empty">窗口内无失败</div>';
+    box.innerHTML = '<div class="empty">窗口内无失败 ✦</div>';
     return;
   }
   const max = Math.max(...items.map(f => f.count), 1);
   box.innerHTML = items.map(f =>
     '<div class="failbar-row"><code>' + f.key.replace(/&/g, "&amp;").replace(/</g, "&lt;")
     + '</code><div class="failbar-track"><div class="failbar-fill" style="width:' + (f.count * 100 / max).toFixed(1) + '%"></div></div>'
-    + '<span class="count">' + fmtInt(f.count) + '</span></div>'
+    + '<span class="count">' + fmtInt(f.count) + "</span></div>"
   ).join("");
 }
-function renderModels(models, totalCalls) {
+function renderModels(models) {
   const tb = $("models").querySelector("tbody");
   if (!models.length) {
     tb.innerHTML = '<tr><td colspan="6" class="empty">该时间范围内没有请求</td></tr>';
@@ -238,11 +326,13 @@ function renderModels(models, totalCalls) {
   }
   const maxCalls = Math.max(...models.map(m => m.calls), 1);
   tb.innerHTML = models.map(m => {
-    const rate = m.calls - m.success === 0 ? "100.0%" : (m.success * 100 / m.calls).toFixed(1) + "%";
-    const cls = m.success === m.calls ? "ok-ratio" : (m.success * 100 / m.calls >= 95 ? "" : "bad-ratio");
-    return "<tr><td>" + m.route + "</td><td>" + m.upstream_model + "</td>"
+    const pct = m.success * 100 / m.calls;
+    const rate = pct.toFixed(1) + "%";
+    const cls = m.success === m.calls ? "rate-ok" : (pct >= 95 ? "" : "rate-bad");
+    const pill = '<span class="pill ' + (m.success === m.calls ? "ok" : pct >= 95 ? "" : "bad") + '">' + rate + "</span>";
+    return "<tr><td><code>" + m.route + "</code></td><td><code>" + m.upstream_model + "</code></td>"
       + '<td class="num barcell"><span class="fill" style="width:' + (m.calls * 100 / maxCalls).toFixed(1) + '%"></span><span>' + fmtInt(m.calls) + "</span></td>"
-      + '<td class="num ' + cls + '">' + rate + "</td>"
+      + '<td class="num ' + cls + '">' + pill + "</td>"
       + '<td class="num">' + fmtInt(m.total_tokens) + "</td>"
       + '<td class="num">' + m.avg_latency_ms + "ms</td></tr>";
   }).join("");
