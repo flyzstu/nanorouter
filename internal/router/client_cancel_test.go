@@ -333,4 +333,3 @@ func TestClientCanceledDuringPassiveProbeReleasesProbeLease(t *testing.T) {
 		t.Fatalf("expected status 200 on 3rd request after client cancel, got %d body=%s", rec3.Code, rec3.Body.String())
 	}
 }
-

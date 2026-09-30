@@ -37,7 +37,9 @@ func findUsage(v any) (Usage, bool) {
 		if raw, ok := x["usage"].(map[string]any); ok {
 			u := Usage{Prompt: number(raw["prompt_tokens"]), Completion: number(raw["completion_tokens"]), Total: number(raw["total_tokens"]), Source: "upstream"}
 			if u.Prompt == 0 {
-				u.Prompt = number(raw["input_tokens"])
+				// Anthropic 形状：input_tokens 不含缓存命中/写入，与
+				// 翻译路径保持同一记账口径，一并计入 prompt 侧。
+				u.Prompt = number(raw["input_tokens"]) + number(raw["cache_read_input_tokens"]) + number(raw["cache_creation_input_tokens"])
 			}
 			if u.Completion == 0 {
 				u.Completion = number(raw["output_tokens"])

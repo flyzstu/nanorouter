@@ -635,3 +635,58 @@ func TestProberSendsCandidateHeadersAndAuth(t *testing.T) {
 		t.Fatalf("expected User-Agent 'custom-prober-ua/1.0', got %q", receivedUA)
 	}
 }
+
+func TestIsMessagesPingValid(t *testing.T) {
+	cases := []struct {
+		name       string
+		status     int
+		body       string
+		wantValid  bool
+		wantReason string
+	}{
+		{"ok text", 200, `{"type":"message","content":[{"type":"text","text":"pong"}],"stop_reason":"end_turn","usage":{"output_tokens":1}}`, true, ""},
+		{"ok thinking only", 200, `{"type":"message","content":[{"type":"thinking","thinking":"hmm"}],"stop_reason":"end_turn"}`, true, ""},
+		{"ok tool_use only", 200, `{"type":"message","content":[{"type":"tool_use","id":"t","name":"f","input":{}}],"stop_reason":"tool_use"}`, true, ""},
+		{"ok usage only", 200, `{"type":"message","content":[],"stop_reason":"max_tokens","usage":{"output_tokens":5}}`, true, ""},
+		{"empty content", 200, `{"type":"message","content":[],"stop_reason":"end_turn","usage":{"output_tokens":0}}`, false, "empty_content"},
+		{"embedded error", 200, `{"type":"error","error":{"type":"api_error","message":"boom"}}`, false, "api_error: boom"},
+		{"http 429", 429, `{}`, false, "http_429"},
+		{"bad json", 200, `not-json`, false, "invalid_json"},
+	}
+	for _, tc := range cases {
+		valid, reason := isMessagesPingValid(tc.status, []byte(tc.body))
+		if valid != tc.wantValid || (tc.wantReason != "" && reason != tc.wantReason) {
+			t.Fatalf("%s: valid=%v reason=%q", tc.name, valid, reason)
+		}
+	}
+}
+
+func TestMakeProbePayloadAnthropicShape(t *testing.T) {
+	r := &Router{}
+	payload, err := r.makeProbePayload(Candidate{ID: "z", Model: "GLM-5.3", Anthropic: true, MaxTokensLimit: 3})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var probe map[string]any
+	if err := json.Unmarshal(payload, &probe); err != nil {
+		t.Fatal(err)
+	}
+	// 探测不带 thinking/推理参数；max_tokens 固定 5（探测不参与
+	// MaxTokensLimit 钳制——它不是用户请求，钳制会破坏极简探测）。
+	if probe["max_tokens"] != float64(5) || probe["temperature"] != float64(0) {
+		t.Fatalf("probe=%v", probe)
+	}
+	if _, ok := probe["reasoning_effort"]; ok {
+		t.Fatalf("probe must not carry reasoning_effort: %v", probe)
+	}
+	if _, ok := probe["thinking"]; ok {
+		t.Fatalf("probe must not carry thinking: %v", probe)
+	}
+	if probe["model"] != "GLM-5.3" {
+		t.Fatalf("model=%v", probe["model"])
+	}
+	messages, _ := probe["messages"].([]any)
+	if len(messages) != 1 {
+		t.Fatalf("messages=%v", messages)
+	}
+}

@@ -15,6 +15,19 @@ import (
 // makeProbePayload 构造极简的 Ping-Pong 探测请求体。
 // 限制 max_tokens: 5 并关闭思维链，同时应用候选的清洗规则（如自动剔除不支持的字段）。
 func (r *Router) makeProbePayload(u Candidate) ([]byte, error) {
+	if u.Anthropic {
+		// Anthropic 候选的探测走 Messages 形状；不注入 thinking，让
+		// 上游按默认行为回答，有效性由响应内容判定。
+		p := map[string]any{
+			"model": u.Model,
+			"messages": []map[string]string{
+				{"role": "user", "content": "ping"},
+			},
+			"max_tokens":  float64(5),
+			"temperature": float64(0),
+		}
+		return json.Marshal(p)
+	}
 	p := map[string]any{
 		"model": u.Model,
 		"messages": []map[string]string{
@@ -61,6 +74,43 @@ func isPingPongValid(statusCode int, body []byte) (bool, string) {
 		return false, "empty_content"
 	}
 	return true, ""
+}
+
+// isMessagesPingValid 校验 Anthropic Messages 形状的探测回复。与 OpenAI
+// 侧同语义：拦截伪 200（内嵌 error、无内容块、零输出 token），思维链
+// 上的内容（thinking 块）同样视作存活。
+func isMessagesPingValid(statusCode int, body []byte) (bool, string) {
+	if statusCode != http.StatusOK {
+		return false, fmt.Sprintf("http_%d", statusCode)
+	}
+	var resp struct {
+		Error *struct {
+			Message string `json:"message"`
+		} `json:"error"`
+		Content []struct {
+			Type string `json:"type"`
+			Text string `json:"text"`
+		} `json:"content"`
+		StopReason string `json:"stop_reason"`
+		Usage      struct {
+			OutputTokens int64 `json:"output_tokens"`
+		} `json:"usage"`
+	}
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return false, "invalid_json"
+	}
+	if resp.Error != nil && resp.Error.Message != "" {
+		return false, fmt.Sprintf("api_error: %s", resp.Error.Message)
+	}
+	for _, block := range resp.Content {
+		if strings.TrimSpace(block.Text) != "" || block.Type == "tool_use" || block.Type == "thinking" {
+			return true, ""
+		}
+	}
+	if resp.Usage.OutputTokens > 0 && resp.StopReason != "" {
+		return true, ""
+	}
+	return false, "empty_content"
 }
 
 // isProbeEnabled 检查候选是否启用了熔断后后台探活。
@@ -172,7 +222,12 @@ func (r *Router) executeProbe(parentCtx context.Context, u Candidate) {
 	}
 
 	start := time.Now()
-	resp, err := r.do(ctx, u, "chat_completions", body, nil)
+	// Anthropic 候选探测 Messages 路径；do() 按候选协议解析路径与凭据头。
+	probeEndpoint := "chat_completions"
+	if u.Anthropic {
+		probeEndpoint = "messages"
+	}
+	resp, err := r.do(ctx, u, probeEndpoint, body, nil, nil)
 	duration := time.Since(start)
 
 	if err != nil {
@@ -188,6 +243,9 @@ func (r *Router) executeProbe(parentCtx context.Context, u Candidate) {
 	}
 
 	valid, reason := isPingPongValid(resp.StatusCode, respBody)
+	if u.Anthropic {
+		valid, reason = isMessagesPingValid(resp.StatusCode, respBody)
+	}
 	if !valid {
 		r.onProbeFailure(u, reason, duration)
 		return

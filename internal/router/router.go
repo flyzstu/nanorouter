@@ -196,6 +196,10 @@ func (r *Router) Handler() http.Handler {
 	mux.Get("/v1/models", r.models)
 	mux.Post("/v1/chat/completions", r.proxy("chat_completions"))
 	mux.Post("/v1/responses", r.proxy("responses"))
+	// Anthropic Messages 形状的生成端点：服务 anthropic 候选（透传），
+	// 也让 Anthropic 协议客户端（Claude Code、dsh 等）直接接入网关。
+	mux.Post("/v1/messages", r.proxy("messages"))
+	mux.Post("/messages", r.proxy("messages"))
 
 	// 兼容端点路径：允许无 /v1 前缀调用
 	mux.Get("/models", r.models)
@@ -244,7 +248,12 @@ func (r *Router) auth(next http.Handler) http.Handler {
 	}
 	return http.HandlerFunc(func(w http.ResponseWriter, q *http.Request) {
 		if q.Header.Get("Authorization") != "Bearer "+expected {
-			http.Error(w, `{"error":{"message":"unauthorized"}}`, 401)
+			// 按请求路径选错误方言：Messages 端点的客户端期望 Anthropic 信封。
+			if strings.HasSuffix(q.URL.Path, "/messages") {
+				writeAnthropicAPIError(w, 401, "unauthorized", "authentication_error")
+			} else {
+				http.Error(w, `{"error":{"message":"unauthorized"}}`, 401)
+			}
 			return
 		}
 		next.ServeHTTP(w, q)
@@ -296,7 +305,7 @@ func (r *Router) proxy(endpoint string, defaultRoutes ...string) http.HandlerFun
 					w.Header().Set("Retry-After", "1")
 				}
 				r.admissionRejected.WithLabelValues(string(outcome)).Inc()
-				writeAPIError(w, status, message, code)
+				writeAPIErrorDialect(w, status, message, code, endpoint)
 				r.logRequestFailed(requestID, endpoint, "", false, status, 0, time.Since(startedAt), string(outcome))
 				return
 			}
@@ -308,13 +317,13 @@ func (r *Router) proxy(endpoint string, defaultRoutes ...string) http.HandlerFun
 
 		body, err := io.ReadAll(http.MaxBytesReader(w, q.Body, maxRequestBody))
 		if err != nil {
-			http.Error(w, `{"error":{"message":"invalid request body"}}`, 400)
+			writeAPIErrorDialect(w, 400, "invalid request body", "invalid_request_body", endpoint)
 			r.logRequestFailed(requestID, endpoint, "", false, http.StatusBadRequest, 0, time.Since(startedAt), "invalid_request_body")
 			return
 		}
 		var payload map[string]any
 		if json.Unmarshal(body, &payload) != nil {
-			http.Error(w, `{"error":{"message":"expected JSON body"}}`, 400)
+			writeAPIErrorDialect(w, 400, "expected JSON body", "invalid_json", endpoint)
 			r.logRequestFailed(requestID, endpoint, "", false, http.StatusBadRequest, 0, time.Since(startedAt), "invalid_json")
 			return
 		}
@@ -334,7 +343,7 @@ func (r *Router) proxy(endpoint string, defaultRoutes ...string) http.HandlerFun
 			}
 		}
 		if !ok {
-			http.Error(w, `{"error":{"message":"unknown model route"}}`, 400)
+			writeAPIErrorDialect(w, 400, "unknown model route", "unknown_model_route", endpoint)
 			r.logRequestFailed(requestID, endpoint, routeName, false, http.StatusBadRequest, 0, time.Since(startedAt), "unknown_model_route")
 			return
 		}
@@ -383,7 +392,7 @@ func (r *Router) proxy(endpoint string, defaultRoutes ...string) http.HandlerFun
 							r.logRequestFailed(requestID, endpoint, routeName, streamed, 499, attempt, time.Since(startedAt), "client_canceled")
 							return
 						}
-						writeAPIError(w, http.StatusGatewayTimeout, "request deadline exceeded while waiting to retry", "upstream_retry_timeout")
+						writeAPIErrorDialect(w, http.StatusGatewayTimeout, "request deadline exceeded while waiting to retry", "upstream_retry_timeout", endpoint)
 						r.logRequestFailed(requestID, endpoint, routeName, streamed, http.StatusGatewayTimeout, attempt, time.Since(startedAt), "retry_timeout")
 						return
 					}
@@ -396,16 +405,16 @@ func (r *Router) proxy(endpoint string, defaultRoutes ...string) http.HandlerFun
 					continue
 				}
 				if rateLimited {
-					writeAPIError(w, http.StatusTooManyRequests, "upstreams remained rate limited after retries", "upstream_rate_limited")
+					writeAPIErrorDialect(w, http.StatusTooManyRequests, "upstreams remained rate limited after retries", "upstream_rate_limited", endpoint)
 					r.logRequestFailed(requestID, endpoint, routeName, streamed, http.StatusTooManyRequests, attempt, time.Since(startedAt), "upstream_rate_limited")
 					return
 				}
 				if concurrencyLimited {
-					writeAPIError(w, http.StatusTooManyRequests, "all eligible upstreams are at their concurrency limit", "upstream_concurrency_limit")
+					writeAPIErrorDialect(w, http.StatusTooManyRequests, "all eligible upstreams are at their concurrency limit", "upstream_concurrency_limit", endpoint)
 					r.logRequestFailed(requestID, endpoint, routeName, streamed, http.StatusTooManyRequests, attempt, time.Since(startedAt), "upstream_concurrency_limit")
 					return
 				}
-				http.Error(w, `{"error":{"message":"all configured upstreams are unavailable","type":"upstream_error"}}`, http.StatusServiceUnavailable)
+				writeAPIErrorDialect(w, http.StatusServiceUnavailable, "all configured upstreams are unavailable", "upstream_error", endpoint)
 				r.logRequestFailed(requestID, endpoint, routeName, streamed, http.StatusServiceUnavailable, attempt, time.Since(startedAt), "upstreams_unavailable")
 				return
 			}
@@ -413,16 +422,30 @@ func (r *Router) proxy(endpoint string, defaultRoutes ...string) http.HandlerFun
 			attempted[u.ID] = true
 			p := clone(payload)
 			upstreamEndpoint := endpoint
-			adaptedResponses := endpoint == "responses" && u.ResponsesViaChatCompletions
-			if adaptedResponses {
+			adaptedResponses := false
+			switch {
+			case endpoint == "responses" && u.ResponsesViaChatCompletions:
 				p, err = responsesToChatCompletions(payload, u.ChatMaxTokensField)
 				if err != nil {
 					r.releaseProbe(u)
-					writeAPIError(w, http.StatusBadRequest, err.Error(), "unsupported_response_feature")
+					writeAPIErrorDialect(w, http.StatusBadRequest, err.Error(), "unsupported_response_feature", endpoint)
 					r.logRequestFailed(requestID, endpoint, routeName, streamed, http.StatusBadRequest, attempt, time.Since(startedAt), "unsupported_response_feature")
 					return
 				}
 				upstreamEndpoint = "chat_completions"
+				adaptedResponses = true
+			case endpoint == "responses" && u.Anthropic:
+				// Responses → Chat → Messages 链式降级：请求侧两跳，
+				// 响应侧按反向链路折返，复用两条各自已测的转换。
+				p, err = responsesToChatCompletions(payload, "")
+				if err != nil {
+					r.releaseProbe(u)
+					writeAPIErrorDialect(w, http.StatusBadRequest, err.Error(), "unsupported_response_feature", endpoint)
+					r.logRequestFailed(requestID, endpoint, routeName, streamed, http.StatusBadRequest, attempt, time.Since(startedAt), "unsupported_response_feature")
+					return
+				}
+				upstreamEndpoint = "chat_completions"
+				adaptedResponses = true
 			}
 			p, dropped := sanitizeRequest(p, u)
 			if len(dropped) > 0 && r.logger.Core().Enabled(zap.DebugLevel) {
@@ -431,6 +454,16 @@ func (r *Router) proxy(endpoint string, defaultRoutes ...string) http.HandlerFun
 			p, clamped := clampRequestMaxTokens(p, u)
 			if len(clamped) > 0 && r.logger.Core().Enabled(zap.DebugLevel) {
 				r.logger.Debug(r.logMessage("request_tokens_clamped"), eventFields("request_tokens_clamped", zap.String("request_id", requestID), zap.String("route", routeName), zap.String("upstream", u.ID), zap.Strings("fields", clamped), zap.Int("max_tokens_limit", u.MaxTokensLimit))...)
+			}
+			if u.Anthropic && upstreamEndpoint == "chat_completions" {
+				p, err = chatCompletionsToMessages(p)
+				if err != nil {
+					r.releaseProbe(u)
+					writeAPIErrorDialect(w, http.StatusBadRequest, err.Error(), "unsupported_openai_feature", endpoint)
+					r.logRequestFailed(requestID, endpoint, routeName, streamed, http.StatusBadRequest, attempt, time.Since(startedAt), "unsupported_openai_feature")
+					return
+				}
+				upstreamEndpoint = "messages"
 			}
 			p["model"] = u.Model
 			encoded, _ := json.Marshal(p)
@@ -465,7 +498,7 @@ func (r *Router) proxy(endpoint string, defaultRoutes ...string) http.HandlerFun
 					release()
 					r.releaseProbe(u)
 					r.retryBudgetDenied.WithLabelValues(routeName).Inc()
-					writeAPIError(w, http.StatusTooManyRequests, "route retry budget exhausted", "retry_budget_exhausted")
+					writeAPIErrorDialect(w, http.StatusTooManyRequests, "route retry budget exhausted", "retry_budget_exhausted", endpoint)
 					r.logRequestFailed(requestID, endpoint, routeName, streamed, http.StatusTooManyRequests, attempt, time.Since(startedAt), "retry_budget_exhausted")
 					return
 				}
@@ -476,7 +509,7 @@ func (r *Router) proxy(endpoint string, defaultRoutes ...string) http.HandlerFun
 			}
 			attemptCtx, cancelAttempt := candidateAttemptContext(ctx, u.AttemptTimeout)
 			upstreamAttempts++
-			resp, err := r.do(attemptCtx, u, upstreamEndpoint, encoded, q)
+			resp, err := r.do(attemptCtx, u, upstreamEndpoint, encoded, p, q)
 			ttfbDuration := time.Since(start)
 			latency := int(ttfbDuration.Milliseconds())
 			r.ttfb.WithLabelValues(routeName, u.ID, endpoint).Observe(ttfbDuration.Seconds())
@@ -520,7 +553,7 @@ func (r *Router) proxy(endpoint string, defaultRoutes ...string) http.HandlerFun
 						r.logRequestFailed(requestID, endpoint, routeName, streamed, 499, attempt+1, time.Since(startedAt), "client_canceled")
 						return
 					}
-					writeAPIError(w, http.StatusGatewayTimeout, "request deadline exceeded", "request_timeout")
+					writeAPIErrorDialect(w, http.StatusGatewayTimeout, "request deadline exceeded", "request_timeout", endpoint)
 					r.logRequestFailed(requestID, endpoint, routeName, streamed, http.StatusGatewayTimeout, attempt+1, time.Since(startedAt), "request_timeout")
 					return
 				}
@@ -548,7 +581,7 @@ func (r *Router) proxy(endpoint string, defaultRoutes ...string) http.HandlerFun
 					} else {
 						r.success(u)
 					}
-					upstreamError := r.copyErrorResponse(w, resp)
+					upstreamError := r.copyErrorResponse(w, resp, u, endpoint)
 					cancelAttempt()
 					release()
 					r.record(requestID, routeName, u, endpoint, resp.StatusCode, latency, streamed, attempt, Usage{Source: "unavailable"}, "client")
@@ -596,9 +629,16 @@ func (r *Router) proxy(endpoint string, defaultRoutes ...string) http.HandlerFun
 			if streamed {
 				usage := Usage{Source: "unavailable"}
 				var streamErr error
-				if adaptedResponses {
+				switch {
+				case adaptedResponses && u.Anthropic:
+					usage, streamErr = r.streamMessagesAsChat(w, resp, true, routeName)
+				case u.Anthropic && endpoint == "chat_completions" && upstreamEndpoint == "messages":
+					usage, streamErr = r.streamMessagesAsChat(w, resp, false, routeName)
+				case adaptedResponses:
 					usage, streamErr = r.streamChatAsResponses(w, resp, routeName)
-				} else {
+				default:
+					// messages 端点的同方言透传也在默认分支：SSE 原样转发，
+					// usage 由 stream 内的合并逻辑采集。
 					usage, streamErr = r.stream(w, resp)
 				}
 				// cancelAttempt 会置空 attemptCtx 的 deadline，必须先判定再取消。
@@ -646,10 +686,30 @@ func (r *Router) proxy(endpoint string, defaultRoutes ...string) http.HandlerFun
 				}
 				r.success(u)
 				if adaptedResponses {
+					if u.Anthropic {
+						b, err = messagesToChatCompletion(b, routeName)
+						if err != nil {
+							release()
+							writeAPIErrorDialect(w, http.StatusBadGateway, "cannot adapt upstream messages response: "+err.Error(), "upstream_error", endpoint)
+							r.record(requestID, routeName, u, endpoint, resp.StatusCode, latency, false, attempt, Usage{Source: "unavailable"}, "upstream")
+							r.logRequestFailed(requestID, endpoint, routeName, false, http.StatusBadGateway, attempt+1, time.Since(startedAt), "response_adaptation_failed")
+							return
+						}
+					}
 					b, err = chatCompletionToResponse(b, routeName)
 					if err != nil {
 						release()
-						writeAPIError(w, http.StatusBadGateway, "cannot adapt upstream chat response: "+err.Error(), "upstream_error")
+						writeAPIErrorDialect(w, http.StatusBadGateway, "cannot adapt upstream chat response: "+err.Error(), "upstream_error", endpoint)
+						r.record(requestID, routeName, u, endpoint, resp.StatusCode, latency, false, attempt, Usage{Source: "unavailable"}, "upstream")
+						r.logRequestFailed(requestID, endpoint, routeName, false, http.StatusBadGateway, attempt+1, time.Since(startedAt), "response_adaptation_failed")
+						return
+					}
+					w.Header().Set("Content-Type", "application/json")
+				} else if u.Anthropic && endpoint == "chat_completions" {
+					b, err = messagesToChatCompletion(b, routeName)
+					if err != nil {
+						release()
+						writeAPIErrorDialect(w, http.StatusBadGateway, "cannot adapt upstream messages response: "+err.Error(), "upstream_error", endpoint)
 						r.record(requestID, routeName, u, endpoint, resp.StatusCode, latency, false, attempt, Usage{Source: "unavailable"}, "upstream")
 						r.logRequestFailed(requestID, endpoint, routeName, false, http.StatusBadGateway, attempt+1, time.Since(startedAt), "response_adaptation_failed")
 						return
@@ -844,7 +904,20 @@ func eventFields(event string, fields ...zap.Field) []zap.Field {
 
 func failureLogFields(requestID, route string, u Candidate, endpoint string, attempt, ttfb int, streamed bool, status int, outcome string, retryable bool) []zap.Field {
 	fields := requestLogFields(requestID, route, u, endpoint, attempt, ttfb, streamed, status)
-	return append(fields, zap.String("outcome", outcome), zap.Bool("retryable", retryable))
+	fields = append(fields, zap.String("outcome", outcome), zap.Bool("retryable", retryable))
+	// 纵深防御：上游把 Authorization/x-api-key 回显进错误消息时（被入侵
+	// 或镜像上游可为之），key 不得随 upstream_error_message 进日志。
+	if key := resolveCandidateAPIKey(u); key != "" {
+		for i, field := range fields {
+			if field.Key != "upstream_error_message" {
+				continue
+			}
+			if value := field.String; value != "" && strings.Contains(value, key) {
+				fields[i] = zap.String(field.Key, strings.ReplaceAll(value, key, "***"))
+			}
+		}
+	}
+	return fields
 }
 func successLogFields(requestID, route string, u Candidate, endpoint string, attempt, ttfb, duration int, streamed bool, status int, usage Usage) []zap.Field {
 	fields := requestLogFields(requestID, route, u, endpoint, attempt, ttfb, streamed, status)
@@ -857,7 +930,7 @@ func successLogFields(requestID, route string, u Candidate, endpoint string, att
 		zap.String("usage_source", usage.Source),
 	)
 }
-func (r *Router) do(ctx context.Context, u Candidate, endpoint string, body []byte, incomingReq *http.Request) (*http.Response, error) {
+func (r *Router) do(ctx context.Context, u Candidate, endpoint string, body []byte, payload map[string]any, incomingReq *http.Request) (*http.Response, error) {
 	base := strings.TrimRight(u.BaseURL, "/")
 	// llama-server 的监听地址通常不带 /v1；保持其他 OpenAI 兼容上游的 base_url 语义不变。
 	if u.LlamaServer && !strings.HasSuffix(strings.ToLower(base), "/v1") {
@@ -867,6 +940,11 @@ func (r *Router) do(ctx context.Context, u Candidate, endpoint string, body []by
 	if endpoint == "chat_completions" && u.ChatCompletionsPath != "" {
 		path = strings.TrimLeft(u.ChatCompletionsPath, "/")
 	}
+	// Anthropic 候选到达此处时 endpoint 已统一为 "messages"（原生透传或
+	// 翻译后），路径按 显式覆盖 > 渠道网关路径 > v1/messages 解析。
+	if u.Anthropic && endpoint == "messages" {
+		path = zcodeMessagesPath(u)
+	}
 	req, err := http.NewRequestWithContext(ctx, "POST", base+"/"+path, bytes.NewReader(body))
 	if err != nil {
 		return nil, err
@@ -874,7 +952,10 @@ func (r *Router) do(ctx context.Context, u Candidate, endpoint string, body []by
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json, text/event-stream")
 	ua := u.UserAgent
-	if ua == "" && u.SimulateOpenCode {
+	if ua == "" && u.SimulateZcode {
+		// 显式 user_agent 优先；未配置时复刻 ZCode 桌面客户端 UA。
+		ua = "ZCode/" + ZcodeClientVersion
+	} else if ua == "" && u.SimulateOpenCode {
 		ua = defaultOpenCodeUserAgent
 	} else if ua == "" {
 		ua = r.userAgent
@@ -882,12 +963,39 @@ func (r *Router) do(ctx context.Context, u Candidate, endpoint string, body []by
 	if ua != "" {
 		req.Header.Set("User-Agent", ua)
 	}
-	if key := resolveAPIKey(u.APIKeyEnv); key != "" {
+	if u.Anthropic {
+		key := resolveCandidateAPIKey(u)
+		if key != "" {
+			// ZCode 网关要求 Bearer 与 x-api-key 并存；原生 Anthropic
+			// 忽略 Authorization，两个都发与两类上游兼容。
+			req.Header.Set("Authorization", "Bearer "+key)
+			req.Header.Set("x-api-key", key)
+		}
+		// anthropic-version 是 Messages 协议的必需头，对全部 anthropic
+		// 候选注入；候选 Headers 配置可覆盖。
+		req.Header.Set("anthropic-version", ZcodeAnthropicVersion)
+		if u.SimulateZcode {
+			messages, _ := payload["messages"].([]any)
+			ids := deriveZcodeRequestIDs(messages)
+			for name, value := range zcodeClientIdentityHeaders() {
+				req.Header.Set(name, value)
+			}
+			// CLI 的归因 id：会话 id 从对话派生（同会话稳定），请求/
+			// 追踪 id 每次全新；x-session-affinity 同步会话 id。
+			req.Header.Set("x-request-id", ids.request)
+			req.Header.Set("x-session-id", ids.session)
+			req.Header.Set("x-session-affinity", ids.session)
+			req.Header.Set("x-zcode-trace-id", ids.trace)
+		}
+	} else if key := resolveAPIKey(u.APIKeyEnv); key != "" {
 		req.Header.Set("Authorization", "Bearer "+key)
 	}
 
-	// 模拟 OpenCode 客户端行为（会话头）
-	if u.SimulateOpenCode {
+	// 模拟 OpenCode 客户端行为（会话头）；simulate_zcode 已在上方按
+	// 对话派生并写入会话头，不进入这里的下游头透传，避免覆盖派生值。
+	if u.SimulateZcode {
+		// derived ids already set
+	} else if u.SimulateOpenCode {
 		sessionID := ""
 		if incomingReq != nil {
 			sessionID = strings.TrimSpace(incomingReq.Header.Get(sessionAffinityHeader))
@@ -1000,7 +1108,12 @@ func (r *Router) candidateEligible(u Candidate, endpoint string, excluded map[st
 	if !u.IsEnabled() || excluded[u.ID] {
 		return false
 	}
-	if endpoint == "responses" && !u.Responses && !u.ResponsesViaChatCompletions {
+	if endpoint == "responses" && !u.Responses && !u.ResponsesViaChatCompletions && !u.Anthropic {
+		return false
+	}
+	// Anthropic Messages 端点只接受 anthropic 候选：OpenAI 候选缺乏
+	// 反向翻译层，静默转发必然产生协议损坏的请求。
+	if endpoint == "messages" && !u.Anthropic {
 		return false
 	}
 	st := r.states[u.ID]
@@ -1109,10 +1222,15 @@ func readUpstreamErrorPrefix(resp *http.Response) ([]byte, upstreamError) {
 	return body, parseUpstreamError(body)
 }
 
-func (r *Router) copyErrorResponse(w http.ResponseWriter, resp *http.Response) upstreamError {
+func (r *Router) copyErrorResponse(w http.ResponseWriter, resp *http.Response, u Candidate, endpoint string) upstreamError {
 	defer resp.Body.Close()
 	// 只缓存有限的错误前缀用于提取诊断字段，剩余响应继续透明转发给下游。
 	body, ue := readUpstreamErrorPrefix(resp)
+	// Anthropic 错误信封发给 OpenAI 形状下游前改写；messages 端点保持
+	// 同方言透传，上游诊断原样到达。
+	if u.Anthropic && endpoint != "messages" {
+		body = anthropicErrorToChat(body)
+	}
 	r.copyHeaders(w, resp.Header)
 	w.WriteHeader(resp.StatusCode)
 	_, _ = w.Write(body)
@@ -1152,7 +1270,10 @@ func (r *Router) stream(w http.ResponseWriter, resp *http.Response) (Usage, erro
 			trimmed := bytes.TrimSpace(line)
 			if bytes.HasPrefix(trimmed, []byte("data:")) {
 				if u := usageFromJSON(bytes.TrimSpace(bytes.TrimPrefix(trimmed, []byte("data:")))); u.Source == "upstream" {
-					usage = u
+					// Anthropic 的 usage 分段到达（message_start 带输入侧、
+					// message_delta 带累计输出侧）；合并而非覆盖，OpenAI 的
+					// 单帧 usage 语义不受影响。
+					usage = mergeUsage(usage, u)
 				}
 			}
 			if f != nil {
@@ -1167,6 +1288,21 @@ func (r *Router) stream(w http.ResponseWriter, resp *http.Response) (Usage, erro
 		}
 	}
 }
+
+// mergeUsage 合并分段到达的 usage：各字段取已见最大值（Anthropic 的
+// message_delta 输出侧是累计值），总数按两侧之和重算。
+func mergeUsage(dst, src Usage) Usage {
+	if src.Prompt > dst.Prompt {
+		dst.Prompt = src.Prompt
+	}
+	if src.Completion > dst.Completion {
+		dst.Completion = src.Completion
+	}
+	dst.Total = dst.Prompt + dst.Completion
+	dst.Source = "upstream"
+	return dst
+}
+
 func failoverEligible(s int) bool {
 	return s == 401 || s == 403 || s == 404 || s == 408 || s == 425 || s == 429 || s == 500 || s == 502 || s == 503 || s == 504
 }
