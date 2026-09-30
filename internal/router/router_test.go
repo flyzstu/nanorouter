@@ -936,8 +936,11 @@ func TestCandidateAttemptTimeoutTerminatesAdaptedSSE(t *testing.T) {
 	if err := Migrate(context.Background(), db); err != nil {
 		t.Fatal(err)
 	}
+	// AttemptTimeout 必须给上游首字节留足余量：超时若抢在响应头之前触发，
+	// 走的是预响应错误路径（冷却候选并 503），而非本测试要验证的
+	// 「流已转发后以 event: error 终止且不冷却」路径，测试会随机落错分支。
 	r, err := New(Config{RequestTimeout: time.Second, Routes: map[string]Route{"free": {Candidates: []Candidate{{
-		ID: "slow-stream", BaseURL: upstream.URL, Model: "up", ResponsesViaChatCompletions: true, AttemptTimeout: 20 * time.Millisecond,
+		ID: "slow-stream", BaseURL: upstream.URL, Model: "up", ResponsesViaChatCompletions: true, AttemptTimeout: 100 * time.Millisecond,
 	}}}}}, db)
 	if err != nil {
 		t.Fatal(err)
@@ -948,7 +951,9 @@ func TestCandidateAttemptTimeoutTerminatesAdaptedSSE(t *testing.T) {
 	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `"delta":"partial"`) || !strings.Contains(rec.Body.String(), "event: error") {
 		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
 	}
-	if elapsed := time.Since(started); elapsed > 150*time.Millisecond {
+	// 终止应来自 100ms 的 attempt 超时而非上游 200ms 自然结束——后者不含
+	// event: error，会先被上面的断言拦截；上界只需排除 1s 的请求级超时。
+	if elapsed := time.Since(started); elapsed > 500*time.Millisecond {
 		t.Fatalf("stream timeout took %s", elapsed)
 	}
 	if calls.Load() != 1 {
