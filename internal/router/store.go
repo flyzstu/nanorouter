@@ -18,10 +18,19 @@ func Migrate(ctx context.Context, db *sql.DB) error {
 	statements := []string{`CREATE TABLE IF NOT EXISTS llm_requests (
  id TEXT PRIMARY KEY, created_at TEXT NOT NULL, route TEXT NOT NULL, upstream_id TEXT NOT NULL, upstream_model TEXT NOT NULL,
  endpoint TEXT NOT NULL, status_code INTEGER NOT NULL, latency_ms INTEGER NOT NULL, streamed INTEGER NOT NULL, attempt INTEGER NOT NULL,
- prompt_tokens BIGINT, completion_tokens BIGINT, total_tokens BIGINT, usage_source TEXT NOT NULL, error_kind TEXT
+ prompt_tokens BIGINT, completion_tokens BIGINT, total_tokens BIGINT, usage_source TEXT NOT NULL, error_kind TEXT,
+ tools_count INTEGER NOT NULL DEFAULT 0
 );`, `CREATE INDEX IF NOT EXISTS llm_requests_created_at ON llm_requests(created_at);`}
 	for _, statement := range statements {
 		if _, err := db.ExecContext(ctx, statement); err != nil {
+			return err
+		}
+	}
+	// 旧库升级：tools_count 后补列。SQLite 没有 ADD COLUMN IF NOT EXISTS，
+	// 两个方言各自报"列已存在"，按错误文本幂等跳过。
+	if _, err := db.ExecContext(ctx, `ALTER TABLE llm_requests ADD COLUMN tools_count INTEGER NOT NULL DEFAULT 0`); err != nil {
+		msg := err.Error()
+		if !strings.Contains(msg, "duplicate column") && !strings.Contains(msg, "already exists") {
 			return err
 		}
 	}
@@ -38,6 +47,9 @@ type Record struct {
 	Status, LatencyMS, Attempt                                int
 	Streamed                                                  bool
 	Usage                                                     Usage
+	// ToolsCount 是下游请求携带的 tools 数组长度（请求侧信号，不含响应侧
+	// 的 tool_calls 次数——流式透传不解析内容，记不到也不该猜）。
+	ToolsCount int
 	// CreatedAt 在记录生成时确定，避免异步批量落盘时时间戳整体后移。
 	CreatedAt time.Time
 }
@@ -69,7 +81,7 @@ func (s *Store) Insert(ctx context.Context, r Record) error {
 }
 
 func recordArgs(r Record) []any {
-	return []any{r.ID, r.CreatedAt.UTC().Format(time.RFC3339Nano), r.Route, r.UpstreamID, r.UpstreamModel, r.Endpoint, r.Status, r.LatencyMS, boolInt(r.Streamed), r.Attempt, r.Usage.Prompt, r.Usage.Completion, r.Usage.Total, r.Usage.Source, r.ErrorKind}
+	return []any{r.ID, r.CreatedAt.UTC().Format(time.RFC3339Nano), r.Route, r.UpstreamID, r.UpstreamModel, r.Endpoint, r.Status, r.LatencyMS, boolInt(r.Streamed), r.Attempt, r.Usage.Prompt, r.Usage.Completion, r.Usage.Total, r.Usage.Source, r.ErrorKind, r.ToolsCount}
 }
 func boolInt(v bool) int {
 	if v {
@@ -106,7 +118,7 @@ func NewStoreWithConfig(db *sql.DB, cfg DatabaseConfig) *Store {
 	if driver == "postgres" {
 		store.rebind = postgresPlaceholders
 	}
-	store.insertQuery = store.rebind(`INSERT INTO llm_requests VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+	store.insertQuery = store.rebind(`INSERT INTO llm_requests VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
 	if cfg.AsyncWrite {
 		store.batchSize = cfg.BatchSize
 		store.flushEvery = cfg.FlushInterval

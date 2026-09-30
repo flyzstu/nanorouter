@@ -1,0 +1,265 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark light">
+<title>nanorouter stats</title>
+<style>
+  :root {
+    --bg: #0F172A; --card: #1B2336; --muted-surface: #272F42;
+    --fg: #F8FAFC; --muted: #94A3B8; --border: #475569;
+    --ok: #22C55E; --bad: #EF4444; --bar: #38BDF8;
+    --mono: ui-monospace, "SF Mono", "Cascadia Mono", "Fira Code", Consolas, monospace;
+    --sans: system-ui, -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+  }
+  @media (prefers-color-scheme: light) {
+    :root {
+      --bg: #F1F5F9; --card: #FFFFFF; --muted-surface: #E2E8F0;
+      --fg: #0F172A; --muted: #475569; --border: #CBD5E1; --bar: #0284C7;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--fg);
+    font: 14px/1.5 var(--sans); padding: 20px;
+  }
+  header { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; margin-bottom: 16px; }
+  h1 { font-size: 16px; margin: 0 auto 0 0; letter-spacing: .02em; }
+  h1 code { font-family: var(--mono); color: var(--muted); font-size: 13px; margin-left: 8px; }
+  .seg { display: inline-flex; border: 1px solid var(--border); border-radius: 8px; overflow: hidden; }
+  .seg button {
+    appearance: none; border: 0; background: transparent; color: var(--muted);
+    font: 600 13px var(--sans); padding: 6px 14px; cursor: pointer; min-height: 32px;
+    transition: background .15s, color .15s;
+  }
+  .seg button + button { border-left: 1px solid var(--border); }
+  .seg button[aria-pressed="true"] { background: var(--muted-surface); color: var(--fg); }
+  .seg button:focus-visible { outline: 2px solid var(--bar); outline-offset: -2px; }
+  .refresh { display: inline-flex; gap: 6px; align-items: center; color: var(--muted); font-size: 13px; cursor: pointer; }
+  .refresh input { accent-color: var(--ok); width: 15px; height: 15px; }
+  #error { display: none; margin: 0 0 16px; padding: 10px 14px; border: 1px solid var(--bad);
+    border-radius: 8px; color: var(--bad); background: color-mix(in srgb, var(--bad) 8%, transparent); }
+  .kpis { display: grid; grid-template-columns: repeat(auto-fit, minmax(168px, 1fr)); gap: 12px; margin-bottom: 12px; }
+  .card { background: var(--card); border: 1px solid var(--border); border-radius: 10px; padding: 14px 16px; }
+  .kpi .label { color: var(--muted); font-size: 12px; margin-bottom: 4px; }
+  .kpi .value { font-family: var(--mono); font-size: 24px; font-weight: 600; letter-spacing: -.01em; }
+  .kpi .sub { color: var(--muted); font-size: 12px; margin-top: 2px; }
+  .kpi .value.ok { color: var(--ok); } .kpi .value.bad { color: var(--bad); }
+  section.card { margin-bottom: 12px; }
+  section.card > h2 { font-size: 13px; font-weight: 600; color: var(--muted); margin: 0 0 10px; text-transform: none; }
+  .grid2 { display: grid; grid-template-columns: 3fr 2fr; gap: 12px; }
+  @media (max-width: 900px) { .grid2 { grid-template-columns: 1fr; } body { padding: 12px; } }
+  svg#chart { width: 100%; height: auto; display: block; }
+  svg#chart text { font: 10px var(--mono); fill: var(--muted); }
+  svg#chart .bar { fill: var(--bar); opacity: .82; }
+  svg#chart .failbar { fill: var(--bad); opacity: .9; }
+  svg#chart .rateline { fill: none; stroke: var(--ok); stroke-width: 2; }
+  svg#chart .grid { stroke: var(--border); stroke-width: .5; opacity: .5; }
+  svg#chart .axis { stroke: var(--border); stroke-width: 1; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th { color: var(--muted); font-weight: 600; text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--border); white-space: nowrap; }
+  td { padding: 6px 8px; border-bottom: 1px solid color-mix(in srgb, var(--border) 45%, transparent); }
+  td.num, th.num { text-align: right; font-family: var(--mono); white-space: nowrap; }
+  tr:last-child td { border-bottom: 0; }
+  .barcell { position: relative; min-width: 120px; }
+  .barcell .fill { position: absolute; inset: 3px auto 3px 0; background: color-mix(in srgb, var(--bar) 22%, transparent); border-radius: 3px; }
+  .barcell span { position: relative; }
+  .ok-ratio { color: var(--ok); } .bad-ratio { color: var(--bad); }
+  .failbar-row { display: grid; grid-template-columns: minmax(110px, auto) 1fr auto; gap: 10px; align-items: center; padding: 5px 0; }
+  .failbar-track { height: 8px; background: var(--muted-surface); border-radius: 4px; overflow: hidden; }
+  .failbar-fill { height: 100%; background: var(--bad); border-radius: 4px; }
+  .failbar-row .count { font-family: var(--mono); }
+  .failbar-row code { font-family: var(--mono); font-size: 12px; }
+  details { margin-top: 8px; color: var(--muted); }
+  details summary { cursor: pointer; font-size: 12px; }
+  .empty { color: var(--muted); padding: 18px 0; text-align: center; }
+  footer { color: var(--muted); font-size: 12px; margin-top: 4px; }
+  @media (prefers-reduced-motion: reduce) { * { transition: none !important; } }
+</style>
+</head>
+<body>
+<header>
+  <h1>nanorouter <code>/stats</code></h1>
+  <div class="seg" role="group" aria-label="时间范围">
+    <button type="button" data-range="1h" aria-pressed="false">1h</button>
+    <button type="button" data-range="24h" aria-pressed="true">24h</button>
+    <button type="button" data-range="7d" aria-pressed="false">7d</button>
+    <button type="button" data-range="30d" aria-pressed="false">30d</button>
+  </div>
+  <label class="refresh"><input type="checkbox" id="auto">每 10s 刷新</label>
+</header>
+<div id="error" role="alert"></div>
+<div class="kpis">
+  <div class="card kpi"><div class="label">调用次数</div><div class="value" id="k-calls">–</div><div class="sub" id="k-calls-sub"></div></div>
+  <div class="card kpi"><div class="label">成功率</div><div class="value" id="k-rate">–</div><div class="sub" id="k-rate-sub"></div></div>
+  <div class="card kpi"><div class="label">Token 用量</div><div class="value" id="k-tokens">–</div><div class="sub" id="k-tokens-sub"></div></div>
+  <div class="card kpi"><div class="label">延迟</div><div class="value" id="k-latency">–</div><div class="sub">p50 / p95</div></div>
+  <div class="card kpi"><div class="label">带工具请求</div><div class="value" id="k-tools">–</div><div class="sub" id="k-tools-sub">请求侧 tools 数组</div></div>
+</div>
+<div class="grid2">
+  <section class="card">
+    <h2>调用与成功率</h2>
+    <svg id="chart" viewBox="0 0 720 240" role="img" aria-label="按时间分桶的调用次数柱状图与成功率折线图"></svg>
+    <details><summary>查看数据表</summary><table id="chart-table"><thead><tr><th>时间桶</th><th class="num">调用</th><th class="num">失败</th><th class="num">成功率</th></tr></thead><tbody></tbody></table></details>
+  </section>
+  <section class="card">
+    <h2>失败分类</h2>
+    <div id="failures"></div>
+  </section>
+</div>
+<section class="card">
+  <h2>模型分布（route → upstream_model）</h2>
+  <table id="models">
+    <thead><tr><th>route</th><th>upstream_model</th><th class="num">调用</th><th class="num">成功率</th><th class="num">tokens</th><th class="num">平均延迟</th></tr></thead>
+    <tbody></tbody>
+  </table>
+</section>
+<footer>数据来自 llm_requests 台账（请求侧元数据，不含对话内容）。usage_source=unavailable 的请求 token 计为零。</footer>
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+let state = { range: "24h", timer: null };
+
+function fmtInt(n) {
+  return n >= 1000000 ? (n / 1000000).toFixed(1) + "M"
+    : n >= 10000 ? (n / 1000).toFixed(1) + "k"
+    : Number(n).toLocaleString("en-US");
+}
+function fmtRate(success, total) {
+  if (!total) return "–";
+  return (success * 100 / total).toFixed(1) + "%";
+}
+function bucketLabel(b) {
+  if (b.length === 16) return b.slice(11);
+  if (b.length === 13) return b.slice(11) + ":00";
+  return b.slice(5);
+}
+function showError(msg) {
+  const el = $("error");
+  el.style.display = msg ? "block" : "none";
+  el.textContent = msg || "";
+}
+async function load() {
+  try {
+    const res = await fetch("/v1/stats/summary?range=" + encodeURIComponent(state.range), { headers: { "Accept": "application/json" } });
+    if (!res.ok) throw new Error("HTTP " + res.status);
+    const data = await res.json();
+    showError("");
+    render(data);
+  } catch (err) {
+    showError("统计加载失败：" + err.message);
+  }
+}
+function render(d) {
+  const t = d.totals, failures = t.requests - t.success;
+  $("k-calls").textContent = fmtInt(t.requests);
+  $("k-calls-sub").textContent = failures > 0 ? "失败 " + fmtInt(failures) : "全部成功";
+  const rate = fmtRate(t.success, t.requests);
+  $("k-rate").textContent = rate;
+  $("k-rate").className = "value " + (t.requests === 0 ? "" : failures === 0 ? "ok" : t.success * 100 / t.requests >= 95 ? "" : "bad");
+  $("k-rate-sub").textContent = "成功 " + fmtInt(t.success);
+  $("k-tokens").textContent = fmtInt(t.total_tokens);
+  $("k-tokens-sub").textContent = "输入 " + fmtInt(t.prompt_tokens) + " · 输出 " + fmtInt(t.completion_tokens);
+  $("k-latency").textContent = t.requests ? t.latency_p50_ms + " / " + t.latency_p95_ms + "ms" : "–";
+  $("k-tools").textContent = fmtInt(t.with_tools);
+  $("k-tools-sub").textContent = t.requests ? "占比 " + fmtRate(t.with_tools, t.requests) : "请求侧 tools 数组";
+  renderChart(d.series);
+  renderFailures(d.failures, failures);
+  renderModels(d.models, t.requests);
+}
+function renderChart(series) {
+  const svg = $("chart");
+  if (!series.length || series.every(p => p.calls === 0)) {
+    svg.innerHTML = '<text x="360" y="120" text-anchor="middle">该时间范围内没有请求</text>';
+    $("chart-table").querySelector("tbody").innerHTML = "";
+    return;
+  }
+  const W = 720, H = 240, ML = 46, MR = 46, MT = 14, MB = 26;
+  const iw = W - ML - MR, ih = H - MT - MB;
+  const maxCalls = Math.max(...series.map(p => p.calls), 1);
+  const bw = iw / series.length;
+  const y = (v) => MT + ih - (v / maxCalls) * ih;
+  const x = (i) => ML + i * bw;
+  let bars = "", line = "", pts = [];
+  series.forEach((p, i) => {
+    if (p.calls === 0) return;
+    const okCalls = p.calls - p.failures;
+    const h = (p.calls / maxCalls) * ih;
+    bars += '<g><title>' + bucketLabel(p.bucket) + ' · 调用 ' + p.calls + ' · 失败 ' + p.failures + '</title>'
+      + '<rect class="bar" x="' + (x(i) + bw * 0.14).toFixed(1) + '" y="' + (MT + ih - h).toFixed(1)
+      + '" width="' + (bw * 0.72).toFixed(1) + '" height="' + h.toFixed(1) + '" rx="2"/>';
+    if (p.failures > 0) {
+      const fh = (p.failures / maxCalls) * ih;
+      bars += '<rect class="failbar" x="' + (x(i) + bw * 0.14).toFixed(1) + '" y="' + (MT + ih - fh).toFixed(1)
+        + '" width="' + (bw * 0.72).toFixed(1) + '" height="' + fh.toFixed(1) + '" rx="2"/>';
+    }
+    bars += '</g>';
+    if (okCalls >= 0) pts.push([x(i) + bw / 2, MT + ih - (okCalls / p.calls) * ih]);
+  });
+  line = '<polyline class="rateline" points="' + pts.map(p => p[0].toFixed(1) + "," + p[1].toFixed(1)).join(" ") + '"/>';
+  let grid = "", labels = "";
+  [0, .5, 1].forEach(f => {
+    const gy = MT + ih - f * ih;
+    grid += '<line class="grid" x1="' + ML + '" y1="' + gy + '" x2="' + (W - MR) + '" y2="' + gy + '"/>';
+    grid += '<text x="' + (ML - 6) + '" y="' + (gy + 3) + '" text-anchor="end">' + fmtInt(maxCalls * f) + '</text>';
+  });
+  const step = Math.ceil(series.length / 8);
+  series.forEach((p, i) => {
+    if (i % step === 0) labels += '<text x="' + (x(i) + bw / 2) + '" y="' + (H - 8) + '" text-anchor="middle">' + bucketLabel(p.bucket) + '</text>';
+  });
+  svg.innerHTML = grid + bars + line
+    + '<line class="axis" x1="' + ML + '" y1="' + (MT + ih) + '" x2="' + (W - MR) + '" y2="' + (MT + ih) + '"/>'
+    + labels
+    + '<text x="' + (W - MR + 6) + '" y="' + (MT + 4) + '" fill="#22C55E">成功率</text>';
+  const tb = $("chart-table").querySelector("tbody");
+  tb.innerHTML = series.map(p =>
+    "<tr><td>" + p.bucket + "</td><td class=\"num\">" + p.calls + "</td><td class=\"num\">" + p.failures + "</td><td class=\"num\">" + fmtRate(p.calls - p.failures, p.calls) + "</td></tr>"
+  ).join("");
+}
+function renderFailures(items, totalFailures) {
+  const box = $("failures");
+  if (!items.length) {
+    box.innerHTML = '<div class="empty">窗口内无失败</div>';
+    return;
+  }
+  const max = Math.max(...items.map(f => f.count), 1);
+  box.innerHTML = items.map(f =>
+    '<div class="failbar-row"><code>' + f.key.replace(/&/g, "&amp;").replace(/</g, "&lt;")
+    + '</code><div class="failbar-track"><div class="failbar-fill" style="width:' + (f.count * 100 / max).toFixed(1) + '%"></div></div>'
+    + '<span class="count">' + fmtInt(f.count) + '</span></div>'
+  ).join("");
+}
+function renderModels(models, totalCalls) {
+  const tb = $("models").querySelector("tbody");
+  if (!models.length) {
+    tb.innerHTML = '<tr><td colspan="6" class="empty">该时间范围内没有请求</td></tr>';
+    return;
+  }
+  const maxCalls = Math.max(...models.map(m => m.calls), 1);
+  tb.innerHTML = models.map(m => {
+    const rate = m.calls - m.success === 0 ? "100.0%" : (m.success * 100 / m.calls).toFixed(1) + "%";
+    const cls = m.success === m.calls ? "ok-ratio" : (m.success * 100 / m.calls >= 95 ? "" : "bad-ratio");
+    return "<tr><td>" + m.route + "</td><td>" + m.upstream_model + "</td>"
+      + '<td class="num barcell"><span class="fill" style="width:' + (m.calls * 100 / maxCalls).toFixed(1) + '%"></span><span>' + fmtInt(m.calls) + "</span></td>"
+      + '<td class="num ' + cls + '">' + rate + "</td>"
+      + '<td class="num">' + fmtInt(m.total_tokens) + "</td>"
+      + '<td class="num">' + m.avg_latency_ms + "ms</td></tr>";
+  }).join("");
+}
+document.querySelectorAll(".seg button").forEach(btn => {
+  btn.addEventListener("click", () => {
+    document.querySelectorAll(".seg button").forEach(b => b.setAttribute("aria-pressed", "false"));
+    btn.setAttribute("aria-pressed", "true");
+    state.range = btn.dataset.range;
+    load();
+  });
+});
+$("auto").addEventListener("change", (e) => {
+  if (state.timer) { clearInterval(state.timer); state.timer = null; }
+  if (e.target.checked) state.timer = setInterval(load, 10000);
+});
+load();
+</script>
+</body>
+</html>

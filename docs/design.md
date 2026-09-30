@@ -238,6 +238,13 @@ SSE 首字节发给下游后不能再安全换模型：会重复文字，或破�
 迁移和记录结构，PostgreSQL 仅在 SQL 占位符上使用方言转换。生产环境通过 `dsn_env` 读取
 PostgreSQL DSN，避免连接凭据进入 ConfigMap。
 
+内置统计页（`GET /stats` + `GET /v1/stats/summary`）对台账做只读聚合：聚合 SQL 按
+双方言可移植书写——时间分桶用 `substr(created_at, 1, N)`（RFC3339 文本前缀即时间桶），
+百分位用 `ORDER BY ... LIMIT 1 OFFSET k` 而非方言 percentile 函数；空桶由应用层补零。
+`tools_count` 是请求侧信号（下游 `tools` 数组长度），流式透传不解析内容，故不含响应侧
+tool_calls 计数。统计路径的认证在 Bearer 之外为浏览器放宽 Basic（仅 `/stats` 与
+`/v1/stats/summary` 两个路径），生成端点不放宽。
+
 ## 用量与隐私
 
 `llm_requests` 一行代表一次**上游尝试**。一次请求先 429 后成功会有两行，便于计算故障率和切换次数。

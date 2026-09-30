@@ -371,6 +371,15 @@ Cookie、请求正文、prompt、模型回复或密钥。
 上游拒绝请求时，日志会提取错误消息及 OpenRouter `metadata` 中的错误类别、供应商、供应商错误码和参数；
 可能包含用户输入的 `flagged_input`、prompt、content 以及未解析的原始响应不会写入日志，完整错误体仍透明返回下游。
 
+## 内置统计页
+
+浏览器访问 `GET /stats` 可查看调用次数、成功率、Token 用量、延迟分位、失败分类与模型分布（route → upstream_model），
+支持 1h/24h/7d/30d 时间范围与每 10 秒自动刷新。数据端点是 `GET /v1/stats/summary?range=24h`，返回同源 JSON。
+
+两个路径走与其他端点相同的 `auth_env` 认证：API 客户端照常用 `Authorization: Bearer <key>`；浏览器没有 Bearer 注入点，
+未认证访问会弹出原生登录框，用户名或密码任一位填 API key 即可。生成端点不接受 Basic 回退，认证面不放宽。
+带工具请求的统计来自请求侧 `tools` 数组长度（`tools_count` 列，旧库自动迁移补列），不含响应侧 tool_calls 次数。
+
 ## 查看用量
 
 ```sh
