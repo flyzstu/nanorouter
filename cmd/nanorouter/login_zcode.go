@@ -1,6 +1,6 @@
 package main
 
-// login-zcode 子命令：为 ZCode Coding Plan 渠道执行设备码登录，把兑换并
+// login zcode 子命令：为 ZCode Coding Plan 渠道执行设备码登录，把兑换并
 // 验证过的 Coding Plan key 写入 ~/.nanorouter/zcode_token.json，供网关的
 // zcode_token_file 回退读取。密钥不打印到任何输出流。
 
@@ -16,7 +16,20 @@ import (
 	"github.com/nanorouter/nanorouter/internal/router"
 )
 
-// newLoginZcodeCommand 组装 login-zcode 子命令，旗标与旧 flag 版本一致。
+// newLoginCommand 组装 login 命令组：按供应商拆分子命令，后续新增
+// login openai 等直接往这里挂。
+func newLoginCommand() *cobra.Command {
+	login := &cobra.Command{
+		Use:   "login",
+		Short: "Log in to a provider and store its credential",
+		Long: `Run a provider-specific device authorization flow and store the exchanged
+credential under ~/.nanorouter/ for gateway candidates to read back.`,
+	}
+	login.AddCommand(newLoginZcodeCommand())
+	return login
+}
+
+// newLoginZcodeCommand 组装 login zcode 子命令，旗标与旧 flag 版本一致。
 func newLoginZcodeCommand() *cobra.Command {
 	var (
 		channel   string
@@ -25,7 +38,7 @@ func newLoginZcodeCommand() *cobra.Command {
 		noBrowser bool
 	)
 	cmd := &cobra.Command{
-		Use:   "login-zcode",
+		Use:   "zcode",
 		Short: "Run the ZCode Coding Plan device authorization flow and store the credential",
 		Long: `Runs the ZCode Coding Plan device authorization flow: opens the provider's
 approval page, polls the gateway until the OAuth token lands, exchanges it
@@ -49,8 +62,8 @@ zcode_token_file: true).`,
 			if err != nil {
 				return err
 			}
-			fmt.Fprintf(cmd.ErrOrStderr(), "login-zcode: configure the candidate with zcode_token_file: true and zcode_channel: %s\n", channel)
-			fmt.Fprintf(cmd.ErrOrStderr(), "login-zcode: credential file: %s\n", path)
+			fmt.Fprintf(cmd.ErrOrStderr(), "login zcode: configure the candidate with zcode_token_file: true and zcode_channel: %s\n", channel)
+			fmt.Fprintf(cmd.ErrOrStderr(), "login zcode: credential file: %s\n", path)
 			return nil
 		},
 	}

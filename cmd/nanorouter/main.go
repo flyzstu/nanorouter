@@ -40,7 +40,7 @@ func newRootCommand() *cobra.Command {
 	}
 	root.Flags().StringVarP(&configPath, "config", "c", "config.yaml", "path to YAML configuration")
 	root.Flags().BoolVar(&debug, "debug", false, "enable colored console debug logs")
-	root.AddCommand(newLoginZcodeCommand())
+	root.AddCommand(newLoginCommand())
 	root.CompletionOptions.DisableDefaultCmd = true
 	return root
 }

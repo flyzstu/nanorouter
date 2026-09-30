@@ -8,7 +8,7 @@
 - `POST /v1/responses`（包括 SSE 原样透传）
 - `POST /v1/messages`（Anthropic Messages 透传，含无 `/v1` 兼容形式）
 - `GET /v1/models`
-- `nanorouter login-zcode`：ZCode Coding Plan 设备码登录子命令
+- `nanorouter login zcode`：ZCode Coding Plan 设备码登录子命令（`login` 命令组按供应商拆分，后续可扩展 `login openai` 等）
 - 每个上游的加权轮转、429/错误冷却与请求内指数退避重试
 - SQLite 调用账本、Prometheus `/metrics`
 - Chat Completions 与 Responses 的非流式/流式 `usage` 采集
@@ -36,7 +36,7 @@ go run ./cmd/nanorouter --config config.yaml
 
 CLI 基于 cobra：`nanorouter --help` 列出全部命令与旗标（`-c` 是 `--config` 的短写），
 `nanorouter --version` 查看构建注入的版本号（本地构建默认 `dev`，`make build` 注入
-git tag/describe，容器镜像由 CI 传入 tag 或分支名），子命令 `login-zcode` 见
+git tag/describe，容器镜像由 CI 传入 tag 或分支名），子命令 `login zcode` 见
 [ZCode Coding Plan 上游](#zcode-coding-plan-上游anthropic-messages-网关)。注意旗标
 是双横线风格：旧命令行的 `--config` 需改为 `--config` 或 `-c`。
 
@@ -249,11 +249,11 @@ Nous 的 Free 级别有独立的 RPM/TPM 限制；请先确认账户额度和 `N
 
 ```sh
 # 首次使用：设备码登录，兑换并验证 Coding Plan key，写入 ~/.nanorouter/zcode_token.json
-nanorouter login-zcode -channel bigmodel        # 或 -channel zai
+nanorouter login zcode --channel bigmodel        # 或 --channel zai
 # 其余旗标：-gateway <origin>、-timeout <duration>、-no-browser
 ```
 
-凭据按优先级解析：`api_key_env` 环境变量（支持 `ZCODE_API_KEY` 等自定义名）→ `zcode_token_file: true` 时回退读取 `~/.nanorouter/zcode_token.json`（login-zcode 写入）→ 参考客户端的 `~/.zcode_coding_plan_token.json`（只读；过期或 `eyJhbGci` 平台 JWT 会自动跳过）。登录链在落盘前会用一次 `max_tokens: 1` 请求向网关验证 key，拒绝即失败，绝不存储网关不接受的凭据；OAuth token 与平台 JWT 一并保存于凭据文件。
+凭据按优先级解析：`api_key_env` 环境变量（支持 `ZCODE_API_KEY` 等自定义名）→ `zcode_token_file: true` 时回退读取 `~/.nanorouter/zcode_token.json`（login zcode 写入）→ 参考客户端的 `~/.zcode_coding_plan_token.json`（只读；过期或 `eyJhbGci` 平台 JWT 会自动跳过）。登录链在落盘前会用一次 `max_tokens: 1` 请求向网关验证 key，拒绝即失败，绝不存储网关不接受的凭据；OAuth token 与平台 JWT 一并保存于凭据文件。
 
 翻译边界（显式 400 `unsupported_openai_feature`，不静默丢弃）：`n > 1`、`response_format` 结构化输出、非零 `presence/frequency_penalty`、`logit_bias`、`logprobs`、`top_logprobs`。下游未携带 `max_tokens` / `max_completion_tokens` 时，Messages 协议要求必填，网关默认注入 `max_tokens: 4096`——需要更长输出请显式传 `max_tokens`。已知无声降级记录于 design.md：assistant 历史的 `reasoning_content`（Anthropic 要求思维块签名，未签名的无法回传）、OpenAI 记账字段（`store`/`metadata` 等），以及白名单映射的自然舍弃 `parallel_tool_calls`/`verbosity`（流式 Responses 链上的 thinking_delta 同样不进入 Responses 事件）。`reasoning_effort` 映射为 thinking 预算（minimal→1K … max→32K），预算不足 `max_tokens` 时钳制，`"none"` 关闭。流式 usage 从 `message_start`（输入侧）与 `message_delta`（累计输出侧）合并采集，账本与 OpenAI 上游同一张表。
 

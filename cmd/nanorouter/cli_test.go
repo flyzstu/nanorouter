@@ -38,7 +38,7 @@ func TestHelpListsAllCommandsAndFlags(t *testing.T) {
 	if err != nil {
 		t.Fatalf("help: %v", err)
 	}
-	for _, want := range []string{"login-zcode", "--config", "--debug", "Available Commands"} {
+	for _, want := range []string{"login", "--config", "--debug", "Available Commands"} {
 		if !strings.Contains(out, want) {
 			t.Fatalf("help output missing %q:\n%s", want, out)
 		}
@@ -56,13 +56,13 @@ func TestUnknownSubcommandIsRejected(t *testing.T) {
 }
 
 func TestLoginZcodeHelpShowsFlags(t *testing.T) {
-	out, _, err := executeRoot(t, "login-zcode", "--help")
+	out, _, err := executeRoot(t, "login", "zcode", "--help")
 	if err != nil {
-		t.Fatalf("login-zcode help: %v", err)
+		t.Fatalf("login zcode help: %v", err)
 	}
 	for _, want := range []string{"--channel", "--gateway", "--timeout", "--no-browser"} {
 		if !strings.Contains(out, want) {
-			t.Fatalf("login-zcode help missing %q:\n%s", want, out)
+			t.Fatalf("login zcode help missing %q:\n%s", want, out)
 		}
 	}
 }
