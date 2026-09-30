@@ -257,10 +257,12 @@ func resolveCandidateAPIKey(u Candidate) string {
 	return ""
 }
 
-// zcodeTokenFileKey 从凭据文件按渠道解析 Coding Plan key。
-// nanorouter 自己的凭据文件优先，其次参考客户端的 token 文件；文件内
-// 分组键缺失时回退另一分组（dsh 的 grouped[provider] ?? bigmodel ?? zai
-// 语义）——切换渠道的用户不应静默丢失凭据。
+// zcodeTokenFileKey 从凭据文件按渠道解析 Coding Plan key。三个只读来源
+// 依次为：login zcode 写入的凭据文件、ZCode 官方加密凭据文件
+// (~/.zcode/v2/credentials.json)、参考客户端的旧 token 文件；前者命中后
+// 不再向后拼接，避免把两次登录的凭据混在一台机器上。文件内分组键缺失时
+// 回退另一分组（dsh 的 grouped[provider] ?? bigmodel ?? zai 语义）——
+// 切换渠道的用户不应静默丢失凭据。
 func zcodeTokenFileKey(channel string) string {
 	if channel != ZcodeChannelZai {
 		channel = ZcodeChannelBigmodel
@@ -275,6 +277,15 @@ func zcodeTokenFileKey(channel string) string {
 	if path := ZcodeTokenStorePath(); path != "" {
 		for name, key := range parseZcodeTokenStoreFile(path) {
 			entries[name] = key
+		}
+	}
+	// ZCode 官方 v2 凭据文件次之：机器上跑着 ZCode 桌面/CLI 时无需重复
+	// 登录即可复用其已登录凭据（加密文件按同机默认密钥解密）。
+	if path := ZcodeV2CredentialsPath(); path != "" {
+		for name, key := range parseZcodeV2CredentialsFile(path) {
+			if _, ok := entries[name]; !ok {
+				entries[name] = key
+			}
 		}
 	}
 	if path := ZcodeReferenceTokenPath(); path != "" {
