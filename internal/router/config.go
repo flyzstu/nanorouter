@@ -389,6 +389,27 @@ type Candidate struct {
 	// 3. 流式请求注入 stream_options: {"include_usage": true}
 	// 4. 补全会话头 X-Session-Affinity 与 X-Session-Id
 	SimulateOpenCode bool `yaml:"simulate_opencode"`
+	// Anthropic 声明上游说 Anthropic Messages 协议（/v1/messages 形状），
+	// 例如智谱 ZCode Coding Plan 网关。此类候选原生服务 /v1/messages 端点，
+	// 并经 chat→Messages 适配服务 Chat Completions / Responses 下游。
+	Anthropic bool `yaml:"anthropic"`
+	// AnthropicMessagesPath 覆盖 Anthropic 候选的上游路径；默认 v1/messages。
+	// simulate_zcode 且未配置本字段时，路径按 zcode_channel 取网关路径。
+	AnthropicMessagesPath string `yaml:"anthropic_messages_path"`
+	// SimulateZcode 开启对 ZCode 桌面客户端行为的全面仿真：
+	// 1. 发送 User-Agent: ZCode/3.14.0 与完整 CLI 身份/平台指纹头
+	// 2. anthropic-version: 2023-06-01 与 x-api-key + Authorization 双凭据头
+	// 3. 会话 id 从对话首个 user turn 稳定派生，请求/追踪 id 每请求全新
+	// 仅对 Anthropic 候选有意义。
+	SimulateZcode bool `yaml:"simulate_zcode"`
+	// ZcodeChannel 指定 ZCode Coding Plan 渠道：bigmodel（国内 ultra）或
+	// zai（海外 ultra-zai）。路径与凭据文件的分组键都随渠道切换。
+	ZcodeChannel string `yaml:"zcode_channel"`
+	// ZcodeTokenFile 允许在 api_key_env 未命中时回退读取凭据文件：
+	// 优先 ~/.nanorouter/zcode_token.json（login-zcode 写入），其次参考
+	// 客户端的 ~/.zcode_coding_plan_token.json（只读）。凭据文件的分组
+	// 键取 zcode_channel。
+	ZcodeTokenFile bool `yaml:"zcode_token_file"`
 	// Probe 显式控制该候选是否在熔断后开启后台异步探活；未配置时继承全局 health_check.enabled。
 	Probe *bool `yaml:"probe"`
 	// Headers 允许针对上游候选配置额外的自定义 HTTP 头（可覆盖默认头）。
@@ -443,6 +464,29 @@ func (u Candidate) validate(global RetryConfig) error {
 	}
 	if u.MaxConcurrency == 0 && u.QueueTimeout > 0 {
 		return fmt.Errorf("queue_timeout requires max_concurrency")
+	}
+	if u.ZcodeChannel != "" && u.ZcodeChannel != ZcodeChannelBigmodel && u.ZcodeChannel != ZcodeChannelZai {
+		return fmt.Errorf("zcode_channel must be %q or %q", ZcodeChannelBigmodel, ZcodeChannelZai)
+	}
+	if (u.SimulateZcode || u.ZcodeTokenFile || u.ZcodeChannel != "" || u.AnthropicMessagesPath != "") && !u.Anthropic {
+		return fmt.Errorf("anthropic must be enabled for anthropic_messages_path / simulate_zcode / zcode_channel / zcode_token_file")
+	}
+	if u.Anthropic {
+		if u.Responses {
+			return fmt.Errorf("anthropic candidates serve Messages natively; responses: true does not apply")
+		}
+		if u.ResponsesViaChatCompletions {
+			return fmt.Errorf("anthropic candidates adapt Responses through the chat chain; responses_via_chat_completions does not apply")
+		}
+		if u.SimulateOpenCode {
+			return fmt.Errorf("simulate_opencode targets the OpenAI-dialect Zhipu gateway and conflicts with anthropic")
+		}
+		if u.ChatCompletionsPath != "" {
+			return fmt.Errorf("chat_completions_path targets OpenAI Chat upstreams and is ignored by anthropic candidates; use anthropic_messages_path")
+		}
+		if u.ChatMaxTokensField != "" {
+			return fmt.Errorf("chat_max_tokens_field targets OpenAI Chat upstreams and is ignored by anthropic candidates")
+		}
 	}
 	return nil
 }

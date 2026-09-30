@@ -20,6 +20,10 @@ import (
 )
 
 func main() {
+	// login-zcode 是独立子命令：不走 -config/-debug 的旗标解析。
+	if len(os.Args) > 1 && os.Args[1] == "login-zcode" {
+		os.Exit(runZcodeLoginCommand(os.Args[2:]))
+	}
 	configPath := flag.String("config", "config.yaml", "path to YAML configuration")
 	debug := flag.Bool("debug", false, "enable colored console debug logs")
 	flag.Parse()
