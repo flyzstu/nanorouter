@@ -285,6 +285,10 @@ func (s *Store) Summary(ctx context.Context, since time.Time, bucketSubstrLen in
 			continue
 		}
 		for _, name := range names {
+			// 聚合侧与写入口同规：绕过网关直写库的超长名字不能进榜单。
+			if name == "" || len(name) > maxToolName {
+				continue
+			}
 			tally[name]++
 		}
 	}
@@ -407,6 +411,7 @@ type requestMeta struct {
 
 const (
 	maxToolNamesJSON = 2048 // 防病态超大 tools 数组撑爆台账
+	maxToolName      = 256  // 单个工具名上限，写入口与聚合侧同规
 	maxClientAgent   = 256
 )
 

@@ -143,13 +143,17 @@ func TestMigrateAddsToolsCountToLegacyTable(t *testing.T) {
 		t.Fatalf("second migrate: %v", err)
 	}
 	store := NewStore(db, "sqlite3")
-	insertStatsRecord(t, store, Record{Route: "r", UpstreamID: "u", UpstreamModel: "m", Endpoint: "chat_completions", Status: 200, ToolsCount: 3, CreatedAt: time.Now().UTC()})
+	insertStatsRecord(t, store, Record{Route: "r", UpstreamID: "u", UpstreamModel: "m", Endpoint: "chat_completions", Status: 200, ToolsCount: 3, ToolNames: `["a"]`, ClientIP: "10.1.1.1", ClientAgent: "ua/1", CreatedAt: time.Now().UTC()})
 	var tools int
-	if err := db.QueryRow(`SELECT tools_count FROM llm_requests`).Scan(&tools); err != nil {
-		t.Fatalf("tools_count column unreadable: %v", err)
+	var ip, agent, names string
+	if err := db.QueryRow(`SELECT tools_count, client_ip, client_agent, tool_names FROM llm_requests`).Scan(&tools, &ip, &agent, &names); err != nil {
+		t.Fatalf("new columns unreadable after legacy migration: %v", err)
 	}
 	if tools != 3 {
 		t.Fatalf("tools=%d", tools)
+	}
+	if ip != "10.1.1.1" || agent != "ua/1" || names != `["a"]` {
+		t.Fatalf("meta columns: ip=%q agent=%q names=%q", ip, agent, names)
 	}
 }
 
@@ -198,6 +202,30 @@ func TestStatsEndpointsAuthAndPayload(t *testing.T) {
 	}
 	if payload.Range != "24h" || payload.Bucket != "1h" || len(payload.Series) != 24 {
 		t.Fatalf("summary envelope: range=%s bucket=%s points=%d", payload.Range, payload.Bucket, len(payload.Series))
+	}
+	// 合法 range 的分桶映射：1h→分钟桶 60 点，7d/30d→天桶 7/30 点。
+	for _, tc := range [][3]any{{"1h", "1m", 60}, {"7d", "1d", 7}, {"30d", "1d", 30}} {
+		rangeName, wantBucket, wantPoints := tc[0].(string), tc[1].(string), tc[2].(int)
+		req = httptest.NewRequest(http.MethodGet, "/v1/stats/summary?range="+rangeName, nil)
+		req.SetBasicAuth("anything", "sekrit")
+		rec = httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("range %s: %d", rangeName, rec.Code)
+		}
+		var envelope struct {
+			Range  string `json:"range"`
+			Bucket string `json:"bucket"`
+			Series []struct {
+				Bucket string `json:"bucket"`
+			} `json:"series"`
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &envelope); err != nil {
+			t.Fatalf("range %s body: %v", rangeName, err)
+		}
+		if envelope.Range != rangeName || envelope.Bucket != wantBucket || len(envelope.Series) != wantPoints {
+			t.Fatalf("range %s: bucket=%s points=%d", rangeName, envelope.Bucket, len(envelope.Series))
+		}
 	}
 
 	// key 放用户名位同样放行（浏览器登录框首格）。
@@ -331,5 +359,102 @@ func TestProxyClientIPTrustForwardedFor(t *testing.T) {
 	}
 	if len(summary.Clients) != 1 || summary.Clients[0].ClientIP != "192.0.2.1" {
 		t.Fatalf("untrusted XFF must fall back to RemoteAddr: %+v", summary.Clients)
+	}
+}
+
+func TestProxyLedgerRecordsAnthropicToolNames(t *testing.T) {
+	// Anthropic 候选的 tools 是顶层 name + input_schema 形状（无 function
+	// 包装），工具名提取必须走另一条分支——这是 anthropic 上游的主路径。
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		if !strings.HasSuffix(req.URL.Path, "v1/messages") {
+			t.Errorf("upstream path = %q", req.URL.Path)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"msg_1","type":"message","role":"assistant","content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","usage":{"input_tokens":3,"output_tokens":2}}`))
+	}))
+	defer upstream.Close()
+	db, err := sql.Open("sqlite3", ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := Migrate(context.Background(), db); err != nil {
+		t.Fatal(err)
+	}
+	r, err := New(Config{RequestTimeout: time.Second, Routes: map[string]Route{"free": {Candidates: []Candidate{{
+		ID: "u", BaseURL: upstream.URL, Model: "up", Anthropic: true,
+	}}}}}, db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := `{"model":"free","max_tokens":10,"messages":[{"role":"user","content":"hi"}],"tools":[{"name":"grep","description":"search","input_schema":{"type":"object"}}]}`
+	rec := httptest.NewRecorder()
+	r.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(body)))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("proxy: %d body=%s", rec.Code, rec.Body.String())
+	}
+	summary, err := r.db.Summary(context.Background(), time.Now().Add(-time.Hour), 13)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if summary.Totals.WithTools != 1 {
+		t.Fatalf("with_tools=%d", summary.Totals.WithTools)
+	}
+	if len(summary.Tools) != 1 || summary.Tools[0].Name != "grep" || summary.Tools[0].Count != 1 {
+		t.Fatalf("tools: %+v", summary.Tools)
+	}
+}
+
+func TestSummaryToleratesMalformedToolNames(t *testing.T) {
+	store := statsTestStore(t)
+	now := time.Now().UTC()
+	records := []Record{
+		// 合法记录正常计入。
+		{ID: "ok", Route: "r", UpstreamID: "u", UpstreamModel: "m", Endpoint: "chat_completions", Status: 200, ToolNames: `["bash"]`, CreatedAt: now},
+		// 非法 JSON 与超长 JSON 都必须在聚合侧被跳过而不是拖垮整个查询。
+		{ID: "junk", Route: "r", UpstreamID: "u", UpstreamModel: "m", Endpoint: "chat_completions", Status: 200, ToolNames: `not-json`, CreatedAt: now},
+		{ID: "huge", Route: "r", UpstreamID: "u", UpstreamModel: "m", Endpoint: "chat_completions", Status: 200, ToolNames: `["` + strings.Repeat("x", 3000) + `"]`, CreatedAt: now},
+	}
+	for _, r := range records {
+		insertStatsRecord(t, store, r)
+	}
+	summary, err := store.Summary(context.Background(), now.Add(-time.Hour), 13)
+	if err != nil {
+		t.Fatalf("summary with malformed rows: %v", err)
+	}
+	if len(summary.Tools) != 1 || summary.Tools[0].Name != "bash" || summary.Tools[0].Count != 1 {
+		t.Fatalf("tools: %+v", summary.Tools)
+	}
+}
+
+func TestNewRequestMetaShapesAndLimits(t *testing.T) {
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	req.Header.Set("User-Agent", "ua/1")
+	// 超长工具名整体放弃记录名称，但计数保留。
+	huge := map[string]any{"tools": []any{map[string]any{"function": map[string]any{"name": strings.Repeat("x", 3000)}}}}
+	meta := newRequestMeta(req, huge, false)
+	if meta.Tools != 1 || meta.ToolNames != "" {
+		t.Fatalf("oversized tools: tools=%d names=%q", meta.Tools, meta.ToolNames)
+	}
+	// 形状不符一律零值：tools 非数组、名称缺省。
+	if meta := newRequestMeta(req, map[string]any{"tools": "garbage"}, false); meta.Tools != 0 || meta.ToolNames != "" {
+		t.Fatalf("garbage tools: %+v", meta)
+	}
+	if meta := newRequestMeta(req, map[string]any{"tools": []any{map[string]any{"type": "function"}}}, false); meta.Tools != 0 || meta.ToolNames != "" {
+		t.Fatalf("nameless tool: %+v", meta)
+	}
+	// OpenAI 与 Anthropic 两种形状混合时都能取到名字。
+	mixed := map[string]any{"tools": []any{
+		map[string]any{"function": map[string]any{"name": "openai_tool"}},
+		map[string]any{"name": "anthropic_tool"},
+	}}
+	meta = newRequestMeta(req, mixed, false)
+	if meta.Tools != 2 || meta.ToolNames != `["openai_tool","anthropic_tool"]` {
+		t.Fatalf("mixed shapes: %+v", meta)
+	}
+	// UA 截断到 256 字节。
+	req.Header.Set("User-Agent", strings.Repeat("a", 300))
+	if meta := newRequestMeta(req, nil, false); len(meta.ClientAgent) != 256 {
+		t.Fatalf("agent len=%d", len(meta.ClientAgent))
 	}
 }
