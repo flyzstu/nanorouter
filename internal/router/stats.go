@@ -11,7 +11,10 @@ package router
 import (
 	"context"
 	_ "embed"
+	"net"
 	"net/http"
+	"sort"
+	"strings"
 	"time"
 
 	json "github.com/goccy/go-json"
@@ -22,12 +25,16 @@ var statsPageHTML []byte
 
 // StatsSummary 是一次聚合的完整结果，字段直接对齐页面的渲染需求。
 type StatsSummary struct {
-	Range    string         `json:"range"`
-	Bucket   string         `json:"bucket"`
-	Totals   StatsTotals    `json:"totals"`
-	Series   []StatsPoint   `json:"series"`
-	Models   []StatsModel   `json:"models"`
-	Failures []StatsFailure `json:"failures"`
+	Range     string          `json:"range"`
+	Bucket    string          `json:"bucket"`
+	Totals    StatsTotals     `json:"totals"`
+	Series    []StatsPoint    `json:"series"`
+	Models    []StatsModel    `json:"models"`
+	Failures  []StatsFailure  `json:"failures"`
+	Upstreams []StatsUpstream `json:"upstreams"`
+	Clients   []StatsClient   `json:"clients"`
+	Agents    []StatsAgent    `json:"agents"`
+	Tools     []StatsTool     `json:"tools"`
 }
 
 type StatsTotals struct {
@@ -61,6 +68,33 @@ type StatsFailure struct {
 	Count int64  `json:"count"`
 }
 
+type StatsUpstream struct {
+	UpstreamID   string `json:"upstream_id"`
+	Calls        int64  `json:"calls"`
+	Success      int64  `json:"success"`
+	TotalTokens  int64  `json:"total_tokens"`
+	AvgLatencyMS int64  `json:"avg_latency_ms"`
+}
+
+type StatsClient struct {
+	ClientIP    string `json:"client_ip"`
+	Calls       int64  `json:"calls"`
+	Success     int64  `json:"success"`
+	TotalTokens int64  `json:"total_tokens"`
+	LastSeen    string `json:"last_seen"`
+}
+
+type StatsAgent struct {
+	Agent   string `json:"agent"`
+	Calls   int64  `json:"calls"`
+	Success int64  `json:"success"`
+}
+
+type StatsTool struct {
+	Name  string `json:"name"`
+	Count int64  `json:"count"`
+}
+
 // statsRanges 是页面允许的时间范围：范围 → 分桶前缀长度与桶标签。
 // RFC3339 "2026-09-30T15:41:22Z"：取 16 位精确到分、13 位到时、10 位到天。
 var statsRanges = map[string]struct {
@@ -75,7 +109,8 @@ var statsRanges = map[string]struct {
 
 // Summary 聚合 since 之后的台账记录。bucketSubstrLen 见 statsRanges。
 func (s *Store) Summary(ctx context.Context, since time.Time, bucketSubstrLen int) (StatsSummary, error) {
-	summary := StatsSummary{Series: []StatsPoint{}, Models: []StatsModel{}, Failures: []StatsFailure{}}
+	summary := StatsSummary{Series: []StatsPoint{}, Models: []StatsModel{}, Failures: []StatsFailure{},
+		Upstreams: []StatsUpstream{}, Clients: []StatsClient{}, Agents: []StatsAgent{}, Tools: []StatsTool{}}
 	// RFC3339Nano 会裁掉尾随零，边界秒内不同小数位长度的字典序比较存在
 	// 理论误判；对统计页而言只影响桶边界±1s 的归属，不值得为它换格式。
 	sinceText := since.UTC().Format(time.RFC3339Nano)
@@ -171,7 +206,101 @@ func (s *Store) Summary(ctx context.Context, since time.Time, bucketSubstrLen in
 	}
 	rows.Close()
 
-	return summary, rows.Err()
+	rows, err = s.db.QueryContext(ctx, s.rebind(
+		`SELECT upstream_id, COUNT(*), COALESCE(SUM(`+successExpr+`), 0),
+		 COALESCE(SUM(total_tokens), 0), COALESCE(AVG(latency_ms), 0)
+		 FROM llm_requests WHERE created_at >= ?
+		 GROUP BY upstream_id ORDER BY COUNT(*) DESC LIMIT 20`),
+		sinceText)
+	if err != nil {
+		return summary, err
+	}
+	for rows.Next() {
+		var u StatsUpstream
+		var avgLatency float64
+		if err := rows.Scan(&u.UpstreamID, &u.Calls, &u.Success, &u.TotalTokens, &avgLatency); err != nil {
+			rows.Close()
+			return summary, err
+		}
+		u.AvgLatencyMS = int64(avgLatency + 0.5)
+		summary.Upstreams = append(summary.Upstreams, u)
+	}
+	rows.Close()
+
+	rows, err = s.db.QueryContext(ctx, s.rebind(
+		// 旧数据 client_ip 为空串：归入"未知"而不是丢掉调用量。
+		`SELECT COALESCE(NULLIF(client_ip, ''), '(未知)'), COUNT(*), COALESCE(SUM(`+successExpr+`), 0),
+		 COALESCE(SUM(total_tokens), 0), MAX(created_at)
+		 FROM llm_requests WHERE created_at >= ?
+		 GROUP BY 1 ORDER BY 2 DESC LIMIT 20`),
+		sinceText)
+	if err != nil {
+		return summary, err
+	}
+	for rows.Next() {
+		var c StatsClient
+		if err := rows.Scan(&c.ClientIP, &c.Calls, &c.Success, &c.TotalTokens, &c.LastSeen); err != nil {
+			rows.Close()
+			return summary, err
+		}
+		summary.Clients = append(summary.Clients, c)
+	}
+	rows.Close()
+
+	rows, err = s.db.QueryContext(ctx, s.rebind(
+		`SELECT COALESCE(NULLIF(client_agent, ''), '(未知)'), COUNT(*), COALESCE(SUM(`+successExpr+`), 0)
+		 FROM llm_requests WHERE created_at >= ?
+		 GROUP BY 1 ORDER BY 2 DESC LIMIT 10`),
+		sinceText)
+	if err != nil {
+		return summary, err
+	}
+	for rows.Next() {
+		var a StatsAgent
+		if err := rows.Scan(&a.Agent, &a.Calls, &a.Success); err != nil {
+			rows.Close()
+			return summary, err
+		}
+		summary.Agents = append(summary.Agents, a)
+	}
+	rows.Close()
+
+	// 工具榜没有跨方言的 JSON 展开函数（json_each vs jsonb_array_elements），
+	// 把范围内的工具名拉回 Go 侧聚合；范围上限 30 天、每行至多 2KB，量级可控。
+	rows, err = s.db.QueryContext(ctx, s.rebind(
+		`SELECT tool_names FROM llm_requests WHERE created_at >= ? AND tool_names != ''`),
+		sinceText)
+	if err != nil {
+		return summary, err
+	}
+	tally := map[string]int64{}
+	for rows.Next() {
+		var encoded string
+		if err := rows.Scan(&encoded); err != nil {
+			rows.Close()
+			return summary, err
+		}
+		var names []string
+		if json.Unmarshal([]byte(encoded), &names) != nil {
+			continue
+		}
+		for _, name := range names {
+			tally[name]++
+		}
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return summary, err
+	}
+	for name, count := range tally {
+		summary.Tools = append(summary.Tools, StatsTool{Name: name, Count: count})
+	}
+	sort.Slice(summary.Tools, func(i, j int) bool { return summary.Tools[i].Count > summary.Tools[j].Count })
+	if len(summary.Tools) > 15 {
+		summary.Tools = summary.Tools[:15]
+	}
+
+	return summary, nil
 }
 
 // writeJSONError 与网关其余错误响应保持同一信封形状。
@@ -267,11 +396,70 @@ func (r *Router) statsPage(w http.ResponseWriter, q *http.Request) {
 	_, _ = w.Write(statsPageHTML)
 }
 
-// countTools 统计下游请求携带的 tools 数量；形状不符一律记 0，不做猜测。
-func countTools(payload map[string]any) int {
-	tools, ok := payload["tools"].([]any)
-	if !ok {
-		return 0
+// requestMeta 是每次代理请求采集的调用方元数据，一次生成、随 record 落盘。
+// 全部是请求元数据：不含 prompt、回复内容或凭据。
+type requestMeta struct {
+	Tools       int
+	ToolNames   string // JSON 数组文本；无工具时为空串
+	ClientIP    string
+	ClientAgent string
+}
+
+const (
+	maxToolNamesJSON = 2048 // 防病态超大 tools 数组撑爆台账
+	maxClientAgent   = 256
+)
+
+// newRequestMeta 从请求与已解析 payload 提取元数据。形状不符一律记零值，
+// 不做猜测；OpenAI（tools[].function.name）与 Anthropic（tools[].name）
+// 两种工具形状都识别。
+func newRequestMeta(q *http.Request, payload map[string]any, trustForwardedFor bool) requestMeta {
+	var names []string
+	if raw, ok := payload["tools"].([]any); ok {
+		for _, rawTool := range raw {
+			tool, ok := rawTool.(map[string]any)
+			if !ok {
+				continue
+			}
+			name := ""
+			if fn, ok := tool["function"].(map[string]any); ok {
+				name, _ = fn["name"].(string)
+			}
+			if name == "" {
+				name, _ = tool["name"].(string)
+			}
+			if name != "" {
+				names = append(names, name)
+			}
+		}
 	}
-	return len(tools)
+	toolNames := ""
+	if len(names) > 0 {
+		if encoded, err := json.Marshal(names); err == nil && len(encoded) <= maxToolNamesJSON {
+			toolNames = string(encoded)
+		}
+	}
+	agent := strings.TrimSpace(q.Header.Get("User-Agent"))
+	if len(agent) > maxClientAgent {
+		agent = agent[:maxClientAgent]
+	}
+	return requestMeta{Tools: len(names), ToolNames: toolNames, ClientIP: clientIP(q, trustForwardedFor), ClientAgent: agent}
+}
+
+// clientIP 解析调用方 IP：开启 trust_forwarded_for 且头存在时取
+// X-Forwarded-For 首值（链路最左侧的原始客户端），否则用 TCP 对端地址
+// （去端口）。
+func clientIP(q *http.Request, trustForwardedFor bool) string {
+	if trustForwardedFor {
+		if xff := q.Header.Get("X-Forwarded-For"); xff != "" {
+			if first := strings.TrimSpace(strings.Split(xff, ",")[0]); first != "" {
+				return first
+			}
+		}
+	}
+	host, _, err := net.SplitHostPort(q.RemoteAddr)
+	if err != nil || host == "" {
+		return q.RemoteAddr
+	}
+	return host
 }

@@ -241,8 +241,12 @@ PostgreSQL DSN，避免连接凭据进入 ConfigMap。
 内置统计页（`GET /stats` + `GET /v1/stats/summary`）对台账做只读聚合：聚合 SQL 按
 双方言可移植书写——时间分桶用 `substr(created_at, 1, N)`（RFC3339 文本前缀即时间桶），
 百分位用 `ORDER BY ... LIMIT 1 OFFSET k` 而非方言 percentile 函数；空桶由应用层补零。
-`tools_count` 是请求侧信号（下游 `tools` 数组长度），流式透传不解析内容，故不含响应侧
-tool_calls 计数。统计路径的认证在 Bearer 之外为浏览器放宽 Basic（仅 `/stats` 与
+`tools_count`/`tool_names`/`client_ip`/`client_agent` 是请求侧元数据：工具名取下游请求
+的 `tools` 数组（兼容 OpenAI/Anthropic 形状），流式透传不解析内容，故不含响应侧
+tool_calls 计数；工具榜聚合因 JSON 展开函数跨方言不统一（json_each vs
+jsonb_array_elements_text），拉回 Go 侧归并。调用方 IP 直连记 TCP 对端地址，开启
+`trust_forwarded_for` 后取 `X-Forwarded-For` 首值（仅限可信反代后部署，否则来源可
+伪造）。统计路径的认证在 Bearer 之外为浏览器放宽 Basic（仅 `/stats` 与
 `/v1/stats/summary` 两个路径），生成端点不放宽。
 
 ## 用量与隐私

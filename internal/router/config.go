@@ -10,15 +10,18 @@ import (
 )
 
 type Config struct {
-	Listen         string             `yaml:"listen"`
-	Database       DatabaseConfig     `yaml:"database"`
-	Logging        LoggingConfig      `yaml:"logging"`
-	AuthEnv        string             `yaml:"auth_env"`
-	RequestTimeout time.Duration      `yaml:"request_timeout"`
-	Retry          RetryConfig        `yaml:"retry"`
-	Backpressure   BackpressureConfig `yaml:"backpressure"`
-	Profiling      ProfilingConfig    `yaml:"profiling"`
-	HealthCheck    HealthCheckConfig  `yaml:"health_check"`
+	Listen   string         `yaml:"listen"`
+	Database DatabaseConfig `yaml:"database"`
+	Logging  LoggingConfig  `yaml:"logging"`
+	AuthEnv  string         `yaml:"auth_env"`
+	// TrustForwardedFor 开启后统计里的调用方 IP 取 X-Forwarded-For 首值。
+	// 仅在网关前面有可信反代时开启；直连部署开启会让调用方伪造来源。
+	TrustForwardedFor bool               `yaml:"trust_forwarded_for"`
+	RequestTimeout    time.Duration      `yaml:"request_timeout"`
+	Retry             RetryConfig        `yaml:"retry"`
+	Backpressure      BackpressureConfig `yaml:"backpressure"`
+	Profiling         ProfilingConfig    `yaml:"profiling"`
+	HealthCheck       HealthCheckConfig  `yaml:"health_check"`
 	// UserAgent 全局覆盖转发到上游的 User-Agent。候选的 user_agent 优先于全局值；
 	// 两者都未配置时使用 Go 默认的 Go-http-client/x.x。部分上游的 Cloudflare WAF
 	// 会拦截该默认 UA，可在此配置常规客户端 UA（例如 opencode/1.18.25）统一绕过。

@@ -39,10 +39,11 @@ func TestSummaryAggregatesTotalsRateAndTools(t *testing.T) {
 	store := statsTestStore(t)
 	now := time.Now().UTC()
 	records := []Record{
-		{Route: "free", UpstreamID: "u1", UpstreamModel: "glm-5.3", Endpoint: "chat_completions", Status: 200, LatencyMS: 100, Usage: Usage{Prompt: 10, Completion: 20, Total: 30, Source: "upstream"}, ToolsCount: 2, CreatedAt: now},
-		{Route: "free", UpstreamID: "u1", UpstreamModel: "glm-5.3", Endpoint: "chat_completions", Status: 200, LatencyMS: 300, Usage: Usage{Prompt: 1, Completion: 2, Total: 3, Source: "upstream"}, CreatedAt: now.Add(-time.Minute)},
-		{Route: "free", UpstreamID: "u1", UpstreamModel: "glm-5.3", Endpoint: "chat_completions", Status: 502, LatencyMS: 500, ErrorKind: "upstream_error", Usage: Usage{Source: "unavailable"}, CreatedAt: now.Add(-2 * time.Minute)},
-		{Route: "free", UpstreamID: "u1", UpstreamModel: "glm-5.3", Endpoint: "chat_completions", Status: 499, LatencyMS: 10, ErrorKind: "client_canceled", Usage: Usage{Source: "unavailable"}, CreatedAt: now.Add(-3 * time.Minute)},
+		{Route: "free", UpstreamID: "u1", UpstreamModel: "glm-5.3", Endpoint: "chat_completions", Status: 200, LatencyMS: 100, Usage: Usage{Prompt: 10, Completion: 20, Total: 30, Source: "upstream"}, ToolsCount: 2, ToolNames: `["read_file","bash"]`, ClientIP: "10.0.0.1", ClientAgent: "claude-code/1.0", CreatedAt: now},
+		{Route: "free", UpstreamID: "u1", UpstreamModel: "glm-5.3", Endpoint: "chat_completions", Status: 200, LatencyMS: 300, Usage: Usage{Prompt: 1, Completion: 2, Total: 3, Source: "upstream"}, ClientIP: "10.0.0.1", ClientAgent: "claude-code/1.0", CreatedAt: now.Add(-time.Minute)},
+		{Route: "free", UpstreamID: "u1", UpstreamModel: "glm-5.3", Endpoint: "chat_completions", Status: 502, LatencyMS: 500, ErrorKind: "upstream_error", Usage: Usage{Source: "unavailable"}, ClientIP: "10.0.0.2", ClientAgent: "curl/8.0", CreatedAt: now.Add(-2 * time.Minute)},
+		{Route: "free", UpstreamID: "u1", UpstreamModel: "glm-5.3", Endpoint: "chat_completions", Status: 499, LatencyMS: 10, ErrorKind: "client_canceled", Usage: Usage{Source: "unavailable"}, ClientIP: "10.0.0.2", ClientAgent: "curl/8.0", CreatedAt: now.Add(-3 * time.Minute)},
+		{Route: "free", UpstreamID: "u2", UpstreamModel: "hermes-4", Endpoint: "chat_completions", Status: 200, LatencyMS: 700, Usage: Usage{Prompt: 5, Completion: 5, Total: 10, Source: "upstream"}, ToolNames: `["read_file"]`, ClientIP: "10.0.0.3", ClientAgent: "opencode/1.2", CreatedAt: now.Add(-4 * time.Minute)},
 		// 范围之外：不应计入任何聚合。
 		{Route: "old", UpstreamID: "u1", UpstreamModel: "glm-5.3", Endpoint: "chat_completions", Status: 500, LatencyMS: 999, ErrorKind: "upstream_error", CreatedAt: now.Add(-25 * time.Hour)},
 	}
@@ -56,20 +57,20 @@ func TestSummaryAggregatesTotalsRateAndTools(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if summary.Totals.Requests != 4 || summary.Totals.Success != 2 {
+	if summary.Totals.Requests != 5 || summary.Totals.Success != 3 {
 		t.Fatalf("totals: requests=%d success=%d", summary.Totals.Requests, summary.Totals.Success)
 	}
-	if summary.Totals.TotalTokens != 33 || summary.Totals.PromptTokens != 11 || summary.Totals.CompletionTokens != 22 {
+	if summary.Totals.TotalTokens != 43 || summary.Totals.PromptTokens != 16 || summary.Totals.CompletionTokens != 27 {
 		t.Fatalf("tokens: %+v", summary.Totals)
 	}
 	if summary.Totals.WithTools != 1 {
 		t.Fatalf("with_tools=%d", summary.Totals.WithTools)
 	}
-	// 延迟样本 [100,300,500,10] 排序后 [10,100,300,500]：p50=(4-1)/2=1 → 100，p95=(4-1)*95/100=2 → 300。
-	if summary.Totals.LatencyP50MS != 100 || summary.Totals.LatencyP95MS != 300 {
+	// 延迟样本 [100,300,500,10,700] 排序后 [10,100,300,500,700]：p50=(5-1)/2=2 → 300，p95=(5-1)*95/100=3 → 500。
+	if summary.Totals.LatencyP50MS != 300 || summary.Totals.LatencyP95MS != 500 {
 		t.Fatalf("percentiles: p50=%d p95=%d", summary.Totals.LatencyP50MS, summary.Totals.LatencyP95MS)
 	}
-	if len(summary.Models) != 1 || summary.Models[0].Calls != 4 || summary.Models[0].Success != 2 || summary.Models[0].TotalTokens != 33 {
+	if len(summary.Models) != 2 || summary.Models[0].Calls != 4 || summary.Models[0].Success != 2 || summary.Models[0].TotalTokens != 33 {
 		t.Fatalf("models: %+v", summary.Models)
 	}
 	if len(summary.Failures) != 2 {
@@ -78,9 +79,42 @@ func TestSummaryAggregatesTotalsRateAndTools(t *testing.T) {
 	if summary.Failures[0].Count != 1 || summary.Failures[1].Count != 1 {
 		t.Fatalf("failures: %+v", summary.Failures)
 	}
-	// 桶以小时前缀聚合，4 条同小时记录落在同一个桶。
-	if len(summary.Series) != 1 || summary.Series[0].Calls != 4 || summary.Series[0].Failures != 2 {
+	// 桶以小时前缀聚合，5 条同小时记录落在同一个桶。
+	if len(summary.Series) != 1 || summary.Series[0].Calls != 5 || summary.Series[0].Failures != 2 {
 		t.Fatalf("series: %+v", summary.Series)
+	}
+	// 上游候选：u1 四条（2 成功）、u2 一条（1 成功），按调用量降序。
+	if len(summary.Upstreams) != 2 || summary.Upstreams[0].UpstreamID != "u1" || summary.Upstreams[0].Calls != 4 || summary.Upstreams[0].Success != 2 {
+		t.Fatalf("upstreams: %+v", summary.Upstreams)
+	}
+	if summary.Upstreams[1].UpstreamID != "u2" || summary.Upstreams[1].TotalTokens != 10 {
+		t.Fatalf("upstreams[1]: %+v", summary.Upstreams[1])
+	}
+	// 调用方：10.0.0.1 两条全成、10.0.0.2 两条全败、10.0.0.3 一条。
+	if len(summary.Clients) != 3 {
+		t.Fatalf("clients: %+v", summary.Clients)
+	}
+	clientByIP := map[string]StatsClient{}
+	for _, c := range summary.Clients {
+		clientByIP[c.ClientIP] = c
+	}
+	if c := clientByIP["10.0.0.2"]; c.Calls != 2 || c.Success != 0 || c.LastSeen == "" {
+		t.Fatalf("client 10.0.0.2: %+v", c)
+	}
+	if c := clientByIP["10.0.0.3"]; c.TotalTokens != 10 {
+		t.Fatalf("client 10.0.0.3: %+v", c)
+	}
+	// 客户端 UA 分组：claude-code 2、curl 2、opencode 1。
+	agentCalls := map[string]int64{}
+	for _, a := range summary.Agents {
+		agentCalls[a.Agent] = a.Calls
+	}
+	if agentCalls["claude-code/1.0"] != 2 || agentCalls["curl/8.0"] != 2 || agentCalls["opencode/1.2"] != 1 {
+		t.Fatalf("agents: %+v", summary.Agents)
+	}
+	// 工具榜：read_file 出现在两条记录共 3 次、bash 1 次，按次数降序。
+	if len(summary.Tools) != 2 || summary.Tools[0].Name != "read_file" || summary.Tools[0].Count != 2 || summary.Tools[1].Name != "bash" {
+		t.Fatalf("tools: %+v", summary.Tools)
 	}
 }
 
@@ -210,8 +244,10 @@ func TestProxyLedgerRecordsToolsCount(t *testing.T) {
 		t.Fatal(err)
 	}
 	body := `{"model":"free","messages":[{"role":"user","content":"hi"}],"tools":[{"type":"function","function":{"name":"a"}},{"type":"function","function":{"name":"b"}}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	req.Header.Set("User-Agent", "test-agent/9.9")
 	rec := httptest.NewRecorder()
-	r.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body)))
+	r.Handler().ServeHTTP(rec, req)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("proxy: %d body=%s", rec.Code, rec.Body.String())
 	}
@@ -221,5 +257,76 @@ func TestProxyLedgerRecordsToolsCount(t *testing.T) {
 	}
 	if summary.Totals.WithTools != 1 {
 		t.Fatalf("with_tools=%d, want 1", summary.Totals.WithTools)
+	}
+	// 元数据三件套：RemoteAddr 去端口、UA 透传、工具名 JSON 数组。
+	if len(summary.Clients) != 1 || summary.Clients[0].ClientIP == "" {
+		t.Fatalf("clients: %+v", summary.Clients)
+	}
+	// httptest.NewRequest 的 RemoteAddr 是 192.0.2.1:1234，应去掉端口。
+	if summary.Clients[0].ClientIP != "192.0.2.1" {
+		t.Fatalf("client ip=%q", summary.Clients[0].ClientIP)
+	}
+	if len(summary.Agents) != 1 || summary.Agents[0].Agent != "test-agent/9.9" {
+		t.Fatalf("agents: %+v", summary.Agents)
+	}
+	if len(summary.Tools) != 2 || summary.Tools[0].Name != "a" || summary.Tools[1].Name != "b" {
+		t.Fatalf("tools: %+v", summary.Tools)
+	}
+}
+
+func TestProxyClientIPTrustForwardedFor(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"1","choices":[{"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}`))
+	}))
+	defer upstream.Close()
+
+	build := func(trust bool) *Router {
+		t.Helper()
+		db, err := sql.Open("sqlite3", ":memory:")
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { db.Close() })
+		if err := Migrate(context.Background(), db); err != nil {
+			t.Fatal(err)
+		}
+		r, err := New(Config{RequestTimeout: time.Second, TrustForwardedFor: trust, Routes: map[string]Route{"free": {Candidates: []Candidate{{
+			ID: "u", BaseURL: upstream.URL, Model: "up",
+		}}}}}, db)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return r
+	}
+	post := func(r *Router) {
+		t.Helper()
+		req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"free","messages":[{"role":"user","content":"hi"}]}`))
+		req.Header.Set("X-Forwarded-For", "203.0.113.7, 10.0.0.9")
+		rec := httptest.NewRecorder()
+		r.Handler().ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("proxy: %d", rec.Code)
+		}
+	}
+
+	rTrue := build(true)
+	post(rTrue)
+	summary, err := rTrue.db.Summary(context.Background(), time.Now().Add(-time.Hour), 13)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(summary.Clients) != 1 || summary.Clients[0].ClientIP != "203.0.113.7" {
+		t.Fatalf("trusted XFF should record first hop: %+v", summary.Clients)
+	}
+
+	rFalse := build(false)
+	post(rFalse)
+	summary, err = rFalse.db.Summary(context.Background(), time.Now().Add(-time.Hour), 13)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(summary.Clients) != 1 || summary.Clients[0].ClientIP != "192.0.2.1" {
+		t.Fatalf("untrusted XFF must fall back to RemoteAddr: %+v", summary.Clients)
 	}
 }

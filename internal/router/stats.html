@@ -72,7 +72,7 @@
   .kpis { display: grid; grid-template-columns: repeat(auto-fit, minmax(178px, 1fr)); gap: 12px; margin-bottom: 14px; }
   .card {
     background: var(--card); border: 1px solid var(--border); border-radius: 16px;
-    padding: 16px 18px; position: relative; overflow: hidden;
+    padding: 16px 18px; position: relative; overflow-x: auto; overflow-y: hidden;
     box-shadow: 0 1px 0 rgba(255,255,255,.04) inset, 0 12px 32px -18px rgba(0,0,0,.55);
   }
   @media (prefers-color-scheme: light) {
@@ -121,7 +121,7 @@
   tr:last-child td { border-bottom: 0; }
   td.num, th.num { text-align: right; font-family: var(--mono); white-space: nowrap; font-feature-settings: "tnum" 1; }
   td code, .failbar-row code { font-family: var(--mono); font-size: 12.5px; }
-  .barcell { position: relative; min-width: 120px; }
+  .barcell { position: relative; min-width: 84px; }
   .barcell .fill {
     position: absolute; inset: 4px auto 4px 0; border-radius: 4px;
     background: linear-gradient(90deg, rgba(129,140,248,.34), rgba(34,211,238,.18));
@@ -131,7 +131,11 @@
   .failbar-row { display: grid; grid-template-columns: minmax(112px, auto) 1fr auto; gap: 12px; align-items: center; padding: 7px 0; }
   .failbar-track { height: 7px; background: var(--track); border-radius: 4px; overflow: hidden; }
   .failbar-fill { height: 100%; border-radius: 4px; background: linear-gradient(90deg, #FB7185, #F43F5E); box-shadow: 0 0 10px rgba(251,113,133,.35); }
+  .failbar-fill.agent { background: linear-gradient(90deg, #818CF8, #C084FC); box-shadow: 0 0 10px rgba(129,140,248,.35); }
+  .failbar-fill.tool { background: linear-gradient(90deg, #22D3EE, #0EA5E9); box-shadow: 0 0 10px rgba(34,211,238,.3); }
   .failbar-row .count { font-family: var(--mono); }
+  .stack { display: flex; flex-direction: column; gap: 12px; min-width: 0; }
+  .stack .card { flex: 1; }
   details { margin-top: 10px; color: var(--muted); }
   details summary { cursor: pointer; font-size: 12px; }
   details summary:hover { color: var(--fg); }
@@ -166,10 +170,19 @@
     <svg id="chart" viewBox="0 0 720 250" role="img" aria-label="按时间分桶的调用次数柱状图与成功率折线图"></svg>
     <details><summary>查看数据表</summary><table id="chart-table"><thead><tr><th>时间桶</th><th class="num">调用</th><th class="num">失败</th><th class="num">成功率</th></tr></thead><tbody></tbody></table></details>
   </section>
-  <section class="card">
-    <h2>失败分类</h2>
-    <div id="failures"></div>
-  </section>
+  <div class="stack">
+    <section class="card">
+      <h2>失败分类</h2>
+      <div id="failures"></div>
+    </section>
+    <section class="card">
+      <h2>调用方 IP</h2>
+      <table id="clients">
+        <thead><tr><th>IP</th><th class="num">调用</th><th class="num">成功率</th><th class="num">最近活动</th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </section>
+  </div>
 </div>
 <section class="card">
   <h2>模型分布 · route → upstream_model</h2>
@@ -178,7 +191,26 @@
     <tbody></tbody>
   </table>
 </section>
-<footer>数据来自 llm_requests 台账（请求侧元数据，不含对话内容）。usage_source=unavailable 的请求 token 计为零。</footer>
+<div class="grid2">
+  <section class="card">
+    <h2>上游候选 · upstream_id</h2>
+    <table id="upstreams">
+      <thead><tr><th>候选</th><th class="num">调用</th><th class="num">成功率</th><th class="num">tokens</th><th class="num">平均延迟</th></tr></thead>
+      <tbody></tbody>
+    </table>
+  </section>
+  <div class="stack">
+    <section class="card">
+      <h2>客户端</h2>
+      <div id="agents"></div>
+    </section>
+    <section class="card">
+      <h2>工具榜 · 请求侧</h2>
+      <div id="tools"></div>
+    </section>
+  </div>
+</div>
+<footer>数据来自 llm_requests 台账（请求侧元数据，不含对话内容）。usage_source=unavailable 的请求 token 计为零；client_ip / client_agent / 工具名为调用方元数据，直连部署记录 TCP 对端地址，开启 trust_forwarded_for 后取 X-Forwarded-For 首值。</footer>
 <script>
 "use strict";
 const $ = (id) => document.getElementById(id);
@@ -234,6 +266,10 @@ function render(d) {
   renderChart(d.series);
   renderFailures(d.failures);
   renderModels(d.models);
+  renderUpstreams(d.upstreams);
+  renderClients(d.clients);
+  renderAgents(d.agents);
+  renderTools(d.tools);
 }
 function renderChart(series) {
   const svg = $("chart");
@@ -327,16 +363,74 @@ function renderModels(models) {
   const maxCalls = Math.max(...models.map(m => m.calls), 1);
   tb.innerHTML = models.map(m => {
     const pct = m.success * 100 / m.calls;
-    const rate = pct.toFixed(1) + "%";
     const cls = m.success === m.calls ? "rate-ok" : (pct >= 95 ? "" : "rate-bad");
-    const pill = '<span class="pill ' + (m.success === m.calls ? "ok" : pct >= 95 ? "" : "bad") + '">' + rate + "</span>";
-    return "<tr><td><code>" + m.route + "</code></td><td><code>" + m.upstream_model + "</code></td>"
+    const pill = '<span class="pill ' + (m.success === m.calls ? "ok" : pct >= 95 ? "" : "bad") + '">' + pct.toFixed(1) + "%</span>";
+    return "<tr><td><code>" + esc(m.route) + "</code></td><td><code>" + esc(m.upstream_model) + "</code></td>"
       + '<td class="num barcell"><span class="fill" style="width:' + (m.calls * 100 / maxCalls).toFixed(1) + '%"></span><span>' + fmtInt(m.calls) + "</span></td>"
       + '<td class="num ' + cls + '">' + pill + "</td>"
       + '<td class="num">' + fmtInt(m.total_tokens) + "</td>"
       + '<td class="num">' + m.avg_latency_ms + "ms</td></tr>";
   }).join("");
 }
+function renderUpstreams(upstreams) {
+  const tb = $("upstreams").querySelector("tbody");
+  if (!upstreams.length) {
+    tb.innerHTML = '<tr><td colspan="5" class="empty">该时间范围内没有请求</td></tr>';
+    return;
+  }
+  const maxCalls = Math.max(...upstreams.map(u => u.calls), 1);
+  tb.innerHTML = upstreams.map(u => {
+    const pct = u.success * 100 / u.calls;
+    const cls = u.success === u.calls ? "rate-ok" : (pct >= 95 ? "" : "rate-bad");
+    const pill = '<span class="pill ' + (u.success === u.calls ? "ok" : pct >= 95 ? "" : "bad") + '">' + pct.toFixed(1) + "%</span>";
+    return "<tr><td><code>" + esc(u.upstream_id) + "</code></td>"
+      + '<td class="num barcell"><span class="fill" style="width:' + (u.calls * 100 / maxCalls).toFixed(1) + '%"></span><span>' + fmtInt(u.calls) + "</span></td>"
+      + '<td class="num ' + cls + '">' + pill + "</td>"
+      + '<td class="num">' + fmtInt(u.total_tokens) + "</td>"
+      + '<td class="num">' + u.avg_latency_ms + "ms</td></tr>";
+  }).join("");
+}
+function renderClients(clients) {
+  const tb = $("clients").querySelector("tbody");
+  if (!clients.length) {
+    tb.innerHTML = '<tr><td colspan="4" class="empty">该时间范围内没有请求</td></tr>';
+    return;
+  }
+  const maxCalls = Math.max(...clients.map(c => c.calls), 1);
+  tb.innerHTML = clients.map(c => {
+    const pct = c.success * 100 / c.calls;
+    const pill = '<span class="pill ' + (c.success === c.calls ? "ok" : pct >= 95 ? "" : "bad") + '">' + pct.toFixed(1) + "%</span>";
+    return "<tr><td><code>" + esc(c.client_ip) + "</code></td>"
+      + '<td class="num barcell"><span class="fill" style="width:' + (c.calls * 100 / maxCalls).toFixed(1) + '%"></span><span>' + fmtInt(c.calls) + "</span></td>"
+      + '<td class="num">' + pill + "</td>"
+      + '<td class="num">' + esc(formatLastSeen(c.last_seen)) + "</td></tr>";
+  }).join("");
+}
+function formatLastSeen(ts) {
+  // RFC3339 UTC → "MM-DD HH:MM"（UTC），过长原文截断兜底。
+  if (!ts || ts.length < 16) return ts || "–";
+  return ts.slice(5, 16).replace("T", " ");
+}
+function renderAgents(agents) {
+  renderBars(agents.map(a => ({ name: a.agent, count: a.calls })), "agents", "agent");
+}
+function renderTools(tools) {
+  renderBars(tools.map(t => ({ name: t.name, count: t.count })), "tools", "tool");
+}
+function renderBars(items, boxId, fillCls) {
+  const box = $(boxId);
+  if (!items.length) {
+    box.innerHTML = '<div class="empty">窗口内无数据</div>';
+    return;
+  }
+  const max = Math.max(...items.map(x => x.count), 1);
+  box.innerHTML = items.map(x =>
+    '<div class="failbar-row"><code>' + esc(x.name)
+    + '</code><div class="failbar-track"><div class="failbar-fill ' + fillCls + '" style="width:' + (x.count * 100 / max).toFixed(1) + '%"></div></div>'
+    + '<span class="count">' + fmtInt(x.count) + "</span></div>"
+  ).join("");
+}
+const esc = (s) => String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;");
 document.querySelectorAll(".seg button").forEach(btn => {
   btn.addEventListener("click", () => {
     document.querySelectorAll(".seg button").forEach(b => b.setAttribute("aria-pressed", "false"));
