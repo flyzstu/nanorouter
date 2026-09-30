@@ -31,8 +31,14 @@ cp config.example.yaml config.yaml
 export NANOROUTER_API_KEY='replace-with-a-local-secret'
 export OPENROUTER_API_KEY='...'
 export GROQ_API_KEY='...'
-go run ./cmd/nanorouter -config config.yaml
+go run ./cmd/nanorouter --config config.yaml
 ```
+
+CLI 基于 cobra：`nanorouter --help` 列出全部命令与旗标（`-c` 是 `--config` 的短写），
+`nanorouter --version` 查看构建注入的版本号（本地构建默认 `dev`，`make build` 注入
+git tag/describe，容器镜像由 CI 传入 tag 或分支名），子命令 `login-zcode` 见
+[ZCode Coding Plan 上游](#zcode-coding-plan-上游anthropic-messages-网关)。注意旗标
+是双横线风格：旧命令行的 `--config` 需改为 `--config` 或 `-c`。
 
 日志语言和最低输出等级可在配置文件中设置：
 
@@ -46,7 +52,7 @@ logging:
 
 中文模式只翻译日志消息；用于检索和告警的结构化字段名及 `event` 值保持英文稳定。默认输出
 带颜色的 `key=value` 文本；日志采集系统需要 JSON 时可设置 `format: json`，此时 `color` 不生效。
-`-debug` 会强制使用彩色文本日志，并将本次启动的日志等级覆盖为 `DEBUG`。
+`--debug` 会强制使用彩色文本日志，并将本次启动的日志等级覆盖为 `DEBUG`。
 
 ## 数据库
 
@@ -70,7 +76,7 @@ database:
 
 ```sh
 export NANOROUTER_POSTGRES_DSN='postgresql://nanorouter:replace-me@postgres:5432/nanorouter?sslmode=require&connect_timeout=5'
-go run ./cmd/nanorouter -config config.yaml
+go run ./cmd/nanorouter --config config.yaml
 ```
 
 两种数据库共享 `llm_requests` 账本表和迁移逻辑；PostgreSQL 会使用其原生参数占位符，SQLite

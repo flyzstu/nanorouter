@@ -6,62 +6,59 @@ package main
 
 import (
 	"context"
-	"flag"
 	"fmt"
-	"os"
 	"os/exec"
 	"runtime"
 	"time"
 
+	"github.com/spf13/cobra"
+
 	"github.com/nanorouter/nanorouter/internal/router"
 )
 
-const loginZcodeUsage = `usage: nanorouter login-zcode [-channel bigmodel|zai] [-gateway URL] [-timeout 5m] [-no-browser]
-
-Runs the ZCode Coding Plan device authorization flow: opens the provider's
+// newLoginZcodeCommand 组装 login-zcode 子命令，旗标与旧 flag 版本一致。
+func newLoginZcodeCommand() *cobra.Command {
+	var (
+		channel   string
+		gateway   string
+		timeout   time.Duration
+		noBrowser bool
+	)
+	cmd := &cobra.Command{
+		Use:   "login-zcode",
+		Short: "Run the ZCode Coding Plan device authorization flow and store the credential",
+		Long: `Runs the ZCode Coding Plan device authorization flow: opens the provider's
 approval page, polls the gateway until the OAuth token lands, exchanges it
 for the servable id.secret key, validates the key against the gateway, and
 stores it in ~/.nanorouter/zcode_token.json (read back by candidates with
-zcode_token_file: true).
-`
-
-// runZcodeLoginCommand 解析 login-zcode 的旗标并执行登录链。
-// 返回进程退出码。
-func runZcodeLoginCommand(args []string) int {
-	fs := flag.NewFlagSet("login-zcode", flag.ContinueOnError)
-	fs.SetOutput(os.Stderr)
-	channel := fs.String("channel", router.ZcodeChannelBigmodel, "Coding Plan channel: bigmodel or zai")
-	gateway := fs.String("gateway", router.ZcodeDefaultOrigin, "gateway origin for device polling and probing")
-	timeout := fs.Duration("timeout", router.ZcodeLoginTimeout, "how long to wait for approval")
-	noBrowser := fs.Bool("no-browser", false, "do not attempt to open the authorization page automatically")
-	if err := fs.Parse(args); err != nil {
-		fmt.Fprint(os.Stderr, loginZcodeUsage)
-		return 2
+zcode_token_file: true).`,
+		Args: cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			ctx, cancel := context.WithTimeout(context.Background(), timeout+time.Minute)
+			defer cancel()
+			opts := router.ZcodeLoginOptions{
+				GatewayOrigin: gateway,
+				Channel:       channel,
+				PollTimeout:   timeout,
+				Output:        cmd.ErrOrStderr(),
+			}
+			if !noBrowser {
+				opts.OpenBrowser = openBrowser
+			}
+			path, err := router.RunZcodeLogin(ctx, opts)
+			if err != nil {
+				return err
+			}
+			fmt.Fprintf(cmd.ErrOrStderr(), "login-zcode: configure the candidate with zcode_token_file: true and zcode_channel: %s\n", channel)
+			fmt.Fprintf(cmd.ErrOrStderr(), "login-zcode: credential file: %s\n", path)
+			return nil
+		},
 	}
-	if fs.NArg() > 0 {
-		fmt.Fprintf(os.Stderr, "unexpected argument %q\n", fs.Arg(0))
-		fmt.Fprint(os.Stderr, loginZcodeUsage)
-		return 2
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), *timeout+time.Minute)
-	defer cancel()
-	opts := router.ZcodeLoginOptions{
-		GatewayOrigin: *gateway,
-		Channel:       *channel,
-		PollTimeout:   *timeout,
-		Output:        os.Stderr,
-	}
-	if !*noBrowser {
-		opts.OpenBrowser = openBrowser
-	}
-	path, err := router.RunZcodeLogin(ctx, opts)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "login-zcode: %v\n", err)
-		return 1
-	}
-	fmt.Fprintf(os.Stderr, "login-zcode: configure the candidate with zcode_token_file: true and zcode_channel: %s\n", *channel)
-	fmt.Fprintf(os.Stderr, "login-zcode: credential file: %s\n", path)
-	return 0
+	cmd.Flags().StringVar(&channel, "channel", router.ZcodeChannelBigmodel, "Coding Plan channel: bigmodel or zai")
+	cmd.Flags().StringVar(&gateway, "gateway", router.ZcodeDefaultOrigin, "gateway origin for device polling and probing")
+	cmd.Flags().DurationVar(&timeout, "timeout", router.ZcodeLoginTimeout, "how long to wait for approval")
+	cmd.Flags().BoolVar(&noBrowser, "no-browser", false, "do not attempt to open the authorization page automatically")
+	return cmd
 }
 
 // openBrowser 尽力而为地打开系统浏览器；失败由调用方提示手动打开。

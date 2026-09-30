@@ -4,7 +4,6 @@ import (
 	"context"
 	"database/sql"
 	"errors"
-	"flag"
 	"net/http"
 	"os"
 	"os/signal"
@@ -15,25 +14,50 @@ import (
 	_ "github.com/lib/pq"
 	"github.com/nanorouter/nanorouter/internal/router"
 	_ "github.com/ncruces/go-sqlite3/driver"
+	"github.com/spf13/cobra"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 )
 
-func main() {
-	// login-zcode 是独立子命令：不走 -config/-debug 的旗标解析。
-	if len(os.Args) > 1 && os.Args[1] == "login-zcode" {
-		os.Exit(runZcodeLoginCommand(os.Args[2:]))
-	}
-	configPath := flag.String("config", "config.yaml", "path to YAML configuration")
-	debug := flag.Bool("debug", false, "enable colored console debug logs")
-	flag.Parse()
+// version 由构建期 ldflags 注入（-X main.version=...），未注入时显示 dev。
+var version = "dev"
 
-	cfg, err := router.LoadConfig(*configPath)
+// newRootCommand 组装根命令：不带子命令时启动网关服务，--version 查看版本。
+func newRootCommand() *cobra.Command {
+	var configPath string
+	var debug bool
+	root := &cobra.Command{
+		Use:     "nanorouter",
+		Short:   "OpenAI/Anthropic-compatible LLM routing gateway",
+		Version: version,
+		Args:    cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			runServer(configPath, debug)
+			return nil
+		},
+		SilenceUsage:  true,
+		SilenceErrors: true,
+	}
+	root.Flags().StringVarP(&configPath, "config", "c", "config.yaml", "path to YAML configuration")
+	root.Flags().BoolVar(&debug, "debug", false, "enable colored console debug logs")
+	root.AddCommand(newLoginZcodeCommand())
+	root.CompletionOptions.DisableDefaultCmd = true
+	return root
+}
+
+func main() {
+	if err := newRootCommand().Execute(); err != nil {
+		os.Exit(1)
+	}
+}
+
+func runServer(configPath string, debug bool) {
+	cfg, err := router.LoadConfig(configPath)
 	if err != nil {
 		logger, _ := zap.NewProduction()
 		logger.Fatal("load configuration failed", zap.Error(err))
 	}
-	logger, err := newLogger(cfg.Logging.Level, cfg.Logging.Format, cfg.Logging.ColorEnabled(), *debug)
+	logger, err := newLogger(cfg.Logging.Level, cfg.Logging.Format, cfg.Logging.ColorEnabled(), debug)
 	if err != nil {
 		panic(err)
 	}
@@ -63,7 +87,9 @@ func main() {
 		logger.Fatal(message("create router failed", "创建路由器失败"), zap.Error(err))
 	}
 	server := &http.Server{Addr: cfg.Listen, Handler: srv.Handler(), ReadHeaderTimeout: 10 * time.Second}
-	logger.Info(message("nanorouter started", "nanorouter 已启动"), zap.String("listen", cfg.Listen), zap.String("database_driver", cfg.Database.Driver))
+	logger.Info(message("nanorouter started", "nanorouter 已启动"),
+		zap.String("version", version),
+		zap.String("listen", cfg.Listen), zap.String("database_driver", cfg.Database.Driver))
 	runErr := make(chan error, 1)
 	go func() { runErr <- server.ListenAndServe() }()
 	shutdownSignal, stopSignals := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)

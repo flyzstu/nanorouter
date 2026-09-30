@@ -19,7 +19,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Build image
-        run: docker build --pull --tag "$IMAGE:$IMAGE_TAG" .
+        run: docker build --pull --build-arg VERSION="${{ gitea.ref_name }}" --tag "$IMAGE:$IMAGE_TAG" .
 
       - name: Log in to Gitea container registry
         if: gitea.event_name == 'push' || gitea.event_name == 'workflow_dispatch'

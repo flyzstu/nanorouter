@@ -270,7 +270,7 @@ SQLite 可选异步批量写：正常关闭会排空队列，队列溢出或异�
 有界 context（不受客户端取消影响），因此下游断开连接时记录仍会落库。实时熔断、并发窗口、
 背压队列和 Retry Budget 当前都是单实例内存状态，数据库不会改变它们。
 
-运行日志使用 Zap 的结构化 JSON；`-debug` 则用相同字段输出稳定的 `key=value` 文本。每个请求以
+运行日志使用 Zap 的结构化 JSON；`--debug` 则用相同字段输出稳定的 `key=value` 文本。每个请求以
 `request_started` 开始，随后记录 `upstream_attempt_started`、`upstream_attempt_finished` 和必要时的
 `retry_scheduled`，并以 `request_completed` 或 `request_failed` 收束。所有事件共享 `request_id`，方便
 Loki、Elasticsearch 或 `jq` 追踪。开始事件将客户端 IP、User-Agent、请求体大小和会话亲和键是否存在
