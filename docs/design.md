@@ -49,6 +49,9 @@ Agent / Open WebUI
 | `router.go` | 鉴权、选路、转发、切换 | 解释每一种模型参数语义 |
 | `usage.go` | 从 JSON/SSE 提取用量 | 用 tokenizer 猜缺失 token |
 | `store.go` | 建表、写调用账本 | 保存 prompt、回复或密钥 |
+| `responses_adapter.go` | Responses→Chat 受限降级 | 承诺 100% Responses 语义 |
+| `anthropic_adapter.go` | Chat↔Messages 双向翻译与 SSE 事件改写 | 映射不可表达的 OpenAI 特性（显式 400） |
+| `zcode.go` / `zcode_login.go` | ZCode 网关常量、id 派生、凭据文件、登录链 | 写参考客户端的 token 文件 |
 
 代理只将 JSON 解为 `map[string]any`，修改 `model` 后重新编码，保留其余字段。因此 `tools`、图片、结构化输出等新增字段不需要随网关升级逐一建模。
 
@@ -88,7 +91,7 @@ Agent / Open WebUI
 
 ## 一次请求的生命周期
 
-1. 客户端向 `/v1/chat/completions` 或 `/v1/responses` 发请求。网关只接受这两种生成协议，
+1. 客户端向 `/v1/chat/completions`、`/v1/responses` 或 `/v1/messages` 发请求。网关只接受这三种生成协议（后两种均含无 `/v1` 的兼容形式），
    不提供旧式 `/v1/completions` 入口。
 2. 网关先通过可选的全局背压准入，再限制请求体最大 16 MiB，解析 JSON 并读取 `model` 作为
    逻辑路由名。未知路由、非法 JSON 或鉴权失败在本地结束，不产生上游请求。
@@ -124,7 +127,7 @@ limiter 以 `min_concurrency` 起步：有排队且 TTFB 达标时加性增长�
 加权槽位；候选冷却、拥塞或请求内失败后仍允许选择其他候选。缺少或空白 Header 时保持原有轮转行为。
 
 收到可故障切换错误后，上游进入冷却。未启用主动探活时，冷却结束进入半开状态，由首个真实请求作为探针；探针成功关闭
-熔断器，失败则重新冷却，避免并发流量在同一时刻冲回上游。当候选（或全局）配置 `probe: true` 启用健康探活时，网关转由后台异步探针（Prober）接管半开检查：候选在熔断冷却期间被严格隔离，真实用户请求直接故障切换（或在 `expose_as` 直连时本地秒回 503），绝不向上游发包傻等；冷却到期时由后台发起极简 Ping 请求（`max_tokens: 5` 并关停思维链），校验必须收到有效 token 生成或非空 `reasoning_content`（拦截 200 伪成功与空 choices）。探测成功自动清零失败计数并恢复候选池；探测失败则按指数退避（30s、60s、120s... 上限 `max_backoff`）延后下一次探测，既避免真实用户当“探路小白鼠”，又保证健康期内零心跳、零额度消耗。对于 429，当前请求会先尝试其他候选；如果一轮候选都不可用，
+熔断器，失败则重新冷却，避免并发流量在同一时刻冲回上游。当候选（或全局）配置 `probe: true` 启用健康探活时，网关转由后台异步探针（Prober）接管半开检查：候选在熔断冷却期间被严格隔离，真实用户请求直接故障切换（或在 `expose_as` 直连时本地秒回 503），绝不向上游发包傻等；冷却到期时由后台发起极简 Ping 请求（`max_tokens: 5`；OpenAI 候选额外关停思维链，Anthropic 候选发 Messages 形状、不注入推理参数），校验必须收到有效 token 生成或非空 `reasoning_content`（Messages 候选为非空内容块或正输出 token，拦截 200 伪成功与空 choices）。探测成功自动清零失败计数并恢复候选池；探测失败则按指数退避（30s、60s、120s... 上限 `max_backoff`）延后下一次探测，既避免真实用户当“探路小白鼠”，又保证健康期内零心跳、零额度消耗。对于 429，当前请求会先尝试其他候选；如果一轮候选都不可用，
 则按 `retry` 配置在网关内重试。默认指数窗口为 1、2、4、8、16 秒，每次实际等待随机落在该窗口的
 50%–100%，避免并发实例同步重试。每个候选的 `Retry-After` 都是其最小冷却时间；当前请求只等到最早可恢复的候选，而不会被最慢候选拖住。每次重试都受整个 `request_timeout` 和客户端取消信号约束，因而不会要求下游盲目重复提交。
 其他可重试错误仍采用 30 秒冷却（有 `Retry-After` 时优先服从）。这是适合单实例的轻量熔断器；多实例时
@@ -166,13 +169,15 @@ Nous Research 为例，网关请求其 `/v1/chat/completions`，`/v1/responses` 
 
 ## 协议边界与能力声明
 
-网关公开两个生成入口：`/v1/chat/completions` 和 `/v1/responses`。上游实际调用由候选能力决定：
+网关公开三个生成入口：`/v1/chat/completions`、`/v1/responses` 和 `/v1/messages`。上游实际调用由候选能力决定：
 
 | 下游请求 | 候选配置 | 上游请求 |
 | --- | --- | --- |
 | Chat Completions | 任意可用候选 | 默认 `/chat/completions`，仅替换 `model` |
 | Responses | `responses: true` | 原生 `/responses`，尽量保留原始 schema |
 | Responses | `responses_via_chat_completions: true` | 转换为 `/chat/completions`，再包装回 Responses |
+| Messages（`/v1/messages`） | `anthropic: true` | 原样转发到 Anthropic Messages 路径 |
+| Chat / Responses | `anthropic: true` | Chat↔Messages 双向翻译（Responses 经 Chat 链式） |
 
 配置中的 `responses: true` 是上游能力声明；Responses 请求会跳过没有该标记的候选。Chat
 Completions 与原生 Responses 不会互相转换 schema，只有显式启用 `responses_via_chat_completions`
@@ -205,9 +210,23 @@ Cerebras `gpt-oss-120b` 与 Mistral 一样使用原生 Chat Completions 加 Resp
 
 SSE 首字节发给下游后不能再安全换模型：会重复文字，或破坏 function-call ID 和参数。因此只有连接建立前、或可见 HTTP 状态码阶段的故障可切换；已经成功开始的流只透明转发。
 
-实现按行读取 SSE，不将长回答完整缓存在内存；它观察 `data:` 内 JSON，最后采集到的 `usage` 写入账本，但绝不改写下游收到的事件。
+实现按行读取 SSE，不将长回答完整缓存在内存；它观察 `data:` 内 JSON，最后采集到的 `usage` 写入账本，但绝不改写下游收到的事件。`message_start` 与 `message_delta` 分段携带的 usage 按"各字段取已见最大值"合并——输出侧是累计值，合并对 OpenAI 单帧 usage 语义无影响。
 
 下游客户端取消（断开连接）会取消请求 context，使对上游流的读取中断，但这不代表上游故障：网关区分 `client_canceled` 与真正的上游流错误，只有后者才会冷却候选并计入故障切换，避免一次客户端取消导致该路由在 30 秒内全部 503。
+
+## ZCode Coding Plan（Anthropic Messages 上游）
+
+智谱的 ZCode Coding Plan 网关说 Anthropic Messages 协议，与本项目其余上游的 OpenAI 方言不同。移植其访问链（常量、头契约、id 派生、登录兑换）时以 dsh-zhipu-provider 插件为唯一移植源——该插件又复制自参考客户端 `zcode_coding_plan_client.py`；网关路径、客户端版本与 anthropic-version 是上游合同，不做本地改名。
+
+**两个端点、三种路径。** 下游新增 `/v1/messages`（含无 `/v1` 兼容形式）：同方言透传，只有头部注入、模型名替换与路径改写，SSE 逐字节转发、usage 旁观采集，是验证网关真实行为的最短路径。OpenAI 方言下游走双向翻译：Chat→Messages 请求翻译 + Messages→Chat 响应/SSE 翻译；Responses 请求先经既有 Responses→Chat 降级，再接 Chat→Messages，响应按反向链路折返——每一跳独立可测，不存在三方言一步转换。翻译在候选选中后执行（与其他适配一致），故障切换时下一候选看到的是未被污染的原始下游请求。
+
+**显式失败优先。** 不可映射的下游特性（`n > 1`、`response_format` 结构化输出、非零惩罚、`logit_bias`、`logprobs`）在本地 400 `unsupported_openai_feature`，不产生上游调用——换模型会掩盖请求语义，静默丢弃会伪造等价。两处已知无声降级是经过权衡的例外：assistant 历史的 `reasoning_content`（Anthropic 拒绝未签名思维块，无签名可补）与 OpenAI 记账字段（`store`/`metadata`/`user`/`service_tier`/`seed`/`stream_options`，无生成语义）。`parallel_tool_calls` 与 `verbosity` 同属白名单式映射的自然舍弃：单候选语义下无观察差异，Anthropic 侧无对应参数。流式 Responses 链上的 thinking_delta 同理：合成的 `reasoning_content` chunk 在 Responses 事件合成器中静默丢弃（Responses 侧无 reasoning delta 事件可承载），文本与工具增量不受影响。错误信封同样按方言改写：Anthropic 的 `{"type":"error",...}` 发往 OpenAI 下游前改写为 `{"error":{...}}`，messages 端点保持原样。
+
+**客户端仿真是头集而不是载荷改写。** `simulate_zcode` 复刻 ZCode 桌面客户端的 CLI 身份/平台指纹头、双凭据头与 `anthropic-version`；会话 id 从对话首个 user turn 的 JSON 做 sha256 截断派生（同一会话稳定、跨会话互异、不可逆），请求/追踪 id 每请求全新。与 `simulate_opencode` 不同，Messages 载荷无需注入 thinking 或补流式参数——那是 OpenAI 方言网关的特有要求。
+
+**凭据两套存储、一个写入方。** login-zcode 子命令执行设备码轮询（init → 授权 URL → poll → 兑换 → 探测），把兑换并经 `max_tokens: 1` 网关探测验证的 `id.secret` key 写入 `~/.nanorouter/zcode_token.json`（0600，渠道分组，连同平台 JWT 与 OAuth token）；候选经 `zcode_token_file: true` 只读回退，参考客户端的 `~/.zcode_coding_plan_token.json` 只读次之。参考客户端的文件永远只读：两个程序共享一份存储，写入会竞态。网关 401/403 能证伪 key，网关不可达不能——把瞬时故障误报成"key 无效"比多一次探测更糟，因此不可达视为通过。凭据文件带 5 秒进程内缓存：参考客户端至多每次登录重写一次，而请求路径每次环境变量未命中都会来读。
+
+**单实例边界不变。** Anthropic 候选的熔断、并发、重试预算、全局背压与其他候选共享同一套机制与状态；`/v1/messages` 端点的错误方言随端点切换（Anthropic 信封），鉴权中间件按路径后缀选方言。探测（Prober）对 Anthropic 候选发 Messages 形状的极简 Ping，有效性判定与 OpenAI 侧同语义（拦截 200 伪成功与空内容）。
 
 ## go-json 的位置
 

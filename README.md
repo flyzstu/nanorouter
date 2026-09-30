@@ -6,7 +6,9 @@
 
 - `POST /v1/chat/completions`
 - `POST /v1/responses`（包括 SSE 原样透传）
+- `POST /v1/messages`（Anthropic Messages 透传，含无 `/v1` 兼容形式）
 - `GET /v1/models`
+- `nanorouter login-zcode`：ZCode Coding Plan 设备码登录子命令
 - 每个上游的加权轮转、429/错误冷却与请求内指数退避重试
 - SQLite 调用账本、Prometheus `/metrics`
 - Chat Completions 与 Responses 的非流式/流式 `usage` 采集
@@ -233,6 +235,22 @@ Nous 的 Free 级别有独立的 RPM/TPM 限制；请先确认账户额度和 `N
 
 网关全面接入智谱专有编码端点 `https://open.bigmodel.cn/api/coding/paas/v4`，环境变量支持 `ZHIPU_API_KEY`（或 `ZHIPUAI_API_KEY`）。模型支持 `glm-5.3` 与 `glm-5.3-flash`，并深度模拟 OpenCode 客户端协议（伪装 User-Agent、自动注入 thinking 思维链与流式 include_usage、透传会话亲和性头，并剔除不支持的缓存字段）。下游可直接通过通用端点 `/v1/chat/completions`（指定 `model: glm-5.3` 或路由名 `zhipuaicoding`）访问，也可使用 `/zhipu-aicoding/v1`（或 `/zhipuaicoding/v1`）专属端点路径。
 
+## ZCode Coding Plan 上游（Anthropic Messages 网关）
+
+网关接入智谱 ZCode Coding Plan 的 Anthropic Messages 网关（`https://zcode.z.ai`）。该上游是 Anthropic 协议：候选声明 `anthropic: true` 后原生服务网关新增的 `/v1/messages` 端点（Anthropic 形状客户端如 Claude Code、dsh 直接接入，SSE 同方言透传）；OpenAI 协议下游则继续请求 `/v1/chat/completions` 或 `/v1/responses`，网关自动完成 Chat↔Messages 双向翻译（Responses 走 Responses→Chat→Messages 链式降级）。
+
+`simulate_zcode: true` 深度模拟 ZCode 桌面客户端：发送 `User-Agent: ZCode/3.14.0` 与完整 CLI 身份/平台指纹头、`anthropic-version: 2023-06-01`、`x-api-key` + `Authorization: Bearer` 双凭据头，以及归因 id（`x-request-id`、`x-session-id`、`x-session-affinity`、`x-zcode-trace-id`）；会话 id 从对话首个 user turn 稳定派生（sha256 截断，不可逆），请求/追踪 id 每请求全新。上游路径按 `anthropic_messages_path`（显式覆盖）→ 渠道网关路径 → `v1/messages` 解析；`/v1/messages` 与 `/messages` 两个端点形式等价。对非 anthropic 路由请求 `/v1/messages` 会得到 503（Anthropic 错误信封）——该端点不服务 OpenAI 候选。`zcode_channel` 选择渠道（`bigmodel` 国内 ultra 路径 / `zai` 海外 ultra-zai 路径）——渠道是凭据的属性，同一批 `GLM-5.3` / `GLM-5.3-Flash` 模型在两个渠道上服务。
+
+```sh
+# 首次使用：设备码登录，兑换并验证 Coding Plan key，写入 ~/.nanorouter/zcode_token.json
+nanorouter login-zcode -channel bigmodel        # 或 -channel zai
+# 其余旗标：-gateway <origin>、-timeout <duration>、-no-browser
+```
+
+凭据按优先级解析：`api_key_env` 环境变量（支持 `ZCODE_API_KEY` 等自定义名）→ `zcode_token_file: true` 时回退读取 `~/.nanorouter/zcode_token.json`（login-zcode 写入）→ 参考客户端的 `~/.zcode_coding_plan_token.json`（只读；过期或 `eyJhbGci` 平台 JWT 会自动跳过）。登录链在落盘前会用一次 `max_tokens: 1` 请求向网关验证 key，拒绝即失败，绝不存储网关不接受的凭据；OAuth token 与平台 JWT 一并保存于凭据文件。
+
+翻译边界（显式 400 `unsupported_openai_feature`，不静默丢弃）：`n > 1`、`response_format` 结构化输出、非零 `presence/frequency_penalty`、`logit_bias`、`logprobs`、`top_logprobs`。下游未携带 `max_tokens` / `max_completion_tokens` 时，Messages 协议要求必填，网关默认注入 `max_tokens: 4096`——需要更长输出请显式传 `max_tokens`。已知无声降级记录于 design.md：assistant 历史的 `reasoning_content`（Anthropic 要求思维块签名，未签名的无法回传）、OpenAI 记账字段（`store`/`metadata` 等），以及白名单映射的自然舍弃 `parallel_tool_calls`/`verbosity`（流式 Responses 链上的 thinking_delta 同样不进入 Responses 事件）。`reasoning_effort` 映射为 thinking 预算（minimal→1K … max→32K），预算不足 `max_tokens` 时钳制，`"none"` 关闭。流式 usage 从 `message_start`（输入侧）与 `message_delta`（累计输出侧）合并采集，账本与 OpenAI 上游同一张表。
+
 ## OpenCode Go 上游
 
 [OpenCode Go](https://opencode.ai/docs/zh-cn/go/) 是低成本的编程模型订阅服务（首月 5 美元，之后每月 10 美元），提供一批经基准测试的开源编程模型。在 [opencode.ai/auth](https://opencode.ai/auth) 订阅并复制 API 密钥，由 `OPENCODE_GO_API_KEY` 注入：
@@ -260,7 +278,7 @@ OpenCode Go 的模型大多通过 OpenAI 兼容的 `chat/completions` 提供，�
 
 MiniMax（`minimax-m3`、`minimax-m2.7`、`minimax-m2.5`）与 Qwen（`qwen3.8-max`、`qwen3.7-max`、`qwen3.7-plus`、`qwen3.6-plus`）仅暴露 Anthropic 的 `/v1/messages` 端点，本网关目前不支持 Anthropic 协议，无法接入。
 
-订阅包含 5 小时（12 美元）、每周（30 美元）与每月（60 美元）用量限制，实际请求数取决于所用模型；可通过 `max_concurrency` 限制并发，或在达到额度时让聚合路由切换到其他候选。
+订阅包含 5 小时（12 美元）、每周（30 美元）与每月（60 美元）用量限制，实际请求数取决于所用模型；可通过 `max_concurrency` 限制并发，或在达到额度时让聚合路由切换到其他候选。仅暴露 Anthropic `/v1/messages` 的上游（如 MiniMax、Qwen）现在可经 `anthropic: true` 候选接入（见 ZCode Coding Plan 章节），但这些供应商未经实测，接入前需自行验证路径与字段兼容性。
 
 ## 上游字段兼容性清洗
 
