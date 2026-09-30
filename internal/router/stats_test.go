@@ -38,12 +38,15 @@ func insertStatsRecord(t *testing.T, store *Store, r Record) {
 func TestSummaryAggregatesTotalsRateAndTools(t *testing.T) {
 	store := statsTestStore(t)
 	now := time.Now().UTC()
+	// 锚定到小时中段：全部样本落在同一小时桶内，测试在整点附近运行也
+	// 不会因桶边界把 series 劈成两个点。
+	hourMid := now.Truncate(time.Hour).Add(30 * time.Minute)
 	records := []Record{
-		{Route: "free", UpstreamID: "u1", UpstreamModel: "glm-5.3", Endpoint: "chat_completions", Status: 200, LatencyMS: 100, Usage: Usage{Prompt: 10, Completion: 20, Total: 30, Source: "upstream"}, ToolsCount: 2, ToolNames: `["read_file","bash"]`, ClientIP: "10.0.0.1", ClientAgent: "claude-code/1.0", CreatedAt: now},
-		{Route: "free", UpstreamID: "u1", UpstreamModel: "glm-5.3", Endpoint: "chat_completions", Status: 200, LatencyMS: 300, Usage: Usage{Prompt: 1, Completion: 2, Total: 3, Source: "upstream"}, ClientIP: "10.0.0.1", ClientAgent: "claude-code/1.0", CreatedAt: now.Add(-time.Minute)},
-		{Route: "free", UpstreamID: "u1", UpstreamModel: "glm-5.3", Endpoint: "chat_completions", Status: 502, LatencyMS: 500, ErrorKind: "upstream_error", Usage: Usage{Source: "unavailable"}, ClientIP: "10.0.0.2", ClientAgent: "curl/8.0", CreatedAt: now.Add(-2 * time.Minute)},
-		{Route: "free", UpstreamID: "u1", UpstreamModel: "glm-5.3", Endpoint: "chat_completions", Status: 499, LatencyMS: 10, ErrorKind: "client_canceled", Usage: Usage{Source: "unavailable"}, ClientIP: "10.0.0.2", ClientAgent: "curl/8.0", CreatedAt: now.Add(-3 * time.Minute)},
-		{Route: "free", UpstreamID: "u2", UpstreamModel: "hermes-4", Endpoint: "chat_completions", Status: 200, LatencyMS: 700, Usage: Usage{Prompt: 5, Completion: 5, Total: 10, Source: "upstream"}, ToolNames: `["read_file"]`, ClientIP: "10.0.0.3", ClientAgent: "opencode/1.2", CreatedAt: now.Add(-4 * time.Minute)},
+		{Route: "free", UpstreamID: "u1", UpstreamModel: "glm-5.3", Endpoint: "chat_completions", Status: 200, LatencyMS: 100, Usage: Usage{Prompt: 10, Completion: 20, Total: 30, Source: "upstream"}, ToolsCount: 2, ToolNames: `["read_file","bash"]`, ClientIP: "10.0.0.1", ClientAgent: "claude-code/1.0", CreatedAt: hourMid},
+		{Route: "free", UpstreamID: "u1", UpstreamModel: "glm-5.3", Endpoint: "chat_completions", Status: 200, LatencyMS: 300, Usage: Usage{Prompt: 1, Completion: 2, Total: 3, Source: "upstream"}, ClientIP: "10.0.0.1", ClientAgent: "claude-code/1.0", CreatedAt: hourMid.Add(-time.Minute)},
+		{Route: "free", UpstreamID: "u1", UpstreamModel: "glm-5.3", Endpoint: "chat_completions", Status: 502, LatencyMS: 500, ErrorKind: "upstream_error", Usage: Usage{Source: "unavailable"}, ClientIP: "10.0.0.2", ClientAgent: "curl/8.0", CreatedAt: hourMid.Add(-2 * time.Minute)},
+		{Route: "free", UpstreamID: "u1", UpstreamModel: "glm-5.3", Endpoint: "chat_completions", Status: 499, LatencyMS: 10, ErrorKind: "client_canceled", Usage: Usage{Source: "unavailable"}, ClientIP: "10.0.0.2", ClientAgent: "curl/8.0", CreatedAt: hourMid.Add(-3 * time.Minute)},
+		{Route: "free", UpstreamID: "u2", UpstreamModel: "hermes-4", Endpoint: "chat_completions", Status: 200, LatencyMS: 700, Usage: Usage{Prompt: 5, Completion: 5, Total: 10, Source: "upstream"}, ToolNames: `["read_file"]`, ClientIP: "10.0.0.3", ClientAgent: "opencode/1.2", CreatedAt: hourMid.Add(-4 * time.Minute)},
 		// 范围之外：不应计入任何聚合。
 		{Route: "old", UpstreamID: "u1", UpstreamModel: "glm-5.3", Endpoint: "chat_completions", Status: 500, LatencyMS: 999, ErrorKind: "upstream_error", CreatedAt: now.Add(-25 * time.Hour)},
 	}
