@@ -224,7 +224,17 @@ SSE 首字节发给下游后不能再安全换模型：会重复文字，或破�
 
 **客户端仿真是头集而不是载荷改写。** `simulate_zcode` 复刻 ZCode 桌面客户端的 CLI 身份/平台指纹头、双凭据头与 `anthropic-version`；会话 id 从对话首个 user turn 的 JSON 做 sha256 截断派生（同一会话稳定、跨会话互异、不可逆），请求/追踪 id 每请求全新。与 `simulate_opencode` 不同，Messages 载荷无需注入 thinking 或补流式参数——那是 OpenAI 方言网关的特有要求。
 
-**凭据三套存储、一个写入方。** `login zcode` 子命令执行设备码轮询（init → 授权 URL → poll → 兑换 → 探测），把兑换并经 `max_tokens: 1` 网关探测验证的 `id.secret` key 写入 `~/.nanorouter/zcode_token.json`（0600，渠道分组，连同平台 JWT 与 OAuth token）；候选经 `zcode_token_file: true` 只读回退，ZCode 官方加密凭据 `~/.zcode/v2/credentials.json`（AES-256-GCM，密钥 = SHA-256(`ZCODE_CREDENTIAL_SECRET` 或 `zcode-credential-fallback:{platform}:{homedir}:{username}`，字段选择与解密 1:1 对齐 dsh-zhipu-provider 的 cipher.ts/auth.ts）只读次之，参考客户端的 `~/.zcode_coding_plan_token.json` 只读再次。三套都只读、只有 `~/.nanorouter` 一套可写：官方文件归 ZCode 客户端所有，写入会竞态。网关 401/403 能证伪 key，网关不可达不能——把瞬时故障误报成"key 无效"比多一次探测更糟，因此不可达视为通过。凭据文件带 5 秒进程内缓存：参考客户端至多每次登录重写一次，而请求路径每次环境变量未命中都会来读。
+**登录可在运行中发起，不需重启。** 设备码登录要等人在浏览器里点确认，HTTP 请求吊在那里几分钟是不合理的，故拆成两段：`POST /zcode/login` 抢占登录槽位、后台 goroutine 跑完整链路、把授权链接与各阶段进度写进内存任务并立刻返回；`GET /zcode/login` 读回进度。凭据落盘后即可被下一请求读到——凭据解析每次请求都走文件（5 秒进程内缓存），**热加载是既有语义，这里没有新增刷新机制**。
+
+任务状态机（`idle → awaiting_authorization → exchanging → succeeded/failed`）单实例、内存态：登录是一次性人工动作，重启重来即可，持久化只会留下过期的设备码。设备码过期后 `active()` 转为 false，使下一次 POST 能重新触发——否则一次忘点的授权会把入口永久挡在 409 外面。抢占与占位必须在同一把锁内完成，否则并发 POST 会各起一条登录链、互相覆盖凭据文件。
+
+登录链新增 `OnProgress` 回调暴露两个节点（拿到链接、进入兑换）；命令行登录不设该字段故行为完全不变。`Output` 接一个逐行写 zap 的 writer，于是授权链接与全部阶段提示自动进日志，无需为每一步新增日志语句。
+
+**两个端点是特权面，只认 Bearer。** 它们能让调用方以网关身份登录第三方账号，故不放进 `auth` 的 Basic 回退白名单（该白名单只服务统计页）。`auth_env` 未配置时中间件整体放行——此时这两个端点等于对所有人开放，文档已就此告警。
+
+**凭据三套存储、一个写入方。** `login zcode` 子命令执行设备码轮询（init → 授权 URL → poll → 兑换 → 探测），把兑换并经 `max_tokens: 1` 网关探测验证的 `id.secret` key 写入 `~/.nanorouter/zcode_token.json`（0600，渠道分组，连同平台 JWT 与 OAuth token）；候选经 `zcode_token_file: true` 只读回退，ZCode 官方加密凭据 `~/.zcode/v2/credentials.json`（AES-256-GCM，种子串取 `ZCODE_CREDENTIAL_SECRET`，未设置时用 `zcode-credential-fallback:{platform}:{homedir}:{username}`；字段选择与解密 1:1 对齐 dsh-zhipu-provider 的 cipher.ts/auth.ts）只读次之，参考客户端的 `~/.zcode_coding_plan_token.json` 只读再次。三套都只读、只有 `~/.nanorouter` 一套可写：官方文件归 ZCode 客户端所有，写入会竞态。网关 401/403 能证伪 key，网关不可达不能——把瞬时故障误报成"key 无效"比多一次探测更糟，因此不可达视为通过。凭据文件带 5 秒进程内缓存：参考客户端至多每次登录重写一次，而请求路径每次环境变量未命中都会来读。
+
+`ZCODE_CREDENTIAL_SECRET` 要填**种子串本身**，不是它的 SHA-256——那道哈希由 `deriveZcodeCipherKey` 内部再算一次。填成哈希会让每条记录解密失败，而 `decryptZcodeCredentialValue` 对失败只返回 false，坏条目按设计被跳过：整份文件于是静默降级为空凭据，上游只回一句 `SERVICE_AUTHENTICATION_INVALID`，本地毫无线索。这是实测踩过的坑，故在此写明。
 
 **单实例边界不变。** Anthropic 候选的熔断、并发、重试预算、全局背压与其他候选共享同一套机制与状态；`/v1/messages` 端点的错误方言随端点切换（Anthropic 信封），鉴权中间件按路径后缀选方言。探测（Prober）对 Anthropic 候选发 Messages 形状的极简 Ping，有效性判定与 OpenAI 侧同语义（拦截 200 伪成功与空内容）。
 

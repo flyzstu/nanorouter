@@ -72,6 +72,9 @@ type Router struct {
 	logger            *zap.Logger
 	retryBackoff      func(int) time.Duration
 	retryWait         func(context.Context, time.Duration) bool
+	// zcodeLogin 是 ZCode 登录的后台任务快照，由 r.mu 保护；nil 表示从未触发。
+	// 与 states（熔断）分开：后者按候选 id 存，这是一次性人工动作。
+	zcodeLogin *zcodeLoginTask
 }
 
 // state 是单个上游的熔断状态。冷却期内不再向它发送新请求，
@@ -221,6 +224,12 @@ func (r *Router) Handler() http.Handler {
 	}
 	mux.Route("/zhipu-aicoding", mountZhipu)
 	mux.Route("/zhipuaicoding", mountZhipu)
+
+	// ZCode 登录：POST 发起并返回授权链接，GET 查进度。二者都在 auth
+	// 之内（不加进 statsAuthPaths），故只有 Bearer 能过——这是能让网关
+	// 以自身身份登录第三方账号的特权端点，不接受浏览器的 Basic 回退。
+	mux.Post("/zcode/login", r.startZcodeLogin)
+	mux.Get("/zcode/login", r.zcodeLoginStatus)
 	return r.auth(mux)
 }
 
@@ -277,6 +286,120 @@ func (r *Router) auth(next http.Handler) http.Handler {
 		next.ServeHTTP(w, q)
 	})
 }
+
+// zcodeLoginStartTimeout 是 POST 等待授权链接的上限。链路要先打网关的
+// init 端点才拿到链接，那一跳本身可能几百毫秒；给 15 秒是为了在网关慢
+// 时不至于把一次成功的发起误报成失败，而 init 真失败时早该返回错误了。
+const zcodeLoginStartTimeout = 15 * time.Second
+
+// startZcodeLogin 发起一次设备码登录并返回授权链接。真正的轮询在后台
+// 跑：浏览器里点确认可能过去几分钟，HTTP 请求不该吊在那里。
+//
+// 只发起不代劳：凭据由操作者自己在官方页面授权，网关只做发起与落盘。
+func (r *Router) startZcodeLogin(w http.ResponseWriter, q *http.Request) {
+	channel, ok := normalizeZcodeChannel(q.URL.Query().Get("channel"))
+	if !ok {
+		writeJSON(w, http.StatusBadRequest, map[string]any{
+			"error": map[string]any{
+				"message": fmt.Sprintf("channel must be %q or %q", ZcodeChannelBigmodel, ZcodeChannelZai),
+				"type":    "invalid_request_error",
+			},
+		})
+		return
+	}
+	if !r.beginZcodeLogin(channel, time.Now()) {
+		// 已有任务在跑。回当前快照而不是新起一条：两次设备码登录会互相
+		// 覆盖凭据文件，且操作者只会拿到后一个链接。
+		writeJSON(w, http.StatusConflict, r.zcodeLoginSnapshot())
+		return
+	}
+
+	// 登录链需要 ctx：请求返回后 ctx 会被取消，故用进程生命周期的 context，
+	// 让后台轮询活到它自己结束（设备码过期或成功）。
+	ctx, cancel := context.WithCancel(context.Background())
+	linkReady := make(chan struct{})
+	var once sync.Once
+	notify := func(phase zcodeLoginPhase, link string, expiresAt time.Time) {
+		r.updateZcodeLogin(func(t *zcodeLoginTask) {
+			t.Phase = phase
+			if link != "" {
+				t.AuthURL = link
+				t.ExpiresAt = expiresAt
+			}
+		})
+		once.Do(func() { close(linkReady) })
+	}
+
+	go func() {
+		defer cancel()
+		// 登录链的全部输出接进日志：授权链接、各阶段提示、落盘路径都在
+		// 这里，操作者既看响应也看日志。
+		//
+		// TokenStorePath 留空：storeZcodeToken 会回退到 ~/.nanorouter/。
+		// 容器里 HOME 指向 emptyDir（根文件系统只读），正好落在可写处。
+		storePath, err := RunZcodeLogin(ctx, ZcodeLoginOptions{
+			GatewayOrigin: zcodeGatewayOrigin(),
+			Channel:       channel,
+			Output:        zapWriter{router: r},
+			OnProgress:    notify,
+		})
+		// 链接始终要放行等待者：init 失败时 RunZcodeLogin 会直接返回，
+		// 没人调 notify，不放行就会白等到超时。
+		once.Do(func() { close(linkReady) })
+		if err != nil {
+			r.finishZcodeLogin(zcodeLoginFailed, err, "")
+			r.logger.Warn(r.logMessage("zcode_login_failed"), eventFields("zcode_login_failed", zap.String("channel", channel), zap.String("reason", err.Error()))...)
+			return
+		}
+		r.finishZcodeLogin(zcodeLoginSucceeded, nil, storePath)
+		r.logger.Info(r.logMessage("zcode_login_succeeded"), eventFields("zcode_login_succeeded", zap.String("channel", channel), zap.String("store_path", storePath))...)
+	}()
+
+	select {
+	case <-linkReady:
+	case <-time.After(zcodeLoginStartTimeout):
+		// 拿不到链接就让调用方去看状态端点，而不是在这里干等。
+	case <-q.Context().Done():
+		// 客户端先走了：登录链继续跑（凭据照样能落盘），只是没人接链接。
+		return
+	}
+
+	snapshot := r.zcodeLoginSnapshot()
+	status := http.StatusAccepted
+	if snapshot.Phase == zcodeLoginFailed {
+		// 链路在拿到链接前就断了（init 不通、设备码不可读），这次请求
+		// 确实失败了，用 502 如实反映。
+		status = http.StatusBadGateway
+	}
+	writeJSON(w, status, snapshot)
+}
+
+// zcodeLoginStatus 返回登录进度。操作者点完授权后轮询这个端点，
+// 直到 phase 变成 succeeded 或 failed。
+func (r *Router) zcodeLoginStatus(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, http.StatusOK, r.zcodeLoginSnapshot())
+}
+
+// zapWriter 把登录链的行式输出逐行写进日志，并剥掉尾部换行。
+type zapWriter struct {
+	router *Router
+}
+
+func (z zapWriter) Write(p []byte) (int, error) {
+	if line := strings.TrimSpace(string(p)); line != "" {
+		z.router.logger.Info(z.router.logMessage("zcode_login_output"), zap.String("line", line))
+	}
+	return len(p), nil
+}
+
+// writeJSON 写一个 JSON 响应。登录端点的响应体都是我们自己构造的
+// 小对象，不值得为它引入渲染错误方言。
+func writeJSON(w http.ResponseWriter, status int, payload any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(payload)
+}
+
 func (r *Router) models(w http.ResponseWriter, q *http.Request) {
 	modelIDs := make([]string, 0, len(r.cfg.Routes))
 	for name, route := range r.cfg.Routes {

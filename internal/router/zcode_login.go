@@ -45,7 +45,18 @@ const (
 var (
 	zcodeBigmodelBizURL = "https://bigmodel.cn"
 	zcodeZaiBizURL      = "https://api.z.ai"
+	// zcodeGatewayOriginOverride 让测试把设备码链路指向 httptest 服务器；
+	// 空串表示用 ZcodeDefaultOrigin。生产代码不写这个变量。
+	zcodeGatewayOriginOverride string
 )
+
+// zcodeGatewayOrigin 返回设备码链路该用的 origin。
+func zcodeGatewayOrigin() string {
+	if override := strings.TrimSpace(zcodeGatewayOriginOverride); override != "" {
+		return override
+	}
+	return ZcodeDefaultOrigin
+}
 
 // ZcodeLoginOptions 是一次登录的可注入缝隙，全部字段可覆盖以便测试。
 type ZcodeLoginOptions struct {
@@ -65,6 +76,11 @@ type ZcodeLoginOptions struct {
 	TokenStorePath string
 	// OpenBrowser 尝试用系统浏览器打开授权页；nil 时跳过。
 	OpenBrowser func(url string) error
+	// OnProgress 在登录链的两个关键节点回调：拿到授权链接时（link 非空），
+	// 以及授权通过、进入兑换时（phase=exchanging，link 为空）。HTTP 后台
+	// 登录用它把链接送进响应、并把状态推给查询端点；nil 时登录链不产生
+	// 任何回调，行为与命令行登录完全一致。
+	OnProgress func(phase zcodeLoginPhase, link string, expiresAt time.Time)
 }
 
 // zcodeLoginHeaders 是 OAuth 端点的基础头（复刻参考客户端）。
@@ -542,6 +558,11 @@ func RunZcodeLogin(ctx context.Context, opts ZcodeLoginOptions) (string, error) 
 	}
 	say("Open the authorization page and approve the login (%s channel):", channel)
 	say("  %s", device.authURL)
+	// 先回调再继续：HTTP 调用方等着这个链接返回响应，拖到轮询开始之后
+	// 就白等了。expiresAt 可能为零值（上游未给），调用方按无过期处理。
+	if opts.OnProgress != nil {
+		opts.OnProgress(zcodeLoginAwaiting, device.authURL, device.expiresAt)
+	}
 	if authHost, err := url.Parse(device.authURL); err == nil {
 		gatewayHost := ""
 		if parsed, err := url.Parse(origin); err == nil {
@@ -596,6 +617,11 @@ func RunZcodeLogin(ctx context.Context, opts ZcodeLoginOptions) (string, error) 
 			continue
 		case "success":
 			say("Authorization received; exchanging the OAuth token for a Coding Plan key...")
+			// 授权已通过、进入兑换：状态机据此区分"等人点"与"网关在忙"，
+			// 二者的处置完全不同（前者无能为力，后者可以去查网关）。
+			if opts.OnProgress != nil {
+				opts.OnProgress(zcodeLoginExchanging, "", time.Time{})
+			}
 			key, err := exchangeZcodeKey(ctx, client, decision.token, channel)
 			if err != nil {
 				return "", err

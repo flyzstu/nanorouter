@@ -285,9 +285,15 @@ routes:
 # /v1，直接请求 /v1/messages；下游是 OpenAI 协议客户端时，继续用
 # /v1/chat/completions，网关自动做 Chat↔Messages 双向翻译。
 #
-# 首次使用先执行 `nanorouter login-zcode -channel bigmodel` 完成设备码登录，
+# 首次使用先执行 `nanorouter login zcode --channel bigmodel` 完成设备码登录，
 # 凭据写入 ~/.nanorouter/zcode_token.json；候选开启 zcode_token_file 后即可
 # 免环境变量读取。也可以直接用 ZCODE_API_KEY 环境变量传入 id.secret 形式的 key。
+#
+# 网关运行中也能发起登录（省去登录宿主机这一步），凭据落盘后热加载、无需重启：
+#   POST /zcode/login[?channel=zai]  发起并返回 auth_url（202），链接同时进日志
+#   GET  /zcode/login                轮询进度：idle/awaiting_authorization/exchanging/succeeded/failed
+# 两者都需要 Authorization: Bearer $NANOROUTER_API_KEY。
+# 容器部署时 ~/.nanorouter/ 需可写——根文件系统只读时把 HOME 指向 emptyDir。
   zcode:
     strategy: weighted_round_robin
     candidates:

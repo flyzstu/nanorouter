@@ -253,7 +253,22 @@ nanorouter login zcode --channel bigmodel        # 或 --channel zai
 # 其余旗标：-gateway <origin>、-timeout <duration>、-no-browser
 ```
 
-凭据按优先级解析：`api_key_env` 环境变量（支持 `ZCODE_API_KEY` 等自定义名）→ `zcode_token_file: true` 时回退读取 `~/.nanorouter/zcode_token.json`（login zcode 写入）→ **ZCode 桌面/CLI 的官方凭据文件 `~/.zcode/v2/credentials.json`**（只读解密，AES-256-GCM，密钥取 `ZCODE_CREDENTIAL_SECRET` 环境变量或同机默认推导；机器上已登录 ZCode 时无需重复登录）→ 参考客户端的 `~/.zcode_coding_plan_token.json`（只读；过期或 `eyJhbGci` 平台 JWT 会自动跳过）。登录链在落盘前会用一次 `max_tokens: 1` 请求向网关验证 key，拒绝即失败，绝不存储网关不接受的凭据；OAuth token 与平台 JWT 一并保存于凭据文件。
+也可以在网关运行中通过 HTTP 发起登录，省去登录宿主机这一步：
+
+```sh
+# 发起并返回授权链接（202）；链接同时写入网关日志
+curl -X POST "http://127.0.0.1:8080/zcode/login" -H "Authorization: Bearer $NANOROUTER_API_KEY"
+# 可选 ?channel=zai 换渠道
+
+# 在浏览器里打开返回的 auth_url 完成授权，然后轮询进度直到 succeeded
+curl "http://127.0.0.1:8080/zcode/login" -H "Authorization: Bearer $NANOROUTER_API_KEY"
+```
+
+授权完成后凭据落盘即生效，**无需重启网关**：凭据按请求实时读取，仅有 5 秒进程内缓存。状态机为 `idle → awaiting_authorization → exchanging → succeeded/failed`，设备码过期后自动回到可触发状态（再次 POST 即可）。同一时刻只允许一条登录链在进行，并发 POST 返回 409 与当前状态。
+
+两个端点都在 `auth_env` 之内且**不接受浏览器的 Basic 回退**——它们能让调用方以网关身份登录第三方账号。`auth_env` 未配置时鉴权中间件直接放行，故**无鉴权实例上不要暴露这两个端点**。容器部署时凭据写入 `~/.nanorouter/`（即 `$HOME`），需保证该路径可写（根文件系统只读时把 `HOME` 指向 emptyDir）。
+
+凭据按优先级解析：`api_key_env` 环境变量（支持 `ZCODE_API_KEY` 等自定义名）→ `zcode_token_file: true` 时回退读取 `~/.nanorouter/zcode_token.json`（login zcode 写入）→ **ZCode 桌面/CLI 的官方凭据文件 `~/.zcode/v2/credentials.json`**（只读解密，AES-256-GCM；`ZCODE_CREDENTIAL_SECRET` 环境变量优先，未设置时用同机默认推导串 `zcode-credential-fallback:{platform}:{homedir}:{username}`；机器上已登录 ZCode 时无需重复登录。注意该变量要填**种子串本身**，不是它的 SHA-256——填错会导致解密静默失败、凭据降级为空）→ 参考客户端的 `~/.zcode_coding_plan_token.json`（只读；过期或 `eyJhbGci` 平台 JWT 会自动跳过）。登录链在落盘前会用一次 `max_tokens: 1` 请求向网关验证 key，拒绝即失败，绝不存储网关不接受的凭据；OAuth token 与平台 JWT 一并保存于凭据文件。
 
 翻译边界（显式 400 `unsupported_openai_feature`，不静默丢弃）：`n > 1`、`response_format` 结构化输出、非零 `presence/frequency_penalty`、`logit_bias`、`logprobs`、`top_logprobs`。下游未携带 `max_tokens` / `max_completion_tokens` 时，Messages 协议要求必填，网关默认注入 `max_tokens: 4096`——需要更长输出请显式传 `max_tokens`。已知无声降级记录于 design.md：assistant 历史的 `reasoning_content`（Anthropic 要求思维块签名，未签名的无法回传）、OpenAI 记账字段（`store`/`metadata` 等），以及白名单映射的自然舍弃 `parallel_tool_calls`/`verbosity`（流式 Responses 链上的 thinking_delta 同样不进入 Responses 事件）。`reasoning_effort` 映射为 thinking 预算（minimal→1K … max→32K），预算不足 `max_tokens` 时钳制，`"none"` 关闭。流式 usage 从 `message_start`（输入侧）与 `message_delta`（累计输出侧）合并采集，账本与 OpenAI 上游同一张表。
 
