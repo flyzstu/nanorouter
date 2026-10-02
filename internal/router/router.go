@@ -484,6 +484,15 @@ func (r *Router) proxy(endpoint string, defaultRoutes ...string) http.HandlerFun
 				}
 				upstreamEndpoint = "messages"
 			}
+			if u.SimulateZcode {
+				// 官方 CLI 把设备身份写进请求体的 metadata.user_id。注入放在
+				// 翻译之后：Responses→Chat 适配按白名单重建请求体，提前注入
+				// 的 metadata 会被丢弃，此处才能覆盖原生透传、Chat→Messages
+				// 与 Responses 链三条路径。
+				if userID := zcodeMetadataUserID(zcodeSessionIDFor(p)); userID != "" {
+					p["metadata"] = map[string]any{"user_id": userID}
+				}
+			}
 			p["model"] = u.Model
 			encoded, _ := json.Marshal(p)
 			queueStart := time.Now()

@@ -657,3 +657,116 @@ func mustOpenMemoryDB(t *testing.T) *sql.DB {
 	}
 	return db
 }
+
+// writeZcodeDeviceState 在当前 HOME 下写入 ZCode 设备状态文件。HOME 需由
+// 调用方先设为临时目录，否则会写到真实机器的 ~/.zcode/v2/。
+func writeZcodeDeviceState(t *testing.T, body string) {
+	t.Helper()
+	home := os.Getenv("HOME")
+	if home == "" {
+		t.Fatal("HOME 未设置")
+	}
+	dir := filepath.Join(home, ".zcode", "v2")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, zcodeDeviceStateName), []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestZcodeDeviceMidInjectedIntoMetadata 模拟官方客户端：设备身份进请求体
+// 的 metadata.user_id，session_id 与 x-session-id 同值。
+func TestZcodeDeviceMidInjectedIntoMetadata(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	writeZcodeDeviceState(t, `{"deviceMid":"device-123"}`)
+	var gotSession, gotUserID string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		gotSession = req.Header.Get("x-session-id")
+		var in map[string]any
+		_ = json.NewDecoder(req.Body).Decode(&in)
+		if metadata, ok := in["metadata"].(map[string]any); ok {
+			gotUserID, _ = metadata["user_id"].(string)
+		}
+		_, _ = w.Write([]byte(`{"id":"m","type":"message","role":"assistant","content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}`))
+	}))
+	defer upstream.Close()
+	r, _ := newZcodeTestRouter(t, Candidate{
+		ID: "z", BaseURL: upstream.URL, Model: "glm-5.3",
+		Anthropic: true, SimulateZcode: true, ZcodeChannel: ZcodeChannelBigmodel, APIKeyEnv: "TEST_ZCODE_KEY",
+	})
+	t.Setenv("TEST_ZCODE_KEY", "11.secret")
+	if rec := postJSON(t, r, "/v1/messages", `{"model":"zcode","max_tokens":8,"messages":[{"role":"user","content":"hi"}]}`); rec.Code != 200 {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	var decoded map[string]string
+	if err := json.Unmarshal([]byte(gotUserID), &decoded); err != nil {
+		t.Fatalf("user_id=%q err=%v", gotUserID, err)
+	}
+	if decoded["device_id"] != "device-123" {
+		t.Fatalf("device_id=%q", decoded["device_id"])
+	}
+	if decoded["account_uuid"] != "" {
+		t.Fatalf("account_uuid 官方恒发空串，得到 %q", decoded["account_uuid"])
+	}
+	if decoded["session_id"] != gotSession {
+		t.Fatalf("session 标识必须同值: metadata=%q header=%q", decoded["session_id"], gotSession)
+	}
+}
+
+// TestZcodeMetadataSurvivesResponsesChain Responses→Chat 按白名单重建请求体，
+// 提前注入的 metadata 会被丢弃；注入点在翻译之后才能覆盖三条链路。
+func TestZcodeMetadataSurvivesResponsesChain(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	writeZcodeDeviceState(t, `{"deviceMid":"device-456"}`)
+	var gotUserID string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		if req.URL.Path != "/api/v1/ultra/anthropic/v1/messages" {
+			t.Errorf("path=%q", req.URL.Path)
+		}
+		var in map[string]any
+		_ = json.NewDecoder(req.Body).Decode(&in)
+		if metadata, ok := in["metadata"].(map[string]any); ok {
+			gotUserID, _ = metadata["user_id"].(string)
+		}
+		_, _ = w.Write([]byte(`{"id":"m","type":"message","role":"assistant","content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}`))
+	}))
+	defer upstream.Close()
+	r, _ := newZcodeTestRouter(t, Candidate{
+		ID: "z", BaseURL: upstream.URL, Model: "glm-5.3",
+		Anthropic: true, SimulateZcode: true, ZcodeChannel: ZcodeChannelBigmodel, APIKeyEnv: "TEST_ZCODE_KEY",
+	})
+	t.Setenv("TEST_ZCODE_KEY", "11.secret")
+	rec := postJSON(t, r, "/v1/responses", `{"model":"zcode","input":"hi","max_output_tokens":8}`)
+	if rec.Code != 200 {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(gotUserID, "device-456") {
+		t.Fatalf("responses 链路丢失 metadata: %q", gotUserID)
+	}
+}
+
+// TestZcodeMetadataAbsentWithoutDeviceState 没有 ZCode 设备身份时不注入
+// metadata——网关不伪造设备 ID。
+func TestZcodeMetadataAbsentWithoutDeviceState(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	var hasMetadata bool
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		var in map[string]any
+		_ = json.NewDecoder(req.Body).Decode(&in)
+		_, hasMetadata = in["metadata"]
+		_, _ = w.Write([]byte(`{"id":"m","type":"message","role":"assistant","content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}`))
+	}))
+	defer upstream.Close()
+	r, _ := newZcodeTestRouter(t, Candidate{
+		ID: "z", BaseURL: upstream.URL, Model: "glm-5.3",
+		Anthropic: true, SimulateZcode: true, ZcodeChannel: ZcodeChannelBigmodel, APIKeyEnv: "TEST_ZCODE_KEY",
+	})
+	t.Setenv("TEST_ZCODE_KEY", "11.secret")
+	if rec := postJSON(t, r, "/v1/messages", `{"model":"zcode","max_tokens":8,"messages":[{"role":"user","content":"hi"}]}`); rec.Code != 200 {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if hasMetadata {
+		t.Fatal("无设备身份时不应注入 metadata")
+	}
+}
