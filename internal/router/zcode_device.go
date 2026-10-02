@@ -13,6 +13,7 @@ package router
 // ZCode 时就没有设备身份，此时不注入该字段，而不是伪造一个 UUID。
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"strings"
@@ -36,13 +37,24 @@ func zcodeDeviceStatePath() string {
 	return filepath.Join(home, ".zcode", "v2", zcodeDeviceStateName)
 }
 
-// zcodeDeviceMid 读取 ZCode 已写入的 deviceMid。文件缺失、损坏或字段为空
-// 时返回空串——官方把设备标识的生成交给客户端，网关不代劳。
-func zcodeDeviceMid() string {
+// zcodeDeviceMid 返回已落库的设备身份。登录时随凭据一起写入，故正常路径下
+// 不再读文件；文件回退只服务尚未登录过的实例。
+func (r *Router) zcodeDeviceMid(ctx context.Context) string {
+	if r.zcodeCredentials != nil {
+		if mid := r.zcodeCredentials.deviceMid(ctx); mid != "" {
+			return mid
+		}
+	}
 	path := zcodeDeviceStatePath()
 	if path == "" {
 		return ""
 	}
+	return readZcodeDeviceMid(path)
+}
+
+// readZcodeDeviceMid 从 ZCode 已写入的状态文件读取 deviceMid。文件缺失、损坏
+// 或字段为空时返回空串——官方把设备标识的生成交给客户端，网关不代劳。
+func readZcodeDeviceMid(path string) string {
 	raw, err := os.ReadFile(path)
 	if err != nil {
 		return ""
@@ -70,8 +82,8 @@ func zcodeSessionIDFor(payload map[string]any) string {
 // 恒发空串，session_id 与已派生的会话 id 同源（同会话稳定、跨会话互异）。
 //
 // 返回空串表示本次不注入——调用方据此跳过 metadata，而不是发一个空对象。
-func zcodeMetadataUserID(sessionID string) string {
-	deviceMid := zcodeDeviceMid()
+func (r *Router) zcodeMetadataUserID(ctx context.Context, sessionID string) string {
+	deviceMid := r.zcodeDeviceMid(ctx)
 	if deviceMid == "" {
 		return ""
 	}

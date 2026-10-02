@@ -81,6 +81,9 @@ type ZcodeLoginOptions struct {
 	// 登录用它把链接送进响应、并把状态推给查询端点；nil 时登录链不产生
 	// 任何回调，行为与命令行登录完全一致。
 	OnProgress func(phase zcodeLoginPhase, link string, expiresAt time.Time)
+	// Store 非 nil 时凭据写入数据库而非文件。容器内文件只读、程序也无写
+	// Secret 的权限，只有数据库能让「登录一次、长期复用」成立。
+	Store *zcodeCredentialStore
 }
 
 // zcodeLoginHeaders 是 OAuth 端点的基础头（复刻参考客户端）。
@@ -629,7 +632,7 @@ func RunZcodeLogin(ctx context.Context, opts ZcodeLoginOptions) (string, error) 
 			if err := probeZcodeKey(ctx, client, origin, channel, key); err != nil {
 				return "", err
 			}
-			path, err := storeZcodeToken(opts.TokenStorePath, channel, key, decision.jwt, decision.token, decision.user)
+			path, err := storeZcodeToken(opts.TokenStorePath, channel, key, decision.jwt, decision.token, decision.user, opts.Store)
 			if err != nil {
 				return "", err
 			}
@@ -662,7 +665,31 @@ func isLoopbackHost(host string) bool {
 // storeZcodeToken 把兑换并验证过的凭据写入渠道分组文件（0600）。
 // oauth token 与平台 JWT 一并保存：它们是重置卡等平台端点需要的另一半，
 // 丢弃它们意味着将来只能重新登录。
-func storeZcodeToken(path, channel, key, jwt, oauthToken, user string) (string, error) {
+//
+// store 非 nil 时改写数据库、跳过文件：容器内文件（以及 Secret 挂载卷）
+// 是只读的，程序没有写权限，OAuth 刷新的新 token 无处可存——下次启动读到的
+// 仍是旧的过期 token，于是再触发一次 OAuth，循环往复。返回的路径是给日志与
+// 状态端点看的标识，DB 写入时以 channel 代替。
+func storeZcodeToken(path, channel, key, jwt, oauthToken, user string, store *zcodeCredentialStore) (string, error) {
+	if store != nil {
+		// 设备身份随凭据一起落库：它属于机器而非账号，与 key 同生命周期，
+		// 顺带让 metadata 注入不再依赖 ZCode 客户端的 telemetry 文件。
+		deviceMid := ""
+		if home, err := os.UserHomeDir(); err == nil {
+			deviceMid = readZcodeDeviceMid(filepath.Join(home, ".zcode", "v2", zcodeDeviceStateName))
+		}
+		if err := store.save(context.Background(), ZcodeCredential{
+			Channel:     channel,
+			APIKey:      key,
+			PlatformJWT: jwt,
+			OAuthToken:  oauthToken,
+			UserName:    user,
+			DeviceMid:   deviceMid,
+		}); err != nil {
+			return "", err
+		}
+		return "db:" + channel, nil
+	}
 	if path == "" {
 		home, err := os.UserHomeDir()
 		if err != nil {

@@ -307,9 +307,10 @@ func TestZcodeLoginStatusSnapshotIsCopy(t *testing.T) {
 	}
 }
 
-// 端点在真实登录后应当把凭据写到凭据文件——这条保证「授权完成后
-// 热加载」的前提成立：文件写了，候选就能在 5 秒缓存过期后用上。
-func TestZcodeLoginWritesCredentialFileForHotReload(t *testing.T) {
+// 端点在真实登录后应当把凭据写进数据库——这条保证「授权完成后热加载」的
+// 前提成立：写库 invalidate 了缓存，下一请求即读到新 key，无需重启。
+// 端点走的是 Store 分支（凭据不再落文件），故断言对象是 DB 而非凭据文件。
+func TestZcodeLoginWritesCredentialToDatabase(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 	resetZcodeTokenCache()
@@ -328,7 +329,7 @@ func TestZcodeLoginWritesCredentialFileForHotReload(t *testing.T) {
 	defer func(v string) { zcodeGatewayOriginOverride = v }(zcodeGatewayOriginOverride)
 	zcodeGatewayOriginOverride = gateway.URL
 
-	r := zcodeLoginTestRouter(t)
+	r, db := newZcodeTestRouter(t, Candidate{ID: "z", BaseURL: "http://127.0.0.1:1", Model: "m"})
 	rec := postZcodeLogin(t, r, "", "")
 	if rec.Code != http.StatusAccepted {
 		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
@@ -340,14 +341,24 @@ func TestZcodeLoginWritesCredentialFileForHotReload(t *testing.T) {
 			if task.Phase != zcodeLoginSucceeded {
 				t.Fatalf("登录失败: %+v", task)
 			}
-			path := filepath.Join(home, ".nanorouter", zcodeTokenStoreName)
-			if _, err := os.Stat(path); err != nil {
-				t.Fatalf("凭据文件未生成: %v", err)
+			// 凭据必须落在 zcode_credentials 表里。
+			var key string
+			if err := db.QueryRow(`SELECT api_key FROM zcode_credentials WHERE channel = ?`,
+				ZcodeChannelBigmodel).Scan(&key); err != nil {
+				t.Fatalf("凭据未写入数据库: %v", err)
 			}
-			// 凭据应能被现有的解析链读到（无需重启即可用的前提）。
-			resetZcodeTokenCache()
-			if key := zcodeTokenFileKey(ZcodeChannelBigmodel); key == "" {
-				t.Fatal("凭据文件已生成但解析不到 key")
+			if key != "111.222" {
+				t.Fatalf("api_key=%q", key)
+			}
+			// 热加载：不经重启，下一次解析就能读到库里的 key。
+			if got := r.resolveCandidateAPIKey(t.Context(), Candidate{
+				ZcodeTokenFile: true, ZcodeChannel: ZcodeChannelBigmodel,
+			}); got != "111.222" {
+				t.Fatalf("热加载失败: %q", got)
+			}
+			// 凭据文件不应再被创建（端点走 DB 分支）。
+			if _, err := os.Stat(filepath.Join(home, ".nanorouter", zcodeTokenStoreName)); err == nil {
+				t.Fatal("端点不应再写凭据文件")
 			}
 			return
 		}

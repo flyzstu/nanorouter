@@ -75,6 +75,9 @@ type Router struct {
 	// zcodeLogin 是 ZCode 登录的后台任务快照，由 r.mu 保护；nil 表示从未触发。
 	// 与 states（熔断）分开：后者按候选 id 存，这是一次性人工动作。
 	zcodeLogin *zcodeLoginTask
+	// zcodeCredentials 是凭据的数据库存储。登录完成后写库、后续请求读库，
+	// 不再依赖只读的文件或 Secret 挂载。测试里可为 nil（退回文件源）。
+	zcodeCredentials *zcodeCredentialStore
 }
 
 // state 是单个上游的熔断状态。冷却期内不再向它发送新请求，
@@ -117,7 +120,7 @@ func NewWithLogger(cfg Config, db *sql.DB, logger *zap.Logger) (*Router, error) 
 	if logger == nil {
 		logger = zap.NewNop()
 	}
-	r := &Router{cfg: cfg, db: NewStoreWithConfig(db, cfg.Database), client: newUpstreamHTTPClient(), userAgent: cfg.UserAgent, states: map[string]*state{}, limiters: map[string]*candidateLimiter{}, admission: newAdmissionController(cfg.Backpressure), retryBudgets: map[string]*retryBudget{}, next: map[string]int{}, registry: prometheus.NewRegistry(), logger: logger, retryWait: waitForRetry, candidates: map[string]Candidate{}}
+	r := &Router{cfg: cfg, db: NewStoreWithConfig(db, cfg.Database), client: newUpstreamHTTPClient(), userAgent: cfg.UserAgent, states: map[string]*state{}, limiters: map[string]*candidateLimiter{}, admission: newAdmissionController(cfg.Backpressure), retryBudgets: map[string]*retryBudget{}, next: map[string]int{}, registry: prometheus.NewRegistry(), logger: logger, retryWait: waitForRetry, candidates: map[string]Candidate{}, zcodeCredentials: newZcodeCredentialStore(db)}
 	r.retryBackoff = func(retry int) time.Duration {
 		return jitteredExponentialBackoff(retry, cfg.Retry.BaseDelay, cfg.Retry.MaxDelay)
 	}
@@ -187,6 +190,7 @@ func NewWithLogger(cfg Config, db *sql.DB, logger *zap.Logger) (*Router, error) 
 		r.proberDone = make(chan struct{})
 		go r.runProber(ctx)
 	}
+	r.startZcodeCredentialCheck()
 	return r, nil
 }
 func (r *Router) Handler() http.Handler {
@@ -334,14 +338,14 @@ func (r *Router) startZcodeLogin(w http.ResponseWriter, q *http.Request) {
 		defer cancel()
 		// 登录链的全部输出接进日志：授权链接、各阶段提示、落盘路径都在
 		// 这里，操作者既看响应也看日志。
-		//
-		// TokenStorePath 留空：storeZcodeToken 会回退到 ~/.nanorouter/。
-		// 容器里 HOME 指向 emptyDir（根文件系统只读），正好落在可写处。
+		// 凭据写库而非文件：容器内文件与 Secret 挂载卷都是只读的，程序没有
+		// 写权限。TokenStorePath 留空，storeZcodeToken 走 Store 分支。
 		storePath, err := RunZcodeLogin(ctx, ZcodeLoginOptions{
 			GatewayOrigin: zcodeGatewayOrigin(),
 			Channel:       channel,
 			Output:        zapWriter{router: r},
 			OnProgress:    notify,
+			Store:         r.zcodeCredentials,
 		})
 		// 链接始终要放行等待者：init 失败时 RunZcodeLogin 会直接返回，
 		// 没人调 notify，不放行就会白等到超时。
@@ -607,12 +611,15 @@ func (r *Router) proxy(endpoint string, defaultRoutes ...string) http.HandlerFun
 				}
 				upstreamEndpoint = "messages"
 			}
+			// 解析一次凭据仅供日志脱敏：上游可能把 Authorization 回显进错误
+			// 消息，key 不能随该字段进日志。真正的取用发生在 do() 内部。
+			credential := r.resolveCandidateAPIKey(ctx, u)
 			if u.SimulateZcode {
 				// 官方 CLI 把设备身份写进请求体的 metadata.user_id。注入放在
 				// 翻译之后：Responses→Chat 适配按白名单重建请求体，提前注入
 				// 的 metadata 会被丢弃，此处才能覆盖原生透传、Chat→Messages
 				// 与 Responses 链三条路径。
-				if userID := zcodeMetadataUserID(zcodeSessionIDFor(p)); userID != "" {
+				if userID := r.zcodeMetadataUserID(ctx, zcodeSessionIDFor(p)); userID != "" {
 					p["metadata"] = map[string]any{"user_id": userID}
 				}
 			}
@@ -628,7 +635,7 @@ func (r *Router) proxy(endpoint string, defaultRoutes ...string) http.HandlerFun
 				r.record(requestID, routeName, u, endpoint, http.StatusTooManyRequests, queueLatency, streamed, attempt, Usage{Source: "unavailable"}, "concurrency", meta)
 				r.failovers.WithLabelValues(routeName, "concurrency_limit").Inc()
 				if r.logger.Core().Enabled(zap.WarnLevel) {
-					r.logger.Warn(r.logMessage("upstream_attempt_finished"), eventFields("upstream_attempt_finished", append(failureLogFields(requestID, routeName, u, endpoint, attempt, queueLatency, streamed, http.StatusTooManyRequests, "concurrency_limit", true), zap.String("attempt_phase", "queue"))...)...)
+					r.logger.Warn(r.logMessage("upstream_attempt_finished"), eventFields("upstream_attempt_finished", append(failureLogFields(requestID, routeName, u, endpoint, attempt, queueLatency, streamed, http.StatusTooManyRequests, "concurrency_limit", true, credential), zap.String("attempt_phase", "queue"))...)...)
 				}
 				attempt++
 				continue
@@ -695,7 +702,7 @@ func (r *Router) proxy(endpoint string, defaultRoutes ...string) http.HandlerFun
 				r.fail(routeName, u, 30*time.Second)
 				r.failovers.WithLabelValues(routeName, kind).Inc()
 				if r.logger.Core().Enabled(zap.WarnLevel) {
-					fields := failureLogFields(requestID, routeName, u, endpoint, attempt, latency, streamed, status, outcome, true)
+					fields := failureLogFields(requestID, routeName, u, endpoint, attempt, latency, streamed, status, outcome, true, credential)
 					fields = append(fields, zap.Error(err))
 					r.logger.Warn(r.logMessage("upstream_attempt_finished"), eventFields("upstream_attempt_finished", fields...)...)
 				}
@@ -732,12 +739,18 @@ func (r *Router) proxy(endpoint string, defaultRoutes ...string) http.HandlerFun
 					} else {
 						r.success(u)
 					}
+					// 401/403 是凭据失效的信号，不是可切换的故障：冷却它没有意义，
+					// 换到另一个候选也只是把同一个坏凭据再试一遍。此时改为触发
+					// 一次登录，拿到新 key 后下一请求自然恢复。
+					if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
+						r.maybeTriggerZcodeRelogin(u, "upstream rejected the credential")
+					}
 					upstreamError := r.copyErrorResponse(w, resp, u, endpoint)
 					cancelAttempt()
 					release()
 					r.record(requestID, routeName, u, endpoint, resp.StatusCode, latency, streamed, attempt, Usage{Source: "unavailable"}, "client", meta)
 					if r.logger.Core().Enabled(zap.WarnLevel) {
-						fields := failureLogFields(requestID, routeName, u, endpoint, attempt, latency, streamed, resp.StatusCode, "upstream_rejected", false)
+						fields := failureLogFields(requestID, routeName, u, endpoint, attempt, latency, streamed, resp.StatusCode, "upstream_rejected", false, credential)
 						fields = append(fields, upstreamError.logFields(true)...)
 						r.logger.Warn(r.logMessage("upstream_attempt_finished"), eventFields("upstream_attempt_finished", fields...)...)
 					}
@@ -767,7 +780,7 @@ func (r *Router) proxy(endpoint string, defaultRoutes ...string) http.HandlerFun
 				r.record(requestID, routeName, u, endpoint, resp.StatusCode, latency, streamed, attempt, Usage{Source: "unavailable"}, "upstream", meta)
 				r.failovers.WithLabelValues(routeName, http.StatusText(resp.StatusCode)).Inc()
 				if r.logger.Core().Enabled(zap.WarnLevel) {
-					fields := failureLogFields(requestID, routeName, u, endpoint, attempt, latency, streamed, resp.StatusCode, "upstream_unavailable", true)
+					fields := failureLogFields(requestID, routeName, u, endpoint, attempt, latency, streamed, resp.StatusCode, "upstream_unavailable", true, credential)
 					fields = append(fields, upstreamError.logFields(true)...)
 					r.logger.Warn(r.logMessage("upstream_attempt_finished"), eventFields("upstream_attempt_finished", fields...)...)
 				}
@@ -1053,12 +1066,12 @@ func eventFields(event string, fields ...zap.Field) []zap.Field {
 	return append([]zap.Field{zap.String("event", event)}, fields...)
 }
 
-func failureLogFields(requestID, route string, u Candidate, endpoint string, attempt, ttfb int, streamed bool, status int, outcome string, retryable bool) []zap.Field {
+func failureLogFields(requestID, route string, u Candidate, endpoint string, attempt, ttfb int, streamed bool, status int, outcome string, retryable bool, credential string) []zap.Field {
 	fields := requestLogFields(requestID, route, u, endpoint, attempt, ttfb, streamed, status)
 	fields = append(fields, zap.String("outcome", outcome), zap.Bool("retryable", retryable))
 	// 纵深防御：上游把 Authorization/x-api-key 回显进错误消息时（被入侵
 	// 或镜像上游可为之），key 不得随 upstream_error_message 进日志。
-	if key := resolveCandidateAPIKey(u); key != "" {
+	if key := credential; key != "" {
 		for i, field := range fields {
 			if field.Key != "upstream_error_message" {
 				continue
@@ -1115,7 +1128,7 @@ func (r *Router) do(ctx context.Context, u Candidate, endpoint string, body []by
 		req.Header.Set("User-Agent", ua)
 	}
 	if u.Anthropic {
-		key := resolveCandidateAPIKey(u)
+		key := r.resolveCandidateAPIKey(ctx, u)
 		if key != "" {
 			// ZCode 网关要求 Bearer 与 x-api-key 并存；原生 Anthropic
 			// 忽略 Authorization，两个都发与两类上游兼容。

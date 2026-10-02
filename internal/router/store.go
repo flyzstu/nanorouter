@@ -42,6 +42,11 @@ func Migrate(ctx context.Context, db *sql.DB) error {
 			}
 		}
 	}
+	// 凭据表与账本同批建立：SQLite 不支持 ADD COLUMN IF NOT EXISTS，
+	// 而 zcode_credentials 的列一次到位、后续不再变，故只需 CREATE IF NOT EXISTS。
+	if err := ensureZcodeCredentialTable(ctx, db); err != nil {
+		return err
+	}
 	return nil
 }
 

@@ -305,7 +305,7 @@ func TestStoreZcodeTokenPermissions(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 	path := filepath.Join(home, ".nanorouter", zcodeTokenStoreName)
-	got, err := storeZcodeToken(path, ZcodeChannelBigmodel, "k1", "", "", "")
+	got, err := storeZcodeToken(path, ZcodeChannelBigmodel, "k1", "", "", "", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -320,7 +320,7 @@ func TestStoreZcodeTokenPermissions(t *testing.T) {
 	if err := os.Chmod(got, 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := storeZcodeToken(path, ZcodeChannelZai, "k2", "", "", ""); err != nil {
+	if _, err := storeZcodeToken(path, ZcodeChannelZai, "k2", "", "", "", nil); err != nil {
 		t.Fatal(err)
 	}
 	info, err = os.Stat(got)

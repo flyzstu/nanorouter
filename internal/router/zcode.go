@@ -9,6 +9,7 @@ package router
 // 上游变更必须同步更新，不能顺手改名。
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
@@ -245,16 +246,25 @@ func ZcodeReferenceTokenPath() string {
 	return filepath.Join(home, zcodeReferenceTokenName)
 }
 
-// resolveCandidateAPIKey 解析候选凭据：环境变量优先（含智谱互备名），
-// 未命中且候选开启 zcode_token_file 时回退读取凭据文件。
-func resolveCandidateAPIKey(u Candidate) string {
+// resolveCandidateAPIKey 解析候选凭据。顺序为环境变量（含智谱互备名）→
+// 数据库 → 凭据文件。
+//
+// 数据库排在文件之前是刻意的：文件里的 key 只能由 login zcode 手工写入，
+// 而 Secret/挂载卷在容器内只读，OAuth 刷新的新 token 无处可存。数据库
+// 是程序自己能写的地方，登录完成后写库，后续请求直接读它。
+func (r *Router) resolveCandidateAPIKey(ctx context.Context, u Candidate) string {
 	if key := resolveAPIKey(u.APIKeyEnv); key != "" {
 		return key
 	}
-	if u.ZcodeTokenFile {
-		return zcodeTokenFileKey(u.ZcodeChannel)
+	if !u.ZcodeTokenFile {
+		return ""
 	}
-	return ""
+	if r.zcodeCredentials != nil {
+		if c, ok := r.zcodeCredentials.get(ctx, u.ZcodeChannel); ok {
+			return c.APIKey
+		}
+	}
+	return zcodeTokenFileKey(u.ZcodeChannel)
 }
 
 // zcodeTokenFileKey 从凭据文件按渠道解析 Coding Plan key。三个只读来源
