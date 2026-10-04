@@ -7,10 +7,12 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"testing"
 	"time"
 
+	_ "github.com/lib/pq"
 	_ "github.com/ncruces/go-sqlite3/driver"
 	_ "github.com/ncruces/go-sqlite3/embed"
 )
@@ -456,5 +458,27 @@ func TestNewRequestMetaShapesAndLimits(t *testing.T) {
 	req.Header.Set("User-Agent", strings.Repeat("a", 300))
 	if meta := newRequestMeta(req, nil, false); len(meta.ClientAgent) != 256 {
 		t.Fatalf("agent len=%d", len(meta.ClientAgent))
+	}
+}
+
+func TestPostgresSummary(t *testing.T) {
+	dsn := os.Getenv("NANOROUTER_TEST_POSTGRES_DSN")
+	if dsn == "" {
+		t.Skip("set NANOROUTER_TEST_POSTGRES_DSN to run PostgreSQL integration test")
+	}
+	db, err := sql.Open("postgres", dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := db.PingContext(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := Migrate(context.Background(), db); err != nil {
+		t.Fatal(err)
+	}
+	store := NewStore(db, "postgres")
+	if _, err := store.Summary(context.Background(), time.Now().Add(-24*time.Hour), 13); err != nil {
+		t.Fatalf("Summary failed on PostgreSQL: %v", err)
 	}
 }

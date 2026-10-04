@@ -18,6 +18,7 @@ import (
 	"time"
 
 	json "github.com/goccy/go-json"
+	"go.uber.org/zap"
 )
 
 //go:embed stats.html
@@ -115,6 +116,7 @@ func (s *Store) Summary(ctx context.Context, since time.Time, bucketSubstrLen in
 	// 理论误判；对统计页而言只影响桶边界±1s 的归属，不值得为它换格式。
 	sinceText := since.UTC().Format(time.RFC3339Nano)
 	successExpr := "CASE WHEN status_code BETWEEN 200 AND 399 THEN 1 ELSE 0 END"
+	failureExpr := "CASE WHEN status_code BETWEEN 200 AND 399 THEN 0 ELSE 1 END"
 
 	err := s.db.QueryRowContext(ctx, s.rebind(
 		`SELECT COUNT(*), COALESCE(SUM(`+successExpr+`), 0),
@@ -148,7 +150,7 @@ func (s *Store) Summary(ctx context.Context, since time.Time, bucketSubstrLen in
 	}
 
 	rows, err := s.db.QueryContext(ctx, s.rebind(
-		`SELECT substr(created_at, 1, ?), COUNT(*), SUM(CASE WHEN `+successExpr+` THEN 0 ELSE 1 END)
+		`SELECT substr(created_at, 1, ?), COUNT(*), COALESCE(SUM(`+failureExpr+`), 0)
 		 FROM llm_requests WHERE created_at >= ? GROUP BY 1 ORDER BY 1`),
 		bucketSubstrLen, sinceText)
 	if err != nil {
@@ -324,6 +326,9 @@ func (r *Router) statsSummary(w http.ResponseWriter, q *http.Request) {
 	}
 	summary, err := r.db.Summary(q.Context(), time.Now().Add(-statsRangeDuration(rangeName)), spec.SubstrLen)
 	if err != nil {
+		if r.logger != nil && r.logger.Core().Enabled(zap.WarnLevel) {
+			r.logger.Warn(r.logMessage("stats_query_failed"), zap.Error(err), zap.String("range", rangeName))
+		}
 		writeJSONError(w, http.StatusInternalServerError, "stats query failed", "stats_unavailable")
 		return
 	}
