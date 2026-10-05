@@ -21,14 +21,26 @@ type zcodeUsageStub struct {
 func newZcodeUsageStub(t *testing.T, respond map[string]string) *zcodeUsageStub {
 	t.Helper()
 	stub := &zcodeUsageStub{mu: make(chan struct{}, 1)}
+	// 用量面四端点 + 只读账户面六端点的典型形状（对齐 glm-usage 合同与
+	// 用户贴出的真实数据字段）。
 	defaults := map[string]string{
-		"/api/monitor/usage/quota/limit":           `{"code":200,"data":{"limits":[{"unit":3,"usage":100,"currentValue":20,"remaining":80}]}}`,
-		"/api/monitor/credit-usage/usage-detail":   `{"code":200,"data":{"summary":{"totalCredits":{"value":12.5}},"modelSummaryList":[{"modelName":"GLM-5.3","totalCredits":9,"totalTokens":1234}]}}`,
-		"/api/monitor/credit-usage/activity":       `{"code":200,"data":{"summary":{"totalTokens":9000},"series":[{"date":"2026-10-01","totalCredits":3,"totalTokens":3000}]}}`,
-		"/api/monitor/usage/model-performance-day": `{"code":200,"data":{"x_time":["2026-10-01"],"liteDecodeSpeed":[55.5],"proMaxDecodeSpeed":[70.1]}}`,
+		"/api/monitor/usage/quota/limit":                                   `{"code":200,"data":{"limits":[{"unit":3,"usage":100,"currentValue":20,"remaining":80}]}}`,
+		"/api/monitor/credit-usage/usage-detail":                           `{"code":200,"data":{"summary":{"totalCredits":{"value":12.5}},"modelSummaryList":[{"modelName":"GLM-5.3","totalCredits":9,"totalTokens":1234}]}}`,
+		"/api/monitor/credit-usage/activity":                               `{"code":200,"data":{"summary":{"totalTokens":9000},"series":[{"date":"2026-10-01","totalCredits":3,"totalTokens":3000}]}}`,
+		"/api/monitor/usage/model-performance-day":                         `{"code":200,"data":{"x_time":["2026-10-01"],"liteDecodeSpeed":[55.5],"proMaxDecodeSpeed":[70.1]}}`,
+		"/api/biz/subscription/list":                                       `{"code":200,"data":{"list":[{"productName":"GLM Coding Lite","status":"VALID","valid":"2027-09-11 10:00:00-2028-09-11 10:00:00","actualPrice":"693.84","renewPrice":"991.2","billingCycle":"annually","autoRenew":false}]}}`,
+		"/api/biz/subscription/v1-coding-plan-auto-renew-closed-by-system": `{"code":200,"data":true}`,
+		"/api/biz/customer-package-reset/list":                             `{"code":200,"data":{"fiveHourResets":[1,2,3,4,5,6,7],"weekResets":[1,2,3,4,5]}}`,
+		"/api/biz/account/query-customer-account-report":                   `{"code":200,"data":{"balance":0,"rechargeAmount":9.35,"giveAmount":102.4,"totalSpendAmount":111.75}}`,
+		"/api/biz/customer/getCustomerInfo":                                `{"code":200,"data":{"id":2399638,"customerName":"flyzstu","email":"w****9@foxmail.com"}}`,
+		"/api/biz/customer/getTokenMagnitude":                              `{"code":200,"data":{"tokens":5000000}}`,
+	}
+	paths := make([]string, 0, len(defaults))
+	for path := range defaults {
+		paths = append(paths, path)
 	}
 	mux := http.NewServeMux()
-	for _, path := range []string{"/api/monitor/usage/quota/limit", "/api/monitor/credit-usage/usage-detail", "/api/monitor/credit-usage/activity", "/api/monitor/usage/model-performance-day"} {
+	for _, path := range paths {
 		body, ok := respond[path]
 		if !ok {
 			body = defaults[path]
@@ -124,28 +136,37 @@ func TestResolveZcodeUsageWindowDefaultsAndValidation(t *testing.T) {
 }
 
 func TestDecodeZcodeUsageEnvelope(t *testing.T) {
-	data, err := decodeZcodeUsageEnvelope([]byte(`{"code":200,"message":"ok","data":{"k":1}}`))
+	data, err := decodeZcodeUsageEnvelope([]byte(`{"code":200,"message":"ok","data":{"k":1}}`), false)
 	if err != nil || string(data) != `{"k":1}` {
 		t.Fatalf("data=%s err=%v", data, err)
 	}
-	if _, err := decodeZcodeUsageEnvelope([]byte(`{"data":{"k":1}}`)); err != nil {
+	if _, err := decodeZcodeUsageEnvelope([]byte(`{"data":{"k":1}}`), false); err != nil {
 		t.Fatalf("missing code should pass: %v", err)
 	}
 	for _, code := range []string{"401", "1001"} {
-		_, err := decodeZcodeUsageEnvelope([]byte(`{"code":` + code + `,"msg":"身份验证失败。"}`))
+		_, err := decodeZcodeUsageEnvelope([]byte(`{"code":`+code+`,"msg":"身份验证失败。"}`), false)
 		if !isZcodeUsageAuthError(err) {
 			t.Fatalf("code %s should be auth error, got %v", code, err)
 		}
 	}
 	// 厂商对坏凭据回 200 + success:false（详见 glm-usage client.py 实测）。
-	if _, err := decodeZcodeUsageEnvelope([]byte(`{"code":1000,"success":false,"msg":"身份验证失败。"}`)); err == nil || isZcodeUsageAuthError(err) {
+	if _, err := decodeZcodeUsageEnvelope([]byte(`{"code":1000,"success":false,"msg":"身份验证失败。"}`), false); err == nil || isZcodeUsageAuthError(err) {
 		t.Fatalf("success=false should be plain error, got %v", err)
 	}
-	if _, err := decodeZcodeUsageEnvelope([]byte(`not-json`)); err == nil {
+	if _, err := decodeZcodeUsageEnvelope([]byte(`not-json`), false); err == nil {
 		t.Fatal("non-json should fail")
 	}
-	if _, err := decodeZcodeUsageEnvelope([]byte(`{"code":200}`)); err == nil {
-		t.Fatal("missing data should fail")
+	if _, err := decodeZcodeUsageEnvelope([]byte(`{"code":200}`), false); err == nil {
+		t.Fatal("missing data should fail for monitor endpoints")
+	}
+	// biz 端点容忍 data 缺省：glm-usage 返回 payload.get("data", payload)，
+	// data 可能是布尔或整个缺省，此时回退整个信封体而非报错。
+	body, err := decodeZcodeUsageEnvelope([]byte(`{"code":200}`), true)
+	if err != nil || string(body) != `{"code":200}` {
+		t.Fatalf("biz tolerant: body=%s err=%v", body, err)
+	}
+	if body, err := decodeZcodeUsageEnvelope([]byte(`{"code":200,"data":true}`), true); err != nil || string(body) != "true" {
+		t.Fatalf("biz data bool: body=%s err=%v", body, err)
 	}
 }
 
@@ -158,7 +179,8 @@ func TestZcodeUsageHandlerAggregatesSectionsAndCaches(t *testing.T) {
 		t.Fatalf("status = %d, body = %v", res.StatusCode, body)
 	}
 	sections, _ := body["sections"].(map[string]any)
-	for _, key := range []string{"quota", "usage", "activity", "performance"} {
+	// 用量面四块 + 账户面六块全部到位。
+	for _, key := range []string{"quota", "usage", "activity", "performance", "subscription", "auto_renew", "resets", "account", "customer", "magnitude"} {
 		if _, ok := sections[key]; !ok {
 			t.Fatalf("sections missing %q: %v", key, body)
 		}
@@ -174,30 +196,54 @@ func TestZcodeUsageHandlerAggregatesSectionsAndCaches(t *testing.T) {
 	if len(limits) != 1 {
 		t.Fatalf("quota limits = %v", quota)
 	}
+	subscription, _ := sections["subscription"].(map[string]any)
+	list, _ := subscription["list"].([]any)
+	if len(list) != 1 {
+		t.Fatalf("subscription list = %v", subscription)
+	}
+	customer, _ := sections["customer"].(map[string]any)
+	if customer["customerName"] != "flyzstu" {
+		t.Fatalf("customer = %v", customer)
+	}
 
 	requests := stub.hits(t)
-	if len(requests) != 4 {
-		t.Fatalf("upstream hits = %d, want 4: %v", len(requests), requests)
+	if len(requests) != 10 {
+		t.Fatalf("upstream hits = %d, want 10: %v", len(requests), requests)
 	}
 	for _, hit := range requests {
-		if strings.HasPrefix(hit, "/api/monitor/usage/quota/limit") && strings.Contains(hit, "startTime") {
-			t.Fatalf("quota should not carry window params: %s", hit)
+		path := strings.SplitN(hit, "?", 2)[0]
+		windowed := path != "/api/monitor/usage/quota/limit" && !strings.HasPrefix(path, "/api/biz/")
+		if windowed && (!strings.Contains(hit, "startTime=") || !strings.Contains(hit, "endTime=")) {
+			t.Fatalf("windowed endpoint missing time params: %s", hit)
 		}
-		if strings.Contains(hit, "usage-detail") {
+		if !windowed && strings.Contains(hit, "startTime=") {
+			t.Fatalf("snapshot endpoint should not carry window params: %s", hit)
+		}
+		switch path {
+		case "/api/monitor/credit-usage/usage-detail":
 			// glm-usage 合同：usage-detail 带 type=1&usageType=MODEL，缺了上游回空体。
 			if !strings.Contains(hit, "type=1") || !strings.Contains(hit, "usageType=MODEL") {
 				t.Fatalf("usage-detail missing type params: %s", hit)
 			}
-		}
-		if strings.Contains(hit, "credit-usage/activity") && !strings.Contains(hit, "type=1") {
-			t.Fatalf("activity missing type=1: %s", hit)
-		}
-		if strings.Contains(hit, "model-performance-day") && strings.Contains(hit, "type=") {
-			t.Fatalf("performance should not carry type param: %s", hit)
-		}
-		if strings.Contains(hit, "usage-detail") || strings.Contains(hit, "activity") || strings.Contains(hit, "model-performance-day") {
-			if !strings.Contains(hit, "startTime=") || !strings.Contains(hit, "endTime=") {
-				t.Fatalf("windowed endpoint missing time params: %s", hit)
+		case "/api/monitor/credit-usage/activity":
+			if !strings.Contains(hit, "type=1") {
+				t.Fatalf("activity missing type=1: %s", hit)
+			}
+		case "/api/monitor/usage/model-performance-day":
+			if strings.Contains(hit, "type=") {
+				t.Fatalf("performance should not carry type param: %s", hit)
+			}
+		case "/api/biz/subscription/list":
+			if !strings.Contains(hit, "pageSize=9999") || !strings.Contains(hit, "pageNum=1") {
+				t.Fatalf("subscription missing paging params: %s", hit)
+			}
+		case "/api/biz/customer-package-reset/list":
+			if !strings.Contains(hit, "targetType=PERSONAL") {
+				t.Fatalf("resets missing targetType: %s", hit)
+			}
+		case "/api/biz/customer/getTokenMagnitude":
+			if !strings.Contains(hit, "productId=product-005") {
+				t.Fatalf("magnitude missing productId: %s", hit)
 			}
 		}
 		if !strings.Contains(hit, "auth=db-test-key") {
@@ -206,17 +252,25 @@ func TestZcodeUsageHandlerAggregatesSectionsAndCaches(t *testing.T) {
 	}
 
 	// 第二次请求全部命中缓存：不再打上游。
-	if _, body := getZcodeUsage(t, r, ""); len(stub.hits(t)) != 4 {
+	if _, body := getZcodeUsage(t, r, ""); len(stub.hits(t)) != 10 {
 		t.Fatalf("second request should be served from cache, hits = %v, body = %v", stub.hits(t), body)
 	}
 }
 
 func TestZcodeUsageAuthFailureReturns401(t *testing.T) {
+	// 全部十个端点都拒绝凭据：凭据失效必须整体 401 暴露，不能用旧值遮掩。
+	authDenied := `{"code":401,"msg":"身份验证失败。"}`
 	stub := newZcodeUsageStub(t, map[string]string{
-		"/api/monitor/usage/quota/limit":           `{"code":401,"msg":"身份验证失败。"}`,
-		"/api/monitor/credit-usage/usage-detail":   `{"code":401,"msg":"身份验证失败。"}`,
-		"/api/monitor/credit-usage/activity":       `{"code":401,"msg":"身份验证失败。"}`,
-		"/api/monitor/usage/model-performance-day": `{"code":401,"msg":"身份验证失败。"}`,
+		"/api/monitor/usage/quota/limit":                                   authDenied,
+		"/api/monitor/credit-usage/usage-detail":                           authDenied,
+		"/api/monitor/credit-usage/activity":                               authDenied,
+		"/api/monitor/usage/model-performance-day":                         authDenied,
+		"/api/biz/subscription/list":                                       authDenied,
+		"/api/biz/subscription/v1-coding-plan-auto-renew-closed-by-system": authDenied,
+		"/api/biz/customer-package-reset/list":                             authDenied,
+		"/api/biz/account/query-customer-account-report":                   authDenied,
+		"/api/biz/customer/getCustomerInfo":                                authDenied,
+		"/api/biz/customer/getTokenMagnitude":                              authDenied,
 	})
 	r := newZcodeUsageRouter(t, stub)
 
@@ -288,8 +342,9 @@ func TestZcodeUsageServesStaleValueAfterUpstreamFailure(t *testing.T) {
 		t.Fatalf("degraded sections should carry failures: %v", body)
 	}
 
-	// 快进越过 stale TTL 后旧值不再服役：全部失败 → 502。
-	cache.now = func() time.Time { return cachedNow().Add(20 * time.Minute) }
+	// 快进越过 stale TTL 后旧值不再服役：全部失败 → 502。快进量要超过
+	// 最长的缓存 TTL（biz 端点 1 小时），否则 biz 新鲜缓存仍会让整体 200。
+	cache.now = func() time.Time { return cachedNow().Add(2 * time.Hour) }
 	res, _ = getZcodeUsage(t, r, "")
 	if res.StatusCode != http.StatusBadGateway {
 		t.Fatalf("status = %d, want 502 after stale expiry", res.StatusCode)
@@ -300,16 +355,44 @@ func TestZcodeUsageWindowParamChangesCacheKey(t *testing.T) {
 	stub := newZcodeUsageStub(t, nil)
 	r := newZcodeUsageRouter(t, stub)
 
+	countBiz := func(hits []string) int {
+		count := 0
+		for _, hit := range hits {
+			if strings.HasPrefix(strings.SplitN(hit, "?", 2)[0], "/api/biz/") {
+				count++
+			}
+		}
+		return count
+	}
+	countPath := func(hits []string, needle string) int {
+		count := 0
+		for _, hit := range hits {
+			if strings.Contains(hit, needle) {
+				count++
+			}
+		}
+		return count
+	}
+
 	if res, _ := getZcodeUsage(t, r, "?days=1"); res.StatusCode != http.StatusOK {
 		t.Fatalf("days=1 failed: %d", res.StatusCode)
 	}
-	// 不同窗口是不同缓存键：必须重新进上游而不是复用 7 天窗的缓存。
-	hits := len(stub.hits(t))
+	before := stub.hits(t)
+
+	// 不同窗口：带窗端点必须重新进上游（缓存键含窗口）；biz 快照与 60s
+	// 新鲜的 quota 跨窗口共享缓存，不得重复外呼。
 	if res, _ := getZcodeUsage(t, r, "?days=30"); res.StatusCode != http.StatusOK {
 		t.Fatalf("days=30 failed: %d", res.StatusCode)
 	}
-	if after := len(stub.hits(t)); after != hits*2 {
-		t.Fatalf("hits = %d, want %d（不同窗口不得共享缓存）", after, hits*2)
+	after := stub.hits(t)
+	if got, want := countBiz(after), countBiz(before); got != want {
+		t.Fatalf("biz hits = %d, want %d（快照端点不得随窗口重新外呼）", got, want)
+	}
+	if countPath(after, "usage-detail") != countPath(before, "usage-detail")+1 {
+		t.Fatalf("usage-detail should refetch for a new window: %v", after)
+	}
+	if countPath(after, "quota/limit") != countPath(before, "quota/limit") {
+		t.Fatalf("quota is windowless and fresh, should stay cached: %v", after)
 	}
 	if _, body := getZcodeUsage(t, r, "?days=x"); body["error"] == nil {
 		t.Fatalf("days=x should 400, body = %v", body)

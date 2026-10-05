@@ -253,7 +253,25 @@
   </section>
 </div>
 
-<footer>数据来自 llm_requests 台账（请求侧元数据，不含对话内容）。usage_source=unavailable 的请求 token 计为零；client_ip / client_agent / 工具名为调用方元数据，直连部署记录 TCP 对端地址，开启 trust_forwarded_for 后取 X-Forwarded-For 首值。ZCode 用量来自智谱 bigmodel.cn 监控端点，凭据复用网关登录链，配额缓存 60s、历史区块 5 分钟。</footer>
+<div class="kpis" id="zresets" style="margin-bottom:12px;"></div>
+<div class="grid2">
+  <section class="card">
+    <h2>套餐 <span class="pill" id="zrenew"></span></h2>
+    <table id="zplan"><thead><tr><th>项目</th><th class="num">值</th></tr></thead><tbody></tbody></table>
+  </section>
+  <div class="stack">
+    <section class="card">
+      <h2>账户资金</h2>
+      <table id="zbalance"><thead><tr><th>项目</th><th class="num">值</th></tr></thead><tbody></tbody></table>
+    </section>
+    <section class="card">
+      <h2>账户信息</h2>
+      <table id="zcustomer"><thead><tr><th>项目</th><th class="num">值</th></tr></thead><tbody></tbody></table>
+    </section>
+  </div>
+</div>
+
+<footer>数据来自 llm_requests 台账（请求侧元数据，不含对话内容）。usage_source=unavailable 的请求 token 计为零；client_ip / client_agent / 工具名为调用方元数据，直连部署记录 TCP 对端地址，开启 trust_forwarded_for 后取 X-Forwarded-For 首值。ZCode 用量来自智谱 bigmodel.cn 监控端点，凭据复用网关登录链，配额缓存 60s、历史区块 5 分钟、套餐与账户区块 1 小时；账户面只读，不含任何核销操作。</footer>
 <script>
 "use strict";
 const $ = (id) => document.getElementById(id);
@@ -601,6 +619,78 @@ function zShowError(message) {
   box.style.display = message ? "block" : "none";
   box.textContent = message || "";
 }
+function zKV(id, rows) {
+  const tb = $(id).querySelector("tbody");
+  tb.textContent = "";
+  if (!rows.length) {
+    tb.innerHTML = '<tr><td colspan="2" class="empty">暂无数据</td></tr>';
+    return;
+  }
+  for (const [k, v] of rows) {
+    const tr = document.createElement("tr");
+    tr.innerHTML = "<td>" + esc(k) + '</td><td class="num">' + esc(v) + "</td>";
+    tb.append(tr);
+  }
+}
+// 套餐与账户卡片（glm-usage /account 同款，全部只读块）：上游字段不齐是
+// 常态，逐块容忍缺失，只渲染有数据的行。
+function zRenderAccount(s) {
+  const sub = s.subscription || {};
+  let plan = null;
+  for (const key of ["list", "records", "rows", "items"]) {
+    if (Array.isArray(sub[key]) && sub[key].length) { plan = sub[key][0]; break; }
+  }
+  const first = (obj, keys) => {
+    for (const k of keys) {
+      const v = obj ? obj[k] : undefined;
+      if (v !== null && v !== undefined && v !== "") return v;
+    }
+    return null;
+  };
+  if (plan) {
+    const price = first(plan, ["actualPrice", "renewPrice"]);
+    const both = [plan.actualPrice, plan.renewPrice].filter((v) => v !== null && v !== undefined && v !== "");
+    const renewClosed = s.auto_renew === true;
+    $("zrenew").textContent = renewClosed ? "自动续订已被关闭" : (plan.autoRenew ? "自动续费中" : "未开启自动续费");
+    zKV("zplan", [
+      ["套餐", first(plan, ["productName", "productCode"]) || "–"],
+      ["状态", first(plan, ["status"]) || "–"],
+      ["有效期", first(plan, ["valid", "validTime"]) || "–"],
+      both.length > 1 ? ["价格（现价 / 续费价）", both.join(" / ")] : ["价格", price || "–"],
+      ["计费周期", first(plan, ["billingCycle"]) || "–"],
+    ].filter(([, v]) => v !== "–"));
+  } else {
+    $("zrenew").textContent = "";
+    zKV("zplan", []);
+  }
+  const resets = s.resets || {};
+  const resetCards = [
+    { sub: "5 小时额度重置", value: Array.isArray(resets.fiveHourResets) ? resets.fiveHourResets.length + " 次" : null },
+    { sub: "周额度重置", value: Array.isArray(resets.weekResets) ? resets.weekResets.length + " 次" : null },
+  ];
+  const magnitude = s.magnitude || {};
+  const trialTokens = magnitude.tokens !== undefined ? magnitude.tokens : magnitude.tokenMagnitude;
+  if (trialTokens !== null && trialTokens !== undefined && trialTokens !== "") {
+    resetCards.push({ sub: "体验卡 Token 总量", value: fmtInt(Number(trialTokens) || 0) });
+  }
+  zRenderCards("zresets", resetCards.filter((c) => c.value !== null));
+  const balance = s.account || {};
+  zKV("zbalance", [
+    ["可用余额", first(balance, ["balance", "availableBalance"]) ?? "–"],
+    ["充值累计", first(balance, ["rechargeAmount"]) ?? "–"],
+    ["赠送累计", first(balance, ["giveAmount"]) ?? "–"],
+    ["消费累计", first(balance, ["totalSpendAmount"]) ?? "–"],
+    ["冻结", first(balance, ["frozenBalance"]) ?? "–"],
+  ].filter(([, v]) => v !== "–"));
+  const customer = s.customer || {};
+  zKV("zcustomer", [
+    ["用户名", first(customer, ["customerName"])],
+    ["邮箱", first(customer, ["email"])],
+    ["手机号", first(customer, ["phoneNumber"])],
+    ["客户编号", first(customer, ["customerNumber"])],
+    ["用户 ID", first(customer, ["id"])],
+  ].filter(([, v]) => v !== null && v !== undefined && v !== ""));
+}
 async function zLoad() {
   const wanted = state.zdays;
   try {
@@ -694,6 +784,8 @@ async function zLoad() {
       (liteLatest === null || isNaN(liteLatest)) ? null : { sub: "Lite 解码速度", value: zNum(liteLatest) + " t/s" },
       (proLatest === null || isNaN(proLatest)) ? null : { sub: "Pro&Max 解码速度", value: zNum(proLatest) + " t/s" },
     ]);
+    // 套餐与账户（只读）：逐块容忍缺失，缺数据的卡片自然留空。
+    zRenderAccount(sections);
     // 降级区块（缓存旧值 + 刷新失败）已在图里渲染，但必须标注出来，
     // 不能让旧数字看起来像实时数据。
     const failures = body.failures || [];
@@ -705,10 +797,14 @@ async function zLoad() {
   } catch (err) {
     zShowError("ZCode 用量加载失败：" + err.message);
     // 失败时清空区块，避免上一轮旧数据与错误并存造成误读。
-    for (const id of ["zquota", "zstats", "zchart", "zaxis", "zperf", "zperfaxis", "zperfstats"]) {
+    for (const id of ["zquota", "zstats", "zchart", "zaxis", "zperf", "zperfaxis", "zperfstats", "zresets"]) {
       const host = $(id); if (host) host.textContent = "";
     }
     $("zmodels").querySelector("tbody").innerHTML = '<tr><td colspan="4" class="empty">–</td></tr>';
+    for (const id of ["zplan", "zbalance", "zcustomer"]) {
+      $(id).querySelector("tbody").innerHTML = '<tr><td colspan="2" class="empty">–</td></tr>';
+    }
+    $("zrenew").textContent = "";
   }
 }
 const esc = (s) => String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;");

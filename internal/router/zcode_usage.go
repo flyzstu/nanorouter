@@ -48,12 +48,15 @@ const (
 // 是否携带时间窗参数——quota 是即时快照，glm-usage 调它时不带任何参数。
 // extraParams 是端点固定参数：glm-usage 的合同里 usage-detail 带
 // type=1&usageType=MODEL、activity 带 type=1（PLAN_TYPE="1"），缺了上游
-// 会返回空体。
+// 会返回空体。bizTolerant 标记 biz 端点：data 可能是列表、布尔或整个缺省
+// （glm-usage 实测返回 payload.get("data", payload)），解码时缺省回退整个
+// 信封体而不是报错。
 type zcodeUsageEndpoint struct {
 	key         string
 	path        string
 	cacheTTL    time.Duration
 	windowed    bool
+	bizTolerant bool
 	extraParams map[string]string
 }
 
@@ -64,6 +67,19 @@ var zcodeUsageEndpoints = []zcodeUsageEndpoint{
 	{key: "activity", path: "/api/monitor/credit-usage/activity", cacheTTL: 5 * time.Minute, windowed: true,
 		extraParams: map[string]string{"type": "1"}},
 	{key: "performance", path: "/api/monitor/usage/model-performance-day", cacheTTL: 5 * time.Minute, windowed: true},
+	// 只读账户面（glm-usage /account 同款六块，全部只要 api_key）：套餐、
+	// 自动续费、额度重置记录、账户资金、账户信息、体验卡 token。变更频率
+	// 低，缓存 1 小时（对齐 glm-usage 的 account_ttl）。不含任何核销类
+	// 破坏性端点。
+	{key: "subscription", path: "/api/biz/subscription/list", cacheTTL: time.Hour, bizTolerant: true,
+		extraParams: map[string]string{"pageSize": "9999", "pageNum": "1"}},
+	{key: "auto_renew", path: "/api/biz/subscription/v1-coding-plan-auto-renew-closed-by-system", cacheTTL: time.Hour, bizTolerant: true},
+	{key: "resets", path: "/api/biz/customer-package-reset/list", cacheTTL: time.Hour, bizTolerant: true,
+		extraParams: map[string]string{"targetType": "PERSONAL"}},
+	{key: "account", path: "/api/biz/account/query-customer-account-report", cacheTTL: time.Hour, bizTolerant: true},
+	{key: "customer", path: "/api/biz/customer/getCustomerInfo", cacheTTL: time.Hour, bizTolerant: true},
+	{key: "magnitude", path: "/api/biz/customer/getTokenMagnitude", cacheTTL: time.Hour, bizTolerant: true,
+		extraParams: map[string]string{"productId": "product-005"}},
 }
 
 // zcodeUsageEntry 是一个端点的缓存条目。err 非空表示上次拉取失败：
@@ -110,7 +126,11 @@ func newZcodeUsageCache() *zcodeUsageCache {
 
 // fetch 拉一个端点。返回 (数据, 失败原因)；数据非空且 err 非空 = 降级中的旧值。
 func (c *zcodeUsageCache) fetch(ctx context.Context, ep zcodeUsageEndpoint, window zcodeUsageWindow, token string) (json.RawMessage, error) {
-	cacheKey := ep.key + "|" + window.cacheKey()
+	// 时间窗只进带窗端点的缓存键：biz 快照端点跨窗口共享同一份缓存。
+	cacheKey := ep.key
+	if ep.windowed {
+		cacheKey += "|" + window.cacheKey()
+	}
 	serve, call, owner := c.claim(cacheKey, ep)
 
 	if !owner {
@@ -258,7 +278,7 @@ func (c *zcodeUsageCache) upstream(ctx context.Context, ep zcodeUsageEndpoint, w
 	if len(strings.TrimSpace(string(body))) == 0 {
 		return nil, errors.New("zcode usage 上游返回空响应")
 	}
-	return decodeZcodeUsageEnvelope(body)
+	return decodeZcodeUsageEnvelope(body, ep.bizTolerant)
 }
 
 // zcodeUsageAuthError 标记「上游明确拒绝了凭据」（HTTP 200 信封 code
@@ -279,8 +299,11 @@ func isZcodeUsageAuthErrorText(message string) bool {
 }
 
 // decodeZcodeUsageEnvelope 解开上游的 {"code":..,"data":..} 信封。
-// glm-usage 实测：鉴权失败回 HTTP 200 + code 401/1001；成功 code 为 200 或缺省。
-func decodeZcodeUsageEnvelope(body []byte) (json.RawMessage, error) {
+// glm-usage 实测：鉴权失败回 HTTP 200 + code 401/1001；成功 code 为 200 或
+// 缺省。bizTolerant 时 data 缺省不是错误——biz 端点的 data 可能是列表、
+// 布尔或整个缺省（glm-usage 返回 payload.get("data", payload)），回退整个
+// 信封体交给前端按形状容忍渲染。
+func decodeZcodeUsageEnvelope(body []byte, bizTolerant bool) (json.RawMessage, error) {
 	var envelope struct {
 		Code    *int            `json:"code"`
 		Success *bool           `json:"success"`
@@ -305,6 +328,9 @@ func decodeZcodeUsageEnvelope(body []byte) (json.RawMessage, error) {
 		return nil, fmt.Errorf("zcode usage 上游错误: %s", message)
 	}
 	if len(envelope.Data) == 0 {
+		if bizTolerant {
+			return json.RawMessage(body), nil
+		}
 		return nil, errors.New("zcode usage 响应缺少 data 字段")
 	}
 	return envelope.Data, nil
