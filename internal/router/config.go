@@ -17,6 +17,11 @@ type Config struct {
 	// 接受 Authorization: Bearer <key> 与 X-Api-Key: <key> 两种传参并存
 	// （OpenAI 系与 Anthropic 系客户端各自的习惯头，同一把 key 皆可）。
 	AuthEnv string `yaml:"auth_env"`
+	// StatsPublic 将统计面（/stats、/v1/stats/summary、/v1/zcode/usage）
+	// 整体豁免出鉴权：内网或反代层已做访问控制、只想公开面板时开启。
+	// 注意 /v1/zcode/usage 会匿名触发网关用所存凭据外呼智谱监控端点，
+	// 并暴露配额与积分等账户级数据；生成端点不受影响，照常要求 key。
+	StatsPublic bool `yaml:"stats_public"`
 	// TrustForwardedFor 开启后统计里的调用方 IP 取 X-Forwarded-For 首值。
 	// 仅在网关前面有可信反代时开启；直连部署开启会让调用方伪造来源。
 	TrustForwardedFor bool               `yaml:"trust_forwarded_for"`

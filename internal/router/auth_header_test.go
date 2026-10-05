@@ -110,3 +110,65 @@ func TestAuthErrorDialectByPath(t *testing.T) {
 		t.Fatalf("chat completions: %d %s", rec.Code, rec.Body.String())
 	}
 }
+
+func TestStatsPublicAuthMatrix(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		public bool
+	}{
+		{"default keeps stats behind auth", false},
+		{"stats_public exempts stats surface", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			// 隔离凭据文件源：公开态下匿名打 /v1/zcode/usage 会进 handler，
+			// 无凭据应回 503，而不是读到开发机的真凭据去碰真上游。
+			t.Setenv("HOME", t.TempDir())
+			resetZcodeTokenCache()
+			t.Cleanup(resetZcodeTokenCache)
+			t.Setenv("NANOROUTER_STATS_PUBLIC_TEST_KEY", "secret-key")
+			r, err := New(Config{
+				AuthEnv:     "NANOROUTER_STATS_PUBLIC_TEST_KEY",
+				StatsPublic: tc.public,
+				Routes: map[string]Route{"zcode": {Candidates: []Candidate{{
+					ID: "z", BaseURL: "http://127.0.0.1:1", Model: "glm-5.3", Anthropic: true,
+				}}}},
+			}, mustOpenMemoryDB(t))
+			if err != nil {
+				t.Fatal(err)
+			}
+			handler := r.Handler()
+
+			// 统计面三路径：默认全 401，公开态全放行（用量端点无凭据时
+			// 进 handler 回 503，鉴权层不再拦截）。
+			for _, path := range []string{"/stats", "/v1/stats/summary", "/v1/zcode/usage"} {
+				q := httptest.NewRequest(http.MethodGet, path, nil)
+				rec := httptest.NewRecorder()
+				handler.ServeHTTP(rec, q)
+				if tc.public {
+					if rec.Code == http.StatusUnauthorized {
+						t.Fatalf("%s: still 401 with stats_public", path)
+					}
+					continue
+				}
+				if rec.Code != http.StatusUnauthorized {
+					t.Fatalf("%s: anonymous status = %d, want 401", path, rec.Code)
+				}
+			}
+
+			// 生成端点不受豁免影响：匿名 401、带 key 200，两态一致。
+			q := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+			rec := httptest.NewRecorder()
+			handler.ServeHTTP(rec, q)
+			if rec.Code != http.StatusUnauthorized {
+				t.Fatalf("models anonymous: %d, want 401 (public=%v)", rec.Code, tc.public)
+			}
+			q = httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+			q.Header.Set("X-Api-Key", "secret-key")
+			rec = httptest.NewRecorder()
+			handler.ServeHTTP(rec, q)
+			if rec.Code != http.StatusOK {
+				t.Fatalf("models with key: %d, want 200 (public=%v)", rec.Code, tc.public)
+			}
+		})
+	}
+}

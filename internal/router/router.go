@@ -281,6 +281,12 @@ func (r *Router) auth(next http.Handler) http.Handler {
 		return subtle.ConstantTimeCompare([]byte(presented), []byte(expected)) == 1
 	}
 	return http.HandlerFunc(func(w http.ResponseWriter, q *http.Request) {
+		// stats_public: 统计面整体豁免鉴权（内网/反代层自管访问控制的部署）。
+		// 生成端点不在豁免名单，照常要求 key。
+		if r.cfg.StatsPublic && statsAuthPaths[q.URL.Path] {
+			next.ServeHTTP(w, q)
+			return
+		}
 		// 两种传参并存：OpenAI 系客户端惯用 Bearer，Anthropic 系惯用
 		// x-api-key——同一把 key 两种头都认，客户端不用为网关改认证方式。
 		authorized := false

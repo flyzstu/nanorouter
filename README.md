@@ -401,6 +401,8 @@ Cookie、请求正文、prompt、模型回复或密钥。
 两个路径走与其他端点相同的 `auth_env` 认证：API 客户端可用 `Authorization: Bearer <key>` 或 `X-Api-Key: <key>`
 两种传参（并存，OpenAI 系与 Anthropic 系客户端各取所惯，同一把 key 皆可）；浏览器没有请求头注入点，
 未认证访问会弹出原生登录框，用户名或密码任一位填 API key 即可。生成端点不接受 Basic 回退，认证面不放宽。
+内网或反代层已自管访问控制时，可设 `stats_public: true` 将统计面（页面与 `/v1/stats/summary`、`/v1/zcode/usage`
+两个数据端点）整体豁免鉴权、匿名可看——注意用量端点会匿名触发网关外呼智谱并暴露账户级数据，生成端点仍要求 key。
 `tools_count`/`tool_names`/`client_ip`/`client_agent` 四列来自请求侧元数据（旧库自动迁移补列）：工具名取请求
 `tools` 数组（兼容 OpenAI 与 Anthropic 两种形状），不含响应侧 tool_calls 次数；调用方 IP 直连部署记录 TCP 对端
 地址，前面有可信反代时开启 `trust_forwarded_for: true` 改取 `X-Forwarded-For` 首值。这些列不含 prompt 与回复内容。

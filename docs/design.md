@@ -258,6 +258,9 @@ jsonb_array_elements_text），拉回 Go 侧归并。调用方 IP 直连记 TCP 
 `trust_forwarded_for` 后取 `X-Forwarded-For` 首值（仅限可信反代后部署，否则来源可
 伪造）。统计路径的认证在 Bearer/`X-Api-Key` 之外为浏览器放宽 Basic（仅
 `/stats`、`/v1/stats/summary` 与 `/v1/zcode/usage` 三个路径），生成端点不放宽。
+`stats_public: true` 时这三个路径整体豁免鉴权——为反代层或内网已自管访问控制的
+部署准备；豁免面不含任何生成端点，`/v1/zcode/usage` 的账户级数据公开与匿名外呼
+是开启者显式接受的取舍。
 
 ZCode 用量看板（`GET /v1/zcode/usage`，渲染在统计页下半区）是唯一主动外呼厂商
 biz 主机的辅助路径：网关按 glm-usage 移植的四个监控端点（配额、模型用量、活动

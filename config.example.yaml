@@ -16,6 +16,11 @@ logging:
 # 日志时区通过进程环境变量 TZ 控制，例如 TZ=Asia/Shanghai；数据库时间始终保存为 UTC。
 # 设定后，下游需使用 Authorization: Bearer $NANOROUTER_API_KEY。
 auth_env: NANOROUTER_API_KEY
+# 公开统计面：/stats、/v1/stats/summary、/v1/zcode/usage 不再要求 key，
+# 供内网或反代层已做访问控制的部署直接打开面板。注意 /v1/zcode/usage 会
+# 匿名触发网关用所存凭据外呼智谱监控端点，并暴露配额/积分等账户级数据；
+# 生成端点不受影响，照常要求 key。默认 false。
+# stats_public: true
 # 统计页的调用方 IP 取自 X-Forwarded-For 首值。仅当网关前面有可信反代时
 # 开启；直连部署保持关闭（默认 false，记录 TCP 对端地址），否则调用方可
 # 伪造来源。
