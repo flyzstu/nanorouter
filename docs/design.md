@@ -251,6 +251,10 @@ PostgreSQL DSN，避免连接凭据进入 ConfigMap。
 内置统计页（`GET /stats` + `GET /v1/stats/summary`）对台账做只读聚合：聚合 SQL 按
 双方言可移植书写——时间分桶用 `substr(created_at, 1, N)`（RFC3339 文本前缀即时间桶），
 百分位用 `ORDER BY ... LIMIT 1 OFFSET k` 而非方言 percentile 函数；空桶由应用层补零。
+页顶另有实时区块（进行中/存活会话/活跃调用方）：进程内存态，与台账互补——
+"进行中"是 acquire→release 之间的并发数；会话与调用方按 5 分钟滑动窗口去重
+计数，只存计数不存明文（会话键与选路亲和同源：X-Session-Affinity →
+X-Session-Id），重启清零，条目上限 5000 防异常流量撑内存。
 `tools_count`/`tool_names`/`client_ip`/`client_agent` 是请求侧元数据：工具名取下游请求
 的 `tools` 数组（兼容 OpenAI/Anthropic 形状），流式透传不解析内容，故不含响应侧
 tool_calls 计数；工具榜聚合因 JSON 展开函数跨方言不统一（json_each vs

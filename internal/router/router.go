@@ -83,6 +83,9 @@ type Router struct {
 	// 让测试可以直接构造 Router{}。
 	zcodeUsage     *zcodeUsageCache
 	zcodeUsageOnce sync.Once
+	// live 是实时会话统计（进行中/存活会话/活跃调用方），懒初始化同上。
+	live     *liveTracker
+	liveOnce sync.Once
 }
 
 // state 是单个上游的熔断状态。冷却期内不再向它发送新请求，
@@ -458,6 +461,10 @@ func (r *Router) proxy(endpoint string, defaultRoutes ...string) http.HandlerFun
 		startedAt := time.Now()
 		requestID := requestID(q)
 		w.Header().Set("X-Request-ID", requestID)
+		// 实时统计：从进入代理到响应结束计为"进行中"（含准入排队）。
+		live := r.liveTracker()
+		live.enter()
+		defer live.leave()
 		ctx, cancelRequest := context.WithTimeout(q.Context(), r.cfg.RequestTimeout)
 		defer cancelRequest()
 		if r.admission != nil {
@@ -526,6 +533,8 @@ func (r *Router) proxy(endpoint string, defaultRoutes ...string) http.HandlerFun
 		if sessionAffinity == "" {
 			sessionAffinity = strings.TrimSpace(q.Header.Get("X-Session-Id"))
 		}
+		// 会话键只参与去重计数，不落内存明文以外的任何地方。
+		live.recordRequest(sessionAffinity, meta.ClientIP)
 		budget := r.retryBudgets[routeName]
 		if budget != nil {
 			r.retryBudgetTokens.WithLabelValues(routeName).Set(budget.credit())

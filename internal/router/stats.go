@@ -28,6 +28,7 @@ var statsPageHTML []byte
 type StatsSummary struct {
 	Range     string          `json:"range"`
 	Bucket    string          `json:"bucket"`
+	Live      LiveStats       `json:"live"`
 	Totals    StatsTotals     `json:"totals"`
 	Series    []StatsPoint    `json:"series"`
 	Models    []StatsModel    `json:"models"`
@@ -334,6 +335,7 @@ func (r *Router) statsSummary(w http.ResponseWriter, q *http.Request) {
 	}
 	summary.Range = rangeName
 	summary.Bucket = spec.Bucket
+	summary.Live = r.liveTracker().snapshot()
 	summary.Series = fillSeriesBuckets(summary.Series, rangeName, spec)
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Cache-Control", "no-store")
