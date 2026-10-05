@@ -635,10 +635,16 @@ function zKV(id, rows) {
 // 套餐与账户卡片（glm-usage /account 同款，全部只读块）：上游字段不齐是
 // 常态，逐块容忍缺失，只渲染有数据的行。
 function zRenderAccount(s) {
-  const sub = s.subscription || {};
+  // subscription 的 data 可能是顶层数组（实测主形态）、{list:[…]} 包裹或单
+  // 对象——三种都识别，取第一条为当前套餐。
+  const rawSub = s.subscription;
+  const firstOf = (arr) => (Array.isArray(arr) && arr.length ? arr[0] : null);
   let plan = null;
-  for (const key of ["list", "records", "rows", "items"]) {
-    if (Array.isArray(sub[key]) && sub[key].length) { plan = sub[key][0]; break; }
+  if (Array.isArray(rawSub)) {
+    plan = firstOf(rawSub);
+  } else if (rawSub && typeof rawSub === "object") {
+    plan = firstOf(rawSub.list) || firstOf(rawSub.records) || firstOf(rawSub.rows) || firstOf(rawSub.items)
+      || (rawSub.productName || rawSub.status ? rawSub : null);
   }
   const first = (obj, keys) => {
     for (const k of keys) {
