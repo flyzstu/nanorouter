@@ -67,19 +67,16 @@ var zcodeUsageEndpoints = []zcodeUsageEndpoint{
 	{key: "activity", path: "/api/monitor/credit-usage/activity", cacheTTL: 5 * time.Minute, windowed: true,
 		extraParams: map[string]string{"type": "1"}},
 	{key: "performance", path: "/api/monitor/usage/model-performance-day", cacheTTL: 5 * time.Minute, windowed: true},
-	// 只读账户面（glm-usage /account 同款六块，全部只要 api_key）：套餐、
-	// 自动续费、额度重置记录、账户资金、账户信息、体验卡 token。变更频率
-	// 低，缓存 1 小时（对齐 glm-usage 的 account_ttl）。不含任何核销类
-	// 破坏性端点。
+	// 只读账户面（glm-usage /account 的可用子集，全部只要 api_key）：套餐、
+	// 自动续费、额度重置记录、账户资金。变更频率低，缓存 1 小时（对齐
+	// glm-usage 的 account_ttl）。不含任何核销类破坏性端点；customer/
+	// magnitude 两端点实测被上游拒绝（403/系统异常），已移除不再外呼。
 	{key: "subscription", path: "/api/biz/subscription/list", cacheTTL: time.Hour, bizTolerant: true,
 		extraParams: map[string]string{"pageSize": "9999", "pageNum": "1"}},
 	{key: "auto_renew", path: "/api/biz/subscription/v1-coding-plan-auto-renew-closed-by-system", cacheTTL: time.Hour, bizTolerant: true},
 	{key: "resets", path: "/api/biz/customer-package-reset/list", cacheTTL: time.Hour, bizTolerant: true,
 		extraParams: map[string]string{"targetType": "PERSONAL"}},
 	{key: "account", path: "/api/biz/account/query-customer-account-report", cacheTTL: time.Hour, bizTolerant: true},
-	{key: "customer", path: "/api/biz/customer/getCustomerInfo", cacheTTL: time.Hour, bizTolerant: true},
-	{key: "magnitude", path: "/api/biz/customer/getTokenMagnitude", cacheTTL: time.Hour, bizTolerant: true,
-		extraParams: map[string]string{"productId": "product-005"}},
 }
 
 // zcodeUsageEntry 是一个端点的缓存条目。err 非空表示上次拉取失败：

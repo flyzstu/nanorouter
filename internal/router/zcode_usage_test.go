@@ -21,8 +21,8 @@ type zcodeUsageStub struct {
 func newZcodeUsageStub(t *testing.T, respond map[string]string) *zcodeUsageStub {
 	t.Helper()
 	stub := &zcodeUsageStub{mu: make(chan struct{}, 1)}
-	// 用量面四端点 + 只读账户面六端点的典型形状（对齐 glm-usage 合同与
-	// 用户贴出的真实数据字段）。
+	// 用量面四端点 + 只读账户面四端点的典型形状（对齐 glm-usage 合同与
+	// 用户贴出的真实数据字段）。customer/magnitude 实测被上游拒绝，已移除。
 	defaults := map[string]string{
 		"/api/monitor/usage/quota/limit":                                   `{"code":200,"data":{"limits":[{"unit":3,"usage":100,"currentValue":20,"remaining":80}]}}`,
 		"/api/monitor/credit-usage/usage-detail":                           `{"code":200,"data":{"summary":{"totalCredits":{"value":12.5}},"modelSummaryList":[{"modelName":"GLM-5.3","totalCredits":9,"totalTokens":1234}]}}`,
@@ -32,8 +32,6 @@ func newZcodeUsageStub(t *testing.T, respond map[string]string) *zcodeUsageStub 
 		"/api/biz/subscription/v1-coding-plan-auto-renew-closed-by-system": `{"code":200,"data":true}`,
 		"/api/biz/customer-package-reset/list":                             `{"code":200,"data":{"fiveHourResets":[1,2,3,4,5,6,7],"weekResets":[1,2,3,4,5]}}`,
 		"/api/biz/account/query-customer-account-report":                   `{"code":200,"data":{"balance":0,"rechargeAmount":9.35,"giveAmount":102.4,"totalSpendAmount":111.75}}`,
-		"/api/biz/customer/getCustomerInfo":                                `{"code":200,"data":{"id":2399638,"customerName":"flyzstu","email":"w****9@foxmail.com"}}`,
-		"/api/biz/customer/getTokenMagnitude":                              `{"code":200,"data":{"tokens":5000000}}`,
 	}
 	paths := make([]string, 0, len(defaults))
 	for path := range defaults {
@@ -179,8 +177,8 @@ func TestZcodeUsageHandlerAggregatesSectionsAndCaches(t *testing.T) {
 		t.Fatalf("status = %d, body = %v", res.StatusCode, body)
 	}
 	sections, _ := body["sections"].(map[string]any)
-	// 用量面四块 + 账户面六块全部到位。
-	for _, key := range []string{"quota", "usage", "activity", "performance", "subscription", "auto_renew", "resets", "account", "customer", "magnitude"} {
+	// 用量面四块 + 账户面四块全部到位。
+	for _, key := range []string{"quota", "usage", "activity", "performance", "subscription", "auto_renew", "resets", "account"} {
 		if _, ok := sections[key]; !ok {
 			t.Fatalf("sections missing %q: %v", key, body)
 		}
@@ -201,14 +199,10 @@ func TestZcodeUsageHandlerAggregatesSectionsAndCaches(t *testing.T) {
 	if len(list) != 1 {
 		t.Fatalf("subscription list = %v", subscription)
 	}
-	customer, _ := sections["customer"].(map[string]any)
-	if customer["customerName"] != "flyzstu" {
-		t.Fatalf("customer = %v", customer)
-	}
 
 	requests := stub.hits(t)
-	if len(requests) != 10 {
-		t.Fatalf("upstream hits = %d, want 10: %v", len(requests), requests)
+	if len(requests) != 8 {
+		t.Fatalf("upstream hits = %d, want 8: %v", len(requests), requests)
 	}
 	for _, hit := range requests {
 		path := strings.SplitN(hit, "?", 2)[0]
@@ -241,10 +235,6 @@ func TestZcodeUsageHandlerAggregatesSectionsAndCaches(t *testing.T) {
 			if !strings.Contains(hit, "targetType=PERSONAL") {
 				t.Fatalf("resets missing targetType: %s", hit)
 			}
-		case "/api/biz/customer/getTokenMagnitude":
-			if !strings.Contains(hit, "productId=product-005") {
-				t.Fatalf("magnitude missing productId: %s", hit)
-			}
 		}
 		if !strings.Contains(hit, "auth=db-test-key") {
 			t.Fatalf("authorization = %s, want db-test-key", hit)
@@ -252,13 +242,13 @@ func TestZcodeUsageHandlerAggregatesSectionsAndCaches(t *testing.T) {
 	}
 
 	// 第二次请求全部命中缓存：不再打上游。
-	if _, body := getZcodeUsage(t, r, ""); len(stub.hits(t)) != 10 {
+	if _, body := getZcodeUsage(t, r, ""); len(stub.hits(t)) != 8 {
 		t.Fatalf("second request should be served from cache, hits = %v, body = %v", stub.hits(t), body)
 	}
 }
 
 func TestZcodeUsageAuthFailureReturns401(t *testing.T) {
-	// 全部十个端点都拒绝凭据：凭据失效必须整体 401 暴露，不能用旧值遮掩。
+	// 全部八个端点都拒绝凭据：凭据失效必须整体 401 暴露，不能用旧值遮掩。
 	authDenied := `{"code":401,"msg":"身份验证失败。"}`
 	stub := newZcodeUsageStub(t, map[string]string{
 		"/api/monitor/usage/quota/limit":                                   authDenied,
@@ -269,8 +259,6 @@ func TestZcodeUsageAuthFailureReturns401(t *testing.T) {
 		"/api/biz/subscription/v1-coding-plan-auto-renew-closed-by-system": authDenied,
 		"/api/biz/customer-package-reset/list":                             authDenied,
 		"/api/biz/account/query-customer-account-report":                   authDenied,
-		"/api/biz/customer/getCustomerInfo":                                authDenied,
-		"/api/biz/customer/getTokenMagnitude":                              authDenied,
 	})
 	r := newZcodeUsageRouter(t, stub)
 

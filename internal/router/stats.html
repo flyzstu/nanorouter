@@ -264,10 +264,6 @@
       <h2>账户资金</h2>
       <table id="zbalance"><thead><tr><th>项目</th><th class="num">值</th></tr></thead><tbody></tbody></table>
     </section>
-    <section class="card">
-      <h2>账户信息</h2>
-      <table id="zcustomer"><thead><tr><th>项目</th><th class="num">值</th></tr></thead><tbody></tbody></table>
-    </section>
   </div>
 </div>
 
@@ -670,15 +666,12 @@ function zRenderAccount(s) {
     zKV("zplan", []);
   }
   const resets = s.resets || {};
+  // customer/magnitude 两端点实测被上游拒绝（403/系统异常），已从网关
+  // 移除：体验卡与账户信息不再渲染。
   const resetCards = [
     { sub: "5 小时额度重置", value: Array.isArray(resets.fiveHourResets) ? resets.fiveHourResets.length + " 次" : null },
     { sub: "周额度重置", value: Array.isArray(resets.weekResets) ? resets.weekResets.length + " 次" : null },
   ];
-  const magnitude = s.magnitude || {};
-  const trialTokens = magnitude.tokens !== undefined ? magnitude.tokens : magnitude.tokenMagnitude;
-  if (trialTokens !== null && trialTokens !== undefined && trialTokens !== "") {
-    resetCards.push({ sub: "体验卡 Token 总量", value: fmtInt(Number(trialTokens) || 0) });
-  }
   zRenderCards("zresets", resetCards.filter((c) => c.value !== null));
   const balance = s.account || {};
   zKV("zbalance", [
@@ -688,14 +681,6 @@ function zRenderAccount(s) {
     ["消费累计", first(balance, ["totalSpendAmount"]) ?? "–"],
     ["冻结", first(balance, ["frozenBalance"]) ?? "–"],
   ].filter(([, v]) => v !== "–"));
-  const customer = s.customer || {};
-  zKV("zcustomer", [
-    ["用户名", first(customer, ["customerName"])],
-    ["邮箱", first(customer, ["email"])],
-    ["手机号", first(customer, ["phoneNumber"])],
-    ["客户编号", first(customer, ["customerNumber"])],
-    ["用户 ID", first(customer, ["id"])],
-  ].filter(([, v]) => v !== null && v !== undefined && v !== ""));
 }
 async function zLoad() {
   const wanted = state.zdays;
@@ -807,7 +792,7 @@ async function zLoad() {
       const host = $(id); if (host) host.textContent = "";
     }
     $("zmodels").querySelector("tbody").innerHTML = '<tr><td colspan="4" class="empty">–</td></tr>';
-    for (const id of ["zplan", "zbalance", "zcustomer"]) {
+    for (const id of ["zplan", "zbalance"]) {
       $(id).querySelector("tbody").innerHTML = '<tr><td colspan="2" class="empty">–</td></tr>';
     }
     $("zrenew").textContent = "";
