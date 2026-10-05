@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/subtle"
 	"database/sql"
 	"encoding/binary"
 	"encoding/hex"
@@ -274,8 +275,22 @@ func (r *Router) auth(next http.Handler) http.Handler {
 	// 凭据（用户名或密码位放 API key 均可），401 带 WWW-Authenticate 让
 	// 浏览器弹出原生登录框。生成端点不放宽，避免削弱网关认证面。
 	statsAuthPaths := map[string]bool{"/stats": true, "/v1/stats/summary": true, "/v1/zcode/usage": true}
+	// keyMatches 常量时间比较：逐字节短路的不等比较存在计时侧信道，
+	// 网关又是长期暴露的服务，不值得省这个包。
+	keyMatches := func(presented string) bool {
+		return subtle.ConstantTimeCompare([]byte(presented), []byte(expected)) == 1
+	}
 	return http.HandlerFunc(func(w http.ResponseWriter, q *http.Request) {
-		if q.Header.Get("Authorization") != "Bearer "+expected {
+		// 两种传参并存：OpenAI 系客户端惯用 Bearer，Anthropic 系惯用
+		// x-api-key——同一把 key 两种头都认，客户端不用为网关改认证方式。
+		authorized := false
+		if authHeader := q.Header.Get("Authorization"); strings.HasPrefix(authHeader, "Bearer ") {
+			authorized = keyMatches(strings.TrimPrefix(authHeader, "Bearer "))
+		}
+		if !authorized {
+			authorized = keyMatches(q.Header.Get("X-Api-Key"))
+		}
+		if !authorized {
 			if statsAuthPaths[q.URL.Path] {
 				// key 填在密码位或用户名位（浏览器登录框首格）都接受。
 				if user, pass, ok := q.BasicAuth(); ok && (pass == expected || user == expected) {

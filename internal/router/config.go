@@ -13,7 +13,10 @@ type Config struct {
 	Listen   string         `yaml:"listen"`
 	Database DatabaseConfig `yaml:"database"`
 	Logging  LoggingConfig  `yaml:"logging"`
-	AuthEnv  string         `yaml:"auth_env"`
+	// AuthEnv 指向存放网关 API key 的环境变量名；配置后所有端点要求认证，
+	// 接受 Authorization: Bearer <key> 与 X-Api-Key: <key> 两种传参并存
+	// （OpenAI 系与 Anthropic 系客户端各自的习惯头，同一把 key 皆可）。
+	AuthEnv string `yaml:"auth_env"`
 	// TrustForwardedFor 开启后统计里的调用方 IP 取 X-Forwarded-For 首值。
 	// 仅在网关前面有可信反代时开启；直连部署开启会让调用方伪造来源。
 	TrustForwardedFor bool               `yaml:"trust_forwarded_for"`

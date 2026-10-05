@@ -72,7 +72,7 @@ Agent / Open WebUI
 下游请求
    │
    ├─ 全局背压准入（读取正文前）
-   ├─ Bearer 鉴权、16 MiB 正文限制、JSON 解析
+   ├─ Bearer/X-Api-Key 鉴权、16 MiB 正文限制、JSON 解析
    ├─ model → 逻辑路由
    │
    └─ 候选循环
@@ -230,7 +230,7 @@ SSE 首字节发给下游后不能再安全换模型：会重复文字，或破�
 
 登录链新增 `OnProgress` 回调暴露两个节点（拿到链接、进入兑换）；命令行登录不设该字段故行为完全不变。`Output` 接一个逐行写 zap 的 writer，于是授权链接与全部阶段提示自动进日志，无需为每一步新增日志语句。
 
-**两个端点是特权面，只认 Bearer。** 它们能让调用方以网关身份登录第三方账号，故不放进 `auth` 的 Basic 回退白名单（该白名单只服务统计页）。`auth_env` 未配置时中间件整体放行——此时这两个端点等于对所有人开放，文档已就此告警。
+**两个端点是特权面，不接受浏览器 Basic 回退。** 它们能让调用方以网关身份登录第三方账号，故不放进 `auth` 的 Basic 回退白名单（该白名单只服务统计页）。请求头认证 Bearer 与 `X-Api-Key` 皆可（与全站一致）。`auth_env` 未配置时中间件整体放行——此时这两个端点等于对所有人开放，文档已就此告警。
 
 **凭据三套存储、一个写入方。** `login zcode` 子命令执行设备码轮询（init → 授权 URL → poll → 兑换 → 探测），把兑换并经 `max_tokens: 1` 网关探测验证的 `id.secret` key 写入 `~/.nanorouter/zcode_token.json`（0600，渠道分组，连同平台 JWT 与 OAuth token）；候选经 `zcode_token_file: true` 只读回退，ZCode 官方加密凭据 `~/.zcode/v2/credentials.json`（AES-256-GCM，种子串取 `ZCODE_CREDENTIAL_SECRET`，未设置时用 `zcode-credential-fallback:{platform}:{homedir}:{username}`；字段选择与解密 1:1 对齐 dsh-zhipu-provider 的 cipher.ts/auth.ts）只读次之，参考客户端的 `~/.zcode_coding_plan_token.json` 只读再次。三套都只读、只有 `~/.nanorouter` 一套可写：官方文件归 ZCode 客户端所有，写入会竞态。网关 401/403 能证伪 key，网关不可达不能——把瞬时故障误报成"key 无效"比多一次探测更糟，因此不可达视为通过。凭据文件带 5 秒进程内缓存：参考客户端至多每次登录重写一次，而请求路径每次环境变量未命中都会来读。
 
@@ -256,8 +256,8 @@ PostgreSQL DSN，避免连接凭据进入 ConfigMap。
 tool_calls 计数；工具榜聚合因 JSON 展开函数跨方言不统一（json_each vs
 jsonb_array_elements_text），拉回 Go 侧归并。调用方 IP 直连记 TCP 对端地址，开启
 `trust_forwarded_for` 后取 `X-Forwarded-For` 首值（仅限可信反代后部署，否则来源可
-伪造）。统计路径的认证在 Bearer 之外为浏览器放宽 Basic（仅 `/stats` 与
-`/v1/stats/summary` 两个路径），生成端点不放宽。
+伪造）。统计路径的认证在 Bearer/`X-Api-Key` 之外为浏览器放宽 Basic（仅
+`/stats`、`/v1/stats/summary` 与 `/v1/zcode/usage` 三个路径），生成端点不放宽。
 
 ZCode 用量看板（`GET /v1/zcode/usage`，渲染在统计页下半区）是唯一主动外呼厂商
 biz 主机的辅助路径：网关按 glm-usage 移植的四个监控端点（配额、模型用量、活动
