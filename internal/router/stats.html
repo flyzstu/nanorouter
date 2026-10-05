@@ -557,20 +557,36 @@ function zRenderChart(chartId, axisId, series, isPerf) {
   const tail = document.createElement("span"); tail.textContent = series[series.length - 1].date;
   axis.append(head, mid, tail);
 }
-function zRenderModels(list) {
+function zRenderModels(usage) {
   const tb = $("zmodels").querySelector("tbody");
   tb.textContent = "";
-  if (!list.length) {
+  const unwrap = (v) => (v && typeof v === "object" && v.value !== undefined ? v.value : v);
+  const sum = (arr) => (Array.isArray(arr) ? arr.reduce((acc, v) => acc + (Number(v) || 0), 0) : 0);
+  // 两种上游形状：glm-usage 文档的 modelSummaryList（每模型标量总量）与
+  // 实测的 modelUsage.modelDataList（每模型按日数组，需逐日求和；积分为
+  // 字符串，totalCreditsUsage 缺失时退 input+output 之和）。
+  let rows = [];
+  if (Array.isArray(usage && usage.modelSummaryList) && usage.modelSummaryList.length) {
+    rows = usage.modelSummaryList.map((m) => ({
+      name: m.modelName || m.modelCode || "未知",
+      credits: Number(unwrap(m.totalCredits)) || 0,
+      tokens: Number(unwrap(m.totalTokens)) || 0,
+    }));
+  } else if (Array.isArray(usage && usage.modelUsage && usage.modelUsage.modelDataList)) {
+    rows = usage.modelUsage.modelDataList.map((m) => {
+      let credits = sum(m.totalCreditsUsage);
+      if (!credits) credits = sum(m.inputCreditsUsage) + sum(m.outputCreditsUsage);
+      let tokens = sum(m.totalTokensUsage);
+      if (!tokens) tokens = sum(m.inputTokensUsage) + sum(m.outputTokensUsage);
+      return { name: m.modelName || m.modelCode || "未知", credits: credits, tokens: tokens };
+    });
+  }
+  if (!rows.length) {
     tb.innerHTML = '<tr><td colspan="4" class="empty">暂无模型数据</td></tr>';
     return;
   }
-  const unwrap = (v) => (v && typeof v === "object" && v.value !== undefined ? v.value : v);
-  const rows = list.map((m) => ({
-    name: m.modelName || m.modelCode || "未知",
-    credits: Number(unwrap(m.totalCredits)) || 0,
-    tokens: Number(unwrap(m.totalTokens)) || 0,
-  })).sort((a, b) => b.credits - a.credits);
-  const total = rows.reduce((sum, m) => sum + m.credits, 0);
+  rows.sort((a, b) => b.credits - a.credits);
+  const total = rows.reduce((acc, m) => acc + m.credits, 0);
   for (const row of rows) {
     const tr = document.createElement("tr");
     tr.innerHTML = "<td><code>" + esc(row.name) + "</code></td>"
@@ -647,7 +663,7 @@ async function zLoad() {
     let series = zDailySeries(act);
     if (!series.length) series = zDailySeries(usage);
     zRenderChart("zchart", "zaxis", series, false);
-    zRenderModels(usage.modelSummaryList || []);
+    zRenderModels(usage);
 
     // 性能：每日解码速度（Lite 青 / Pro&Max 紫双柱）与最近健康度。
     const perf = sections.performance || {};
