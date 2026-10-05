@@ -183,6 +183,18 @@ func TestZcodeUsageHandlerAggregatesSectionsAndCaches(t *testing.T) {
 		if strings.HasPrefix(hit, "/api/monitor/usage/quota/limit") && strings.Contains(hit, "startTime") {
 			t.Fatalf("quota should not carry window params: %s", hit)
 		}
+		if strings.Contains(hit, "usage-detail") {
+			// glm-usage 合同：usage-detail 带 type=1&usageType=MODEL，缺了上游回空体。
+			if !strings.Contains(hit, "type=1") || !strings.Contains(hit, "usageType=MODEL") {
+				t.Fatalf("usage-detail missing type params: %s", hit)
+			}
+		}
+		if strings.Contains(hit, "credit-usage/activity") && !strings.Contains(hit, "type=1") {
+			t.Fatalf("activity missing type=1: %s", hit)
+		}
+		if strings.Contains(hit, "model-performance-day") && strings.Contains(hit, "type=") {
+			t.Fatalf("performance should not carry type param: %s", hit)
+		}
 		if strings.Contains(hit, "usage-detail") || strings.Contains(hit, "activity") || strings.Contains(hit, "model-performance-day") {
 			if !strings.Contains(hit, "startTime=") || !strings.Contains(hit, "endTime=") {
 				t.Fatalf("windowed endpoint missing time params: %s", hit)

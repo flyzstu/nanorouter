@@ -46,17 +46,23 @@ const (
 
 // zcodeUsageEndpoint 是一个上游端点：路径与对应的缓存 TTL。windowed 标记
 // 是否携带时间窗参数——quota 是即时快照，glm-usage 调它时不带任何参数。
+// extraParams 是端点固定参数：glm-usage 的合同里 usage-detail 带
+// type=1&usageType=MODEL、activity 带 type=1（PLAN_TYPE="1"），缺了上游
+// 会返回空体。
 type zcodeUsageEndpoint struct {
-	key      string
-	path     string
-	cacheTTL time.Duration
-	windowed bool
+	key         string
+	path        string
+	cacheTTL    time.Duration
+	windowed    bool
+	extraParams map[string]string
 }
 
 var zcodeUsageEndpoints = []zcodeUsageEndpoint{
 	{key: "quota", path: "/api/monitor/usage/quota/limit", cacheTTL: 60 * time.Second},
-	{key: "usage", path: "/api/monitor/credit-usage/usage-detail", cacheTTL: 5 * time.Minute, windowed: true},
-	{key: "activity", path: "/api/monitor/credit-usage/activity", cacheTTL: 5 * time.Minute, windowed: true},
+	{key: "usage", path: "/api/monitor/credit-usage/usage-detail", cacheTTL: 5 * time.Minute, windowed: true,
+		extraParams: map[string]string{"type": "1", "usageType": "MODEL"}},
+	{key: "activity", path: "/api/monitor/credit-usage/activity", cacheTTL: 5 * time.Minute, windowed: true,
+		extraParams: map[string]string{"type": "1"}},
 	{key: "performance", path: "/api/monitor/usage/model-performance-day", cacheTTL: 5 * time.Minute, windowed: true},
 }
 
@@ -222,6 +228,9 @@ func (c *zcodeUsageCache) upstream(ctx context.Context, ep zcodeUsageEndpoint, w
 			values.Set(key, value)
 		}
 	}
+	for key, value := range ep.extraParams {
+		values.Set(key, value)
+	}
 	target := c.baseURL + ep.path
 	if len(values) > 0 {
 		target += "?" + values.Encode()
@@ -245,6 +254,9 @@ func (c *zcodeUsageCache) upstream(ctx context.Context, ep zcodeUsageEndpoint, w
 	body, err := io.ReadAll(io.LimitReader(resp.Body, zcodeUsageMaxBodyBytes))
 	if err != nil {
 		return nil, fmt.Errorf("zcode usage 读响应失败: %w", err)
+	}
+	if len(strings.TrimSpace(string(body))) == 0 {
+		return nil, errors.New("zcode usage 上游返回空响应")
 	}
 	return decodeZcodeUsageEnvelope(body)
 }
