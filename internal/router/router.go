@@ -78,6 +78,10 @@ type Router struct {
 	// zcodeCredentials 是凭据的数据库存储。登录完成后写库、后续请求读库，
 	// 不再依赖只读的文件或 Secret 挂载。测试里可为 nil（退回文件源）。
 	zcodeCredentials *zcodeCredentialStore
+	// zcodeUsage 是 ZCode 用量查询的进程内缓存，懒初始化（见 zcode_usage.go），
+	// 让测试可以直接构造 Router{}。
+	zcodeUsage     *zcodeUsageCache
+	zcodeUsageOnce sync.Once
 }
 
 // state 是单个上游的熔断状态。冷却期内不再向它发送新请求，
@@ -216,6 +220,9 @@ func (r *Router) Handler() http.Handler {
 	// 内置统计页与其数据端点：同一 auth 中间件，浏览器经 Basic 回退登录。
 	mux.Get("/stats", r.statsPage)
 	mux.Get("/v1/stats/summary", r.statsSummary)
+	// ZCode Coding Plan 用量（glm-usage 内嵌）：数据面在 statsAuthPaths 里，
+	// 浏览器同样走 Basic 回退。
+	mux.Get("/v1/zcode/usage", r.zcodeUsageHandler)
 
 	// zhipu-aicoding 专属端点路径：允许将客户端 Base URL 直接配置为 /zhipu-aicoding 或 /zhipuaicoding
 	mountZhipu := func(sub chi.Router) {
@@ -266,7 +273,7 @@ func (r *Router) auth(next http.Handler) http.Handler {
 	// 浏览器没有 Bearer 头的注入点；统计页与它的数据端点额外接受 Basic
 	// 凭据（用户名或密码位放 API key 均可），401 带 WWW-Authenticate 让
 	// 浏览器弹出原生登录框。生成端点不放宽，避免削弱网关认证面。
-	statsAuthPaths := map[string]bool{"/stats": true, "/v1/stats/summary": true}
+	statsAuthPaths := map[string]bool{"/stats": true, "/v1/stats/summary": true, "/v1/zcode/usage": true}
 	return http.HandlerFunc(func(w http.ResponseWriter, q *http.Request) {
 		if q.Header.Get("Authorization") != "Bearer "+expected {
 			if statsAuthPaths[q.URL.Path] {

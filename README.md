@@ -404,6 +404,12 @@ Cookie、请求正文、prompt、模型回复或密钥。
 `tools` 数组（兼容 OpenAI 与 Anthropic 两种形状），不含响应侧 tool_calls 次数；调用方 IP 直连部署记录 TCP 对端
 地址，前面有可信反代时开启 `trust_forwarded_for: true` 改取 `X-Forwarded-For` 首值。这些列不含 prompt 与回复内容。
 
+统计页下半区还有 **ZCode Coding Plan 用量看板**（数据端点 `GET /v1/zcode/usage?days=7`，支持 1/7/30 天切换）：
+配额卡（5 小时窗口/周配额用量与重置倒计时）、积分统计卡、每日积分柱状图、模型积分占比表、Lite/Pro&Max 解码速度。
+数据来自智谱 bigmodel.cn 监控端点，凭据复用 `login zcode` 的登录链（数据库 → 凭据文件），无需额外配置；未登录时
+该区块提示先运行 `nanorouter login zcode`。配额缓存 60 秒、历史区块 5 分钟；上游故障时 10 分钟内降级返回旧值并
+标注 failures，凭据失效（401/1001）如实报错不降级。认证与统计页相同（Bearer 或浏览器 Basic 回退）。
+
 ## 查看用量
 
 ```sh

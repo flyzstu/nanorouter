@@ -140,6 +140,19 @@
   details summary { cursor: pointer; font-size: 12px; }
   details summary:hover { color: var(--fg); }
   .empty { color: var(--muted); padding: 26px 0; text-align: center; font-size: 13px; }
+  /* ZCode 用量区块：分隔线、双柱每日图与轴标签 */
+  .zdiv { display: flex; align-items: center; gap: 12px; margin: 28px 0 14px; color: var(--muted);
+          font-size: 11px; font-weight: 650; letter-spacing: .14em; text-transform: uppercase; }
+  .zdiv::before, .zdiv::after { content: ""; height: 1px; flex: 1; background: var(--border); }
+  .zdiv .zdays a { color: var(--cyan); text-decoration: none; font: 11px var(--mono); text-transform: none; }
+  .zdiv .zdays a:hover { text-decoration: underline; }
+  .zchart { display: flex; align-items: flex-end; gap: 3px; height: 150px; padding-top: 8px; }
+  .zchart .col { flex: 1; display: flex; align-items: flex-end; justify-content: center; gap: 2px; height: 100%; }
+  .zchart .col i { display: block; width: 100%; max-width: 26px; min-height: 2px; border-radius: 3px 3px 0 0;
+                   background: linear-gradient(180deg, var(--cyan), rgba(129,140,248,.35)); }
+  .zchart .col i.alt { background: linear-gradient(180deg, var(--accent-2), rgba(129,140,248,.30)); }
+  .zaxis { display: flex; justify-content: space-between; gap: 8px; color: var(--muted); font: 11px var(--mono); margin-top: 6px; }
+  @media (max-width: 720px) { .zaxis { flex-direction: column; gap: 2px; } }
   footer { color: var(--muted); font-size: 12px; margin-top: 14px; }
   ::selection { background: rgba(129,140,248,.35); }
   @media (prefers-reduced-motion: reduce) { * { transition: none !important; } }
@@ -210,11 +223,41 @@
     </section>
   </div>
 </div>
-<footer>数据来自 llm_requests 台账（请求侧元数据，不含对话内容）。usage_source=unavailable 的请求 token 计为零；client_ip / client_agent / 工具名为调用方元数据，直连部署记录 TCP 对端地址，开启 trust_forwarded_for 后取 X-Forwarded-For 首值。</footer>
+<div class="zdiv"><span>ZCode Coding Plan 用量</span><span class="zdays" id="zdays"></span></div>
+<div id="zerror" role="alert" style="display:none;margin:0 0 12px;padding:10px 14px;border-radius:10px;border:1px solid rgba(251,113,133,.4);color:var(--bad);background:rgba(251,113,133,.07);"></div>
+<div class="kpis" id="zquota"></div>
+<div class="kpis" id="zstats"></div>
+<div class="grid2">
+  <section class="card">
+    <h2>每日积分消耗</h2>
+    <div class="zchart" id="zchart"></div>
+    <div class="zaxis" id="zaxis"></div>
+  </section>
+  <section class="card">
+    <h2>模型积分占比</h2>
+    <table id="zmodels">
+      <thead><tr><th>模型</th><th class="num">tokens</th><th class="num">积分</th><th class="num">占比</th></tr></thead>
+      <tbody></tbody>
+    </table>
+  </section>
+</div>
+<div class="grid2">
+  <section class="card">
+    <h2>解码速度 · Lite / Pro&amp;Max</h2>
+    <div class="zchart" id="zperf"></div>
+    <div class="zaxis" id="zperfaxis"></div>
+  </section>
+  <section class="card" id="zperfcards">
+    <h2>最近健康度</h2>
+    <div class="kpis" id="zperfstats" style="margin-bottom:0;"></div>
+  </section>
+</div>
+
+<footer>数据来自 llm_requests 台账（请求侧元数据，不含对话内容）。usage_source=unavailable 的请求 token 计为零；client_ip / client_agent / 工具名为调用方元数据，直连部署记录 TCP 对端地址，开启 trust_forwarded_for 后取 X-Forwarded-For 首值。ZCode 用量来自智谱 bigmodel.cn 监控端点，凭据复用网关登录链，配额缓存 60s、历史区块 5 分钟。</footer>
 <script>
 "use strict";
 const $ = (id) => document.getElementById(id);
-let state = { range: "24h", timer: null };
+let state = { range: "24h", timer: null, zdays: 7 };
 
 const HEX = { cyan: "#22D3EE", indigo: "#818CF8", ok: "#34D399", bad: "#FB7185", grid: "rgba(154,154,176,.18)", label: "#9A9AB0" };
 
@@ -430,6 +473,228 @@ function renderBars(items, boxId, fillCls) {
     + '<span class="count">' + fmtInt(x.count) + "</span></div>"
   ).join("");
 }
+// ==================== ZCode Coding Plan 用量（/v1/zcode/usage） ====================
+// 数据形状与 glm-usage 看板一致：上游把多数标量包成 {"value": ...}，但不总包，
+// 各渲染入口对两种形态都做了解包。
+function zNum(v, dec) {
+  if (v === null || v === undefined || isNaN(Number(v))) return "–";
+  return Number(v).toLocaleString("en-US", { maximumFractionDigits: dec === undefined ? 2 : dec });
+}
+function zCard(sub, value) {
+  const card = document.createElement("div");
+  card.className = "card kpi";
+  const k = document.createElement("div"); k.className = "label"; k.textContent = sub;
+  const v = document.createElement("div"); v.className = "value grad"; v.textContent = value;
+  card.append(k, v);
+  return card;
+}
+function zRenderCards(hostId, items) {
+  const host = $(hostId);
+  host.textContent = "";
+  for (const item of items.filter(Boolean)) host.append(zCard(item.sub, item.value));
+}
+function zDailySeries(section) {
+  if (!section) return [];
+  if (Array.isArray(section.series) && section.series.length) {
+    // 与其他渲染入口同规：标量可能包 {"value": ...}，先解包再取数。
+    const unwrap = (v) => (v && typeof v === "object" && v.value !== undefined ? v.value : v);
+    return section.series.map((row) => ({
+      date: String(row.date || "").slice(0, 10),
+      credits: Number(unwrap(row.totalCredits)) || 0,
+      tokens: Number(unwrap(row.totalTokens)) || 0,
+    }));
+  }
+  if (Array.isArray(section.xTime) && Array.isArray(section.modelDataList)) {
+    return section.xTime.map((date, i) => {
+      let credits = 0, tokens = 0;
+      for (const m of section.modelDataList) {
+        if (Array.isArray(m.totalCreditsUsage)) credits += Number(m.totalCreditsUsage[i]) || 0;
+        if (Array.isArray(m.totalTokensUsage)) tokens += Number(m.totalTokensUsage[i]) || 0;
+      }
+      return { date: String(date).slice(0, 10), credits: credits, tokens: tokens };
+    });
+  }
+  return [];
+}
+function zRenderChart(chartId, axisId, series, isPerf) {
+  const host = $(chartId), axis = $(axisId);
+  host.textContent = ""; axis.textContent = "";
+  if (!series.length) {
+    host.innerHTML = '<div class="empty">暂无每日数据</div>';
+    return;
+  }
+  const max = Math.max(...(isPerf ? series.flatMap((d) => [d.lite, d.pro]) : series.map((d) => d.credits)), 0.0001);
+  for (const day of series) {
+    const col = document.createElement("div");
+    col.className = "col";
+    if (isPerf) {
+      if (day.lite === null && day.pro === null) { host.append(col); continue; }
+      // 单侧无数据时该侧不渲染占位柱：0.5% 的幻影柱会把"无数据"画成"极小值"。
+      if (day.lite !== null) {
+        const a = document.createElement("i");
+        a.style.height = Math.max(day.lite / max * 100, 0.5) + "%";
+        col.append(a);
+      }
+      if (day.pro !== null) {
+        const b = document.createElement("i");
+        b.className = "alt";
+        b.style.height = Math.max(day.pro / max * 100, 0.5) + "%";
+        col.append(b);
+      }
+      col.title = day.date + "：" + zNum(day.lite) + " t/s（成功率 " + (day.liteRate === null ? "–" : zNum(day.liteRate, 1) + "%")
+        + "） / Pro&Max " + zNum(day.pro) + " t/s（成功率 " + (day.proRate === null ? "–" : zNum(day.proRate, 1) + "%") + "）";
+    } else {
+      const bar = document.createElement("i");
+      bar.style.height = Math.max(day.credits / max * 100, 0.5) + "%";
+      col.title = day.date + "：" + zNum(day.credits) + " 积分 / " + fmtInt(day.tokens) + " tokens";
+      col.append(bar);
+    }
+    host.append(col);
+  }
+  const head = document.createElement("span"); head.textContent = series[0].date;
+  const mid = document.createElement("span");
+  mid.textContent = isPerf ? "Lite / Pro&Max 解码速度" : "峰值 " + zNum(max) + " 积分";
+  const tail = document.createElement("span"); tail.textContent = series[series.length - 1].date;
+  axis.append(head, mid, tail);
+}
+function zRenderModels(list) {
+  const tb = $("zmodels").querySelector("tbody");
+  tb.textContent = "";
+  if (!list.length) {
+    tb.innerHTML = '<tr><td colspan="4" class="empty">暂无模型数据</td></tr>';
+    return;
+  }
+  const unwrap = (v) => (v && typeof v === "object" && v.value !== undefined ? v.value : v);
+  const rows = list.map((m) => ({
+    name: m.modelName || m.modelCode || "未知",
+    credits: Number(unwrap(m.totalCredits)) || 0,
+    tokens: Number(unwrap(m.totalTokens)) || 0,
+  })).sort((a, b) => b.credits - a.credits);
+  const total = rows.reduce((sum, m) => sum + m.credits, 0);
+  for (const row of rows) {
+    const tr = document.createElement("tr");
+    tr.innerHTML = "<td><code>" + esc(row.name) + "</code></td>"
+      + '<td class="num">' + fmtInt(row.tokens) + "</td>"
+      + '<td class="num">' + zNum(row.credits) + "</td>"
+      + '<td class="num">' + (total ? (row.credits * 100 / total).toFixed(1) + "%" : "–") + "</td>";
+    tb.append(tr);
+  }
+}
+function zShowError(message) {
+  const box = $("zerror");
+  box.style.display = message ? "block" : "none";
+  box.textContent = message || "";
+}
+async function zLoad() {
+  const wanted = state.zdays;
+  try {
+    const res = await fetch("/v1/zcode/usage?days=" + encodeURIComponent(wanted), { headers: { "Accept": "application/json" } });
+    if (!res.ok) {
+      let message = "HTTP " + res.status;
+      try {
+        const errBody = await res.json();
+        if (errBody && errBody.error && errBody.error.message) message = errBody.error.message;
+      } catch (_) { /* 非 JSON 错误体（如反代 502 页）保持状态码消息 */ }
+      throw new Error(message);
+    }
+    const body = await res.json();
+    if (wanted !== state.zdays) return; // 等待期间已切换窗口：丢弃过期响应
+    const sections = body.sections || {};
+    const usage = sections.usage || {}, act = sections.activity || {};
+    const u = usage.summary || {}, a = act.summary || {};
+    const unwrap = (obj, key) => {
+      const item = obj[key];
+      return item && typeof item === "object" && item.value !== undefined ? item.value : item;
+    };
+
+    // 配额卡：unit=3 五小时窗、unit=6 周配额（与 glm-usage 的 SUMMARY_UNITS 一致）。
+    const limits = Array.isArray(sections.quota && sections.quota.limits) ? sections.quota.limits : [];
+    const cards = [];
+    for (const [unit, label] of [[3, "5 小时窗口"], [6, "周配额"]]) {
+      const limit = limits.find((item) => item && item.unit === unit);
+      if (!limit) continue;
+      const total = Number(limit.usage) || 0, used = Number(limit.currentValue) || 0;
+      cards.push({ sub: label, value: total ? (used * 100 / total).toFixed(1) + "%" : "–" });
+      let sub = label + " · 已用积分";
+      if (limit.nextResetTime) {
+        const seconds = Math.max((Number(limit.nextResetTime) - Date.now()) / 1000, 0);
+        const h = Math.floor(seconds / 3600), m = Math.floor((seconds % 3600) / 60);
+        sub += " · " + (h > 0 ? h + " 小时 " : "") + m + " 分后重置";
+      }
+      cards.push({ sub: sub, value: zNum(used) + " / " + zNum(total) });
+    }
+    zRenderCards("zquota", cards);
+
+    // 统计卡：积分、缓存命中、低峰占比、tokens、累计时长（glm-usage TAB3 同款）。
+    const totalCredits = unwrap(u, "totalCredits");
+    const cacheHit = unwrap(u, "cacheHitRate");
+    const offPeak = unwrap(u, "offPeakUsageRate");
+    const totalTokens = unwrap(a, "totalTokens");
+    const durationMs = unwrap(a, "totalUsageDurationMs");
+    const duration = (durationMs === null || durationMs === undefined) ? null
+      : durationMs >= 3600000 ? (durationMs / 3600000).toFixed(1) + " 小时"
+      : durationMs >= 60000 ? (durationMs / 60000).toFixed(1) + " 分钟"
+      : Math.round(durationMs / 1000) + " 秒";
+    zRenderCards("zstats", [
+      (totalCredits === null || totalCredits === undefined) ? null : { sub: "积分 · 统计区间", value: zNum(totalCredits) },
+      (cacheHit === null || cacheHit === undefined) ? null : { sub: "缓存命中", value: zNum(cacheHit, 1) + "%" },
+      (offPeak === null || offPeak === undefined) ? null : { sub: "低峰时段", value: zNum(offPeak, 1) + "%" },
+      (totalTokens === null || totalTokens === undefined) ? null : { sub: "tokens 累计", value: fmtInt(totalTokens) },
+      duration ? { sub: "累计编码时长", value: duration } : null,
+    ]);
+
+    // 每日积分：activity.series 优先，退回 usage.xTime + modelDataList。
+    let series = zDailySeries(act);
+    if (!series.length) series = zDailySeries(usage);
+    zRenderChart("zchart", "zaxis", series, false);
+    zRenderModels(usage.modelSummaryList || []);
+
+    // 性能：每日解码速度（Lite 青 / Pro&Max 紫双柱）与最近健康度。
+    const perf = sections.performance || {};
+    const latest = (values) => {
+      for (let i = values.length - 1; i >= 0; i -= 1) {
+        if (values[i] !== null && values[i] !== undefined && values[i] !== "") return values[i];
+      }
+      return null;
+    };
+    const xTime = (perf.x_time || perf.xTime || []).map((d) => String(d).slice(0, 10));
+    // null/"" 表示当日无数据；Number(null)===0 会把空洞伪造成零值，
+    // 先转 NaN 让下方 isNaN→null 的缺口逻辑正常生效。
+    const keepGap = (v) => (v === null || v === undefined || v === "" ? NaN : Number(v));
+    const lite = (perf.liteDecodeSpeed || []).map(keepGap);
+    const pro = (perf.proMaxDecodeSpeed || []).map(keepGap);
+    const liteRate = (perf.liteSuccessRate || []).map(keepGap);
+    const proRate = (perf.proMaxSuccessRate || []).map(keepGap);
+    const perfSeries = xTime.map((date, i) => ({
+      date: date,
+      lite: isNaN(lite[i]) ? null : lite[i],
+      pro: isNaN(pro[i]) ? null : pro[i],
+      liteRate: isNaN(liteRate[i]) ? null : liteRate[i],
+      proRate: isNaN(proRate[i]) ? null : proRate[i],
+    }));
+    zRenderChart("zperf", "zperfaxis", perfSeries, true);
+    const liteLatest = latest(lite), proLatest = latest(pro);
+    zRenderCards("zperfstats", [
+      (liteLatest === null || isNaN(liteLatest)) ? null : { sub: "Lite 解码速度", value: zNum(liteLatest) + " t/s" },
+      (proLatest === null || isNaN(proLatest)) ? null : { sub: "Pro&Max 解码速度", value: zNum(proLatest) + " t/s" },
+    ]);
+    // 降级区块（缓存旧值 + 刷新失败）已在图里渲染，但必须标注出来，
+    // 不能让旧数字看起来像实时数据。
+    const failures = body.failures || [];
+    if (failures.length) {
+      zShowError("以下区块为缓存旧值，刷新失败：" + failures.map((f) => (f.section || "?") + "（" + (f.error || "") + "）").join("、"));
+    } else {
+      zShowError("");
+    }
+  } catch (err) {
+    zShowError("ZCode 用量加载失败：" + err.message);
+    // 失败时清空区块，避免上一轮旧数据与错误并存造成误读。
+    for (const id of ["zquota", "zstats", "zchart", "zaxis", "zperf", "zperfaxis", "zperfstats"]) {
+      const host = $(id); if (host) host.textContent = "";
+    }
+    $("zmodels").querySelector("tbody").innerHTML = '<tr><td colspan="4" class="empty">–</td></tr>';
+  }
+}
 const esc = (s) => String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;");
 document.querySelectorAll(".seg button").forEach(btn => {
   btn.addEventListener("click", () => {
@@ -441,9 +706,27 @@ document.querySelectorAll(".seg button").forEach(btn => {
 });
 $("auto").addEventListener("change", (e) => {
   if (state.timer) { clearInterval(state.timer); state.timer = null; }
-  if (e.target.checked) state.timer = setInterval(load, 10000);
+  if (e.target.checked) state.timer = setInterval(() => { load(); zLoad(); }, 10000);
 });
+const zdaysHost = $("zdays");
+if (zdaysHost) {
+  for (const days of [1, 7, 30]) {
+    const link = document.createElement("a");
+    link.href = "#";
+    link.textContent = days + "d";
+    if (days === state.zdays) link.style.fontWeight = "650";
+    link.addEventListener("click", (e) => {
+      e.preventDefault();
+      state.zdays = days;
+      zdaysHost.querySelectorAll("a").forEach((a) => { a.style.fontWeight = ""; });
+      link.style.fontWeight = "650";
+      zLoad();
+    });
+    zdaysHost.append(link, document.createTextNode(" "));
+  }
+}
 load();
+zLoad();
 </script>
 </body>
 </html>
