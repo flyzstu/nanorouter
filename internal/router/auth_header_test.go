@@ -111,6 +111,24 @@ func TestAuthErrorDialectByPath(t *testing.T) {
 	}
 }
 
+func TestHealthzExemptFromAuth(t *testing.T) {
+	handler := newAuthHeaderTestRouter(t).Handler()
+	// /healthz 恒免鉴权：k8s 探针无头可带，auth_env 下匿名也 200。
+	q := httptest.NewRequest(http.MethodGet, "/healthz", nil)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, q)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("healthz anonymous: %d, want 200", rec.Code)
+	}
+	// /metrics 不豁免：含调用量，匿名仍 401。
+	q = httptest.NewRequest(http.MethodGet, "/metrics", nil)
+	rec = httptest.NewRecorder()
+	handler.ServeHTTP(rec, q)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("metrics anonymous: %d, want 401", rec.Code)
+	}
+}
+
 func TestStatsPublicAuthMatrix(t *testing.T) {
 	for _, tc := range []struct {
 		name   string

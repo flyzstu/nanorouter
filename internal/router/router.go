@@ -284,12 +284,18 @@ func (r *Router) auth(next http.Handler) http.Handler {
 		return subtle.ConstantTimeCompare([]byte(presented), []byte(expected)) == 1
 	}
 	return http.HandlerFunc(func(w http.ResponseWriter, q *http.Request) {
-		// stats_public: 统计面整体豁免鉴权（内网/反代层自管访问控制的部署）。
-		// 生成端点不在豁免名单，照常要求 key。
+		// /healthz 恒为免鉴权：只回 200 无业务数据，k8s 存活/就绪探针无头可带，
+		// auth_env 一配探针即 401 把自己杀死。/metrics 不豁免（含调用量）。
+		if q.URL.Path == "/healthz" {
+			next.ServeHTTP(w, q)
+			return
+		}
 		if r.cfg.StatsPublic && statsAuthPaths[q.URL.Path] {
 			next.ServeHTTP(w, q)
 			return
 		}
+		// stats_public 豁免的只是统计面（内网/反代层自管访问控制的部署），
+		// 生成端点不在豁免名单，照常要求 key。
 		// 两种传参并存：OpenAI 系客户端惯用 Bearer，Anthropic 系惯用
 		// x-api-key——同一把 key 两种头都认，客户端不用为网关改认证方式。
 		authorized := false
