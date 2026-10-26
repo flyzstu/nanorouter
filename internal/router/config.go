@@ -25,6 +25,7 @@ type Config struct {
 	// TrustForwardedFor 开启后统计里的调用方 IP 取 X-Forwarded-For 首值。
 	// 仅在网关前面有可信反代时开启；直连部署开启会让调用方伪造来源。
 	TrustForwardedFor bool               `yaml:"trust_forwarded_for"`
+	ZcodeReset        ZcodeResetConfig   `yaml:"zcode_reset"`
 	RequestTimeout    time.Duration      `yaml:"request_timeout"`
 	Retry             RetryConfig        `yaml:"retry"`
 	Backpressure      BackpressureConfig `yaml:"backpressure"`
@@ -65,6 +66,15 @@ func (c *BackpressureConfig) normalize() error {
 
 type ProfilingConfig struct {
 	Enabled bool `yaml:"enabled"`
+}
+
+// ZcodeResetConfig 控制 ZCode 额度重置卡端点。
+//
+// 查询（GET /v1/zcode/reset/status）恒可用；核销（POST /v1/zcode/reset/use）
+// 默认关闭：花卡不可逆，网关是无人值守服务，不能因为一个可被扫描器命中的
+// POST 就消耗用户的资产。需要时在配置里显式打开。
+type ZcodeResetConfig struct {
+	AllowUse bool `yaml:"allow_use"`
 }
 
 // HealthCheckConfig 控制熔断后的后台异步探活机制。

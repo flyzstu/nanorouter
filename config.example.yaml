@@ -25,6 +25,11 @@ auth_env: NANOROUTER_API_KEY
 # 开启；直连部署保持关闭（默认 false，记录 TCP 对端地址），否则调用方可
 # 伪造来源。
 # trust_forwarded_for: true
+# ZCode 额度重置卡：查询（GET /v1/zcode/reset/status）恒可用；核销
+# （POST /v1/zcode/reset/use）默认关闭。核销会不可逆地消耗一张卡，网关又是
+# 无人值守服务，请确认实例只有可信调用方后再打开。请求主链路不会自动核销。
+zcode_reset:
+  allow_use: false
 request_timeout: 90s
 # 全局覆盖转发到上游的 User-Agent。默认 Go-http-client/x.x 会被部分上游
 # （如 Nous Research 的 Cloudflare WAF）拦截并返回 403；可设为常规客户端 UA，

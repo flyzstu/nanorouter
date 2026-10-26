@@ -83,6 +83,9 @@ type Router struct {
 	// 让测试可以直接构造 Router{}。
 	zcodeUsage     *zcodeUsageCache
 	zcodeUsageOnce sync.Once
+	// zcodeReset 是重置卡 status 的进程内缓存，懒初始化（见 zcode_reset.go）。
+	zcodeReset     *zcodeResetStatusCache
+	zcodeResetOnce sync.Once
 	// live 是实时会话统计（进行中/存活会话/活跃调用方），懒初始化同上。
 	live     *liveTracker
 	liveOnce sync.Once
@@ -227,6 +230,10 @@ func (r *Router) Handler() http.Handler {
 	// ZCode Coding Plan 用量（glm-usage 内嵌）：数据面在 statsAuthPaths 里，
 	// 浏览器同样走 Basic 回退。
 	mux.Get("/v1/zcode/usage", r.zcodeUsageHandler)
+	// 重置卡：status 只读；use 是破坏性核销，默认关闭（zcode_reset.allow_use），
+	// 且只由显式 POST 触发，请求主链路不会自动调用。
+	mux.Get("/v1/zcode/reset/status", r.zcodeResetStatusHandler)
+	mux.Post("/v1/zcode/reset/use", r.zcodeResetUseHandler)
 
 	// zhipu-aicoding 专属端点路径：允许将客户端 Base URL 直接配置为 /zhipu-aicoding 或 /zhipuaicoding
 	mountZhipu := func(sub chi.Router) {
@@ -277,7 +284,16 @@ func (r *Router) auth(next http.Handler) http.Handler {
 	// 浏览器没有 Bearer 头的注入点；统计页与它的数据端点额外接受 Basic
 	// 凭据（用户名或密码位放 API key 均可），401 带 WWW-Authenticate 让
 	// 浏览器弹出原生登录框。生成端点不放宽，避免削弱网关认证面。
+	// statsAuthPaths 同时是 stats_public 的豁免名单；重置卡端点只允许 Basic
+	// 回退、不参与匿名豁免（核销是破坏性操作）。
 	statsAuthPaths := map[string]bool{"/stats": true, "/v1/stats/summary": true, "/v1/zcode/usage": true}
+	basicAuthPaths := map[string]bool{
+		"/stats":                 true,
+		"/v1/stats/summary":      true,
+		"/v1/zcode/usage":        true,
+		"/v1/zcode/reset/status": true,
+		"/v1/zcode/reset/use":    true,
+	}
 	// keyMatches 常量时间比较：逐字节短路的不等比较存在计时侧信道，
 	// 网关又是长期暴露的服务，不值得省这个包。
 	keyMatches := func(presented string) bool {
@@ -306,7 +322,7 @@ func (r *Router) auth(next http.Handler) http.Handler {
 			authorized = keyMatches(q.Header.Get("X-Api-Key"))
 		}
 		if !authorized {
-			if statsAuthPaths[q.URL.Path] {
+			if basicAuthPaths[q.URL.Path] {
 				// key 填在密码位或用户名位（浏览器登录框首格）都接受。
 				if user, pass, ok := q.BasicAuth(); ok && (pass == expected || user == expected) {
 					next.ServeHTTP(w, q)

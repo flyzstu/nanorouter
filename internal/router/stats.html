@@ -153,7 +153,22 @@
   .zchart .col i.alt { background: linear-gradient(180deg, var(--accent-2), rgba(129,140,248,.30)); }
   .zaxis { display: flex; justify-content: space-between; gap: 8px; color: var(--muted); font: 11px var(--mono); margin-top: 6px; }
   @media (max-width: 720px) { .zaxis { flex-direction: column; gap: 2px; } }
+  .zresetrow { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; padding: 9px 0; border-bottom: 1px solid var(--track); }
+  .zresetrow:last-child { border-bottom: 0; }
+  .zresetrow .name { font-weight: 650; min-width: 96px; }
+  .zresetrow .meta { color: var(--muted); font: 12px var(--mono); margin-right: auto; }
+  .zresetbtn {
+    appearance: none; border: 1px solid var(--border-strong); background: var(--card); color: var(--fg);
+    font: 600 12.5px var(--sans); padding: 5px 12px; border-radius: 8px; cursor: pointer;
+    transition: border-color .15s, background .15s, color .15s, opacity .15s;
+  }
+  .zresetbtn:hover:not(:disabled) { border-color: var(--accent-1); color: #fff; background: linear-gradient(135deg, var(--accent-1), var(--accent-2)); }
+  .zresetbtn:disabled { opacity: .45; cursor: not-allowed; }
+  .zresetbtn:focus-visible { outline: 2px solid var(--accent-1); outline-offset: 2px; }
   footer { color: var(--muted); font-size: 12px; margin-top: 14px; }
+  footer .legal { display: flex; flex-wrap: wrap; gap: 6px 12px; justify-content: center; align-items: center; margin-top: 10px; }
+  footer .legal a { color: inherit; text-decoration: none; }
+  footer .legal a:hover { text-decoration: underline; }
   ::selection { background: rgba(129,140,248,.35); }
   @media (prefers-reduced-motion: reduce) { * { transition: none !important; } }
 </style>
@@ -256,7 +271,20 @@
   </section>
 </div>
 
-<div class="kpis" id="zresets" style="margin-bottom:12px;"></div>
+<div class="grid2">
+  <section class="card">
+    <h2>重置卡 <span class="pill" id="zresetchannel"></span></h2>
+    <div id="zresetrows"><div class="empty">加载中…</div></div>
+    <div class="zaxis" id="zresetaxis"></div>
+  </section>
+  <section class="card">
+    <h2>最近重置</h2>
+    <table id="zresethistory">
+      <thead><tr><th>类型</th><th class="num">完成时间</th></tr></thead>
+      <tbody></tbody>
+    </table>
+  </section>
+</div>
 <div class="grid2">
   <section class="card">
     <h2>套餐 <span class="pill" id="zrenew"></span></h2>
@@ -270,7 +298,13 @@
   </div>
 </div>
 
-<footer>数据来自 llm_requests 台账（请求侧元数据，不含对话内容）。usage_source=unavailable 的请求 token 计为零；client_ip / client_agent / 工具名为调用方元数据，直连部署记录 TCP 对端地址，开启 trust_forwarded_for 后取 X-Forwarded-For 首值。ZCode 用量来自智谱 bigmodel.cn 监控端点，凭据复用网关登录链，配额缓存 60s、历史区块 5 分钟、套餐与账户区块 1 小时；账户面只读，不含任何核销操作。</footer>
+<footer>
+  <div>数据来自 llm_requests 台账（请求侧元数据，不含对话内容）。usage_source=unavailable 的请求 token 计为零；client_ip / client_agent / 工具名为调用方元数据，直连部署记录 TCP 对端地址，开启 trust_forwarded_for 后取 X-Forwarded-For 首值。ZCode 用量来自智谱 bigmodel.cn 监控端点，凭据复用网关登录链，配额缓存 60s、历史区块 5 分钟、套餐与账户区块 1 小时；账户面只读。额度重置卡查询走 ZCode 平台 reset 端点（30s 缓存），核销默认关闭且只能由本页显式确认触发。</div>
+  <div class="legal">
+    <a href="https://beian.miit.gov.cn/" target="_blank" rel="noopener noreferrer">浙ICP备2026085501号-1</a>
+    <span>版权所有 © 2026 飞哥的个人随想</span>
+  </div>
+</footer>
 <script>
 "use strict";
 const $ = (id) => document.getElementById(id);
@@ -676,14 +710,6 @@ function zRenderAccount(s) {
     $("zrenew").textContent = "";
     zKV("zplan", []);
   }
-  const resets = s.resets || {};
-  // customer/magnitude 两端点实测被上游拒绝（403/系统异常），已从网关
-  // 移除：体验卡与账户信息不再渲染。
-  const resetCards = [
-    { sub: "5 小时额度重置", value: Array.isArray(resets.fiveHourResets) ? resets.fiveHourResets.length + " 次" : null },
-    { sub: "周额度重置", value: Array.isArray(resets.weekResets) ? resets.weekResets.length + " 次" : null },
-  ];
-  zRenderCards("zresets", resetCards.filter((c) => c.value !== null));
   const balance = s.account || {};
   zKV("zbalance", [
     ["可用余额", first(balance, ["balance", "availableBalance"]) ?? "–"],
@@ -692,6 +718,118 @@ function zRenderAccount(s) {
     ["消费累计", first(balance, ["totalSpendAmount"]) ?? "–"],
     ["冻结", first(balance, ["frozenBalance"]) ?? "–"],
   ].filter(([, v]) => v !== "–"));
+}
+// 重置卡：/v1/zcode/reset/status 是唯一数据源（网关侧 30 秒缓存）。
+// 核销按钮只在 zcode_reset.allow_use 打开时可用，且必须显式确认。
+function zResetLabel(type) { return type === "WEEK" ? "周额度" : "5 小时额度"; }
+function zResetExpiry(expireAt) {
+  const seconds = Math.max((Number(expireAt) - Date.now()) / 1000, 0);
+  if (!seconds) return "已到期";
+  const d = Math.floor(seconds / 86400), h = Math.floor((seconds % 86400) / 3600), m = Math.floor((seconds % 3600) / 60);
+  return (d > 0 ? d + " 天 " : "") + (h > 0 ? h + " 小时 " : "") + m + " 分后过期";
+}
+function zResetValid(items) {
+  return (Array.isArray(items) ? items : [])
+    .filter((item) => item && Number(item.expire_at) > Date.now())
+    .sort((left, right) => Number(left.expire_at) - Number(right.expire_at));
+}
+function zRenderReset(data) {
+  const host = $("zresetrows");
+  host.textContent = "";
+  $("zresetchannel").textContent = data.channel || "";
+  const useEnabled = data.use_enabled === true;
+  const types = [
+    ["FIVE_HOUR", zResetValid(data.available_five_hour_resets)],
+    ["WEEK", zResetValid(data.available_week_resets)],
+  ];
+  for (const [type, items] of types) {
+    const row = document.createElement("div");
+    row.className = "zresetrow";
+    const name = document.createElement("span");
+    name.className = "name";
+    name.textContent = zResetLabel(type);
+    const meta = document.createElement("span");
+    meta.className = "meta";
+    meta.textContent = items.length
+      ? items.length + " 张 · " + zResetExpiry(items[0].expire_at) + "（最早）"
+      : "暂无可用";
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "zresetbtn";
+    button.textContent = "核销一张";
+    button.disabled = !useEnabled || items.length === 0;
+    button.title = useEnabled ? "调用 /v1/zcode/reset/use 消耗一张重置卡" : "核销未启用：配置 zcode_reset.allow_use: true";
+    button.addEventListener("click", () => zUseReset(type, button));
+    row.append(name, meta, button);
+    host.append(row);
+  }
+  $("zresetaxis").textContent = useEnabled
+    ? "核销不可逆，点击后会先要求确认"
+    : "只读：核销端点未启用（zcode_reset.allow_use）";
+  const rows = [];
+  const history = [
+    ["5 小时额度", data.latest_five_hour_reset_history],
+    ["周额度", data.latest_week_reset_history],
+  ];
+  for (const [label, item] of history) {
+    const usedAt = item && Number(item.used_at) > 0 ? Number(item.used_at) : 0;
+    if (usedAt) rows.push([label, new Date(usedAt).toLocaleString("zh-CN", { hour12: false })]);
+  }
+  zKV("zresethistory", rows);
+}
+async function zLoadReset() {
+  const host = $("zresetrows");
+  try {
+    const res = await fetch("/v1/zcode/reset/status", { headers: { "Accept": "application/json" } });
+    const body = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      if (res.status === 401) throw new Error("需要登录（stats_public 不豁免重置卡查询）");
+      throw new Error((body.error && body.error.message) || ("HTTP " + res.status));
+    }
+    zRenderReset(body);
+  } catch (err) {
+    host.textContent = "";
+    const empty = document.createElement("div");
+    empty.className = "empty";
+    empty.textContent = "重置卡读取失败：" + err.message;
+    host.append(empty);
+    $("zresetchannel").textContent = "";
+    $("zresetaxis").textContent = "";
+    $("zresethistory").querySelector("tbody").innerHTML = '<tr><td colspan="2" class="empty">–</td></tr>';
+  }
+}
+async function zUseReset(type, button) {
+  const label = zResetLabel(type);
+  if (!window.confirm("确认核销 1 张「" + label + "」重置卡？该操作不可撤销。")) return;
+  if (!state.resetKeys) state.resetKeys = {};
+  // 失败重试复用同一个幂等键：响应丢失时服务端已经核销，换新键会再花一张。
+  let key = state.resetKeys[type];
+  if (!key) {
+    key = (window.crypto && crypto.randomUUID)
+      ? crypto.randomUUID()
+      : "ui-" + Date.now() + "-" + Math.random().toString(16).slice(2);
+    state.resetKeys[type] = key;
+  }
+  document.querySelectorAll(".zresetbtn").forEach((item) => { item.disabled = true; });
+  button.textContent = "核销中…";
+  try {
+    const res = await fetch("/v1/zcode/reset/use", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "Accept": "application/json" },
+      body: JSON.stringify({ reset_type: type, idempotency_key: key }),
+    });
+    const body = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      throw new Error((body.error && body.error.message) || ("HTTP " + res.status));
+    }
+    delete state.resetKeys[type];
+    zShowError("");
+    await zLoadReset();
+    zLoad();
+  } catch (err) {
+    zShowError("重置失败：" + err.message + "（已保留本次幂等键，可直接重试）");
+    await zLoadReset();
+  }
 }
 async function zLoad() {
   const wanted = state.zdays;
@@ -788,6 +926,8 @@ async function zLoad() {
     ]);
     // 套餐与账户（只读）：逐块容忍缺失，缺数据的卡片自然留空。
     zRenderAccount(sections);
+    // 重置卡独立取数（不同主机、双 token 鉴权），失败只影响本区块。
+    zLoadReset();
     // 降级区块（缓存旧值 + 刷新失败）已在图里渲染，但必须标注出来，
     // 不能让旧数字看起来像实时数据。
     const failures = body.failures || [];
@@ -799,7 +939,7 @@ async function zLoad() {
   } catch (err) {
     zShowError("ZCode 用量加载失败：" + err.message);
     // 失败时清空区块，避免上一轮旧数据与错误并存造成误读。
-    for (const id of ["zquota", "zstats", "zchart", "zaxis", "zperf", "zperfaxis", "zperfstats", "zresets"]) {
+    for (const id of ["zquota", "zstats", "zchart", "zaxis", "zperf", "zperfaxis", "zperfstats"]) {
       const host = $(id); if (host) host.textContent = "";
     }
     $("zmodels").querySelector("tbody").innerHTML = '<tr><td colspan="4" class="empty">–</td></tr>';
@@ -841,6 +981,7 @@ if (zdaysHost) {
 }
 load();
 zLoad();
+zLoadReset();
 </script>
 </body>
 </html>

@@ -95,6 +95,18 @@ func (s *zcodeCredentialStore) query(ctx context.Context) (map[string]ZcodeCrede
 	return entries, rows.Err()
 }
 
+// tokensForChannel 按渠道取平台 JWT 与 OAuth token，不要求 api_key 非空
+// （reset 端点不使用 key）。这里刻意不做跨渠道回退：业务 JWT 按 family
+// 签发，混用会被上游拒绝，也会把 A 渠道的活体凭据发给 B 渠道。
+func (s *zcodeCredentialStore) tokensForChannel(ctx context.Context, channel string) (ZcodeCredential, bool) {
+	entries, _ := s.load(ctx)
+	c, ok := entries[channel]
+	if !ok || (c.PlatformJWT == "" && c.OAuthToken == "") {
+		return ZcodeCredential{}, false
+	}
+	return c, true
+}
+
 // get 按渠道取凭据。跨渠道回退的取舍与文件源一致：bigmodel 优先于 zai。
 func (s *zcodeCredentialStore) get(ctx context.Context, channel string) (ZcodeCredential, bool) {
 	entries, _ := s.load(ctx)

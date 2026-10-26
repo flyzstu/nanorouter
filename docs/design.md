@@ -52,6 +52,7 @@ Agent / Open WebUI
 | `responses_adapter.go` | Responses→Chat 受限降级 | 承诺 100% Responses 语义 |
 | `anthropic_adapter.go` | Chat↔Messages 双向翻译与 SSE 事件改写 | 映射不可表达的 OpenAI 特性（显式 400） |
 | `zcode.go` / `zcode_login.go` | ZCode 网关常量、id 派生、凭据文件、登录链 | 写参考客户端的 token 文件 |
+| `zcode_usage.go` / `zcode_reset.go` | ZCode 用量看板与重置卡查询/手动核销 | 自动核销，或在生成路径里消费重置卡 |
 
 代理只将 JSON 解为 `map[string]any`，修改 `model` 后重新编码，保留其余字段。因此 `tools`、图片、结构化输出等新增字段不需要随网关升级逐一建模。
 
@@ -260,8 +261,9 @@ X-Session-Id），重启清零，条目上限 5000 防异常流量撑内存。
 tool_calls 计数；工具榜聚合因 JSON 展开函数跨方言不统一（json_each vs
 jsonb_array_elements_text），拉回 Go 侧归并。调用方 IP 直连记 TCP 对端地址，开启
 `trust_forwarded_for` 后取 `X-Forwarded-For` 首值（仅限可信反代后部署，否则来源可
-伪造）。统计路径的认证在 Bearer/`X-Api-Key` 之外为浏览器放宽 Basic（仅
-`/stats`、`/v1/stats/summary` 与 `/v1/zcode/usage` 三个路径），生成端点不放宽。
+伪造）。统计与重置卡路径的认证在 Bearer/`X-Api-Key` 之外为浏览器放宽 Basic（仅
+`/stats`、`/v1/stats/summary`、`/v1/zcode/usage`、`/v1/zcode/reset/status` 与
+`/v1/zcode/reset/use`），生成端点不放宽。
 `/healthz` 恒免鉴权：只回 200、无业务数据，k8s 存活/就绪探针无头可带，
 `auth_env` 下若拦截探针会把自己杀死；`/metrics` 不豁免（含调用量）。
 `stats_public: true` 时这三个路径整体豁免鉴权——为反代层或内网已自管访问控制的
@@ -272,15 +274,26 @@ ZCode 用量看板（`GET /v1/zcode/usage`，渲染在统计页下半区）是�
 biz 主机的辅助路径：网关按 glm-usage 移植的八个只读端点（四个用量监控：配额、
 模型用量、活动序列、性能；四个账户面：套餐订阅、自动续费状态、额度重置记录、
 账户资金）从 bigmodel.cn 拉数据，凭据复用生成路径的解析链（数据库 → 凭据文件），
-不引入新配置。账户面刻意只读——重置卡核销等破坏性端点一概不移植；
-getCustomerInfo 与 getTokenMagnitude 实测被上游拒绝（403/系统异常），已移除
-不再外呼。设计取舍：按端点独立缓存（quota 60s、用量 5 分钟、
+不引入新配置。该面刻意只读；getCustomerInfo 与 getTokenMagnitude 实测被上游
+拒绝（403/系统异常），已移除不再外呼。设计取舍：按端点独立缓存（quota 60s、用量 5 分钟、
 账户面 1 小时）并用单飞去重并发拉取，页面流量不放大上游流量；失败按块隔离并进
 `failures`，非凭据失败在 stale 窗（10 分钟）内降级返回旧值并后台刷新，凭据被拒
 （HTTP 200 信封 code 401/1001）不降级、如实报 401——旧配额数字被当成现状比
 短暂报错更有害。数据原样透传（`sections` 内为上游 `data`，biz 端点的 data
 可能是列表或布尔，缺省时回退整个信封体），不做字段猜测；生成请求路径零接触。
 该端点与统计页同在 Basic 回退白名单。
+
+额度重置卡是独立的第二条辅助路径（`GET /v1/zcode/reset/status`、
+`POST /v1/zcode/reset/use`）。它不走 bigmodel.cn 的 API key，而是 ZCode 平台的
+凭据对（`Authorization: Bearer <平台 JWT>` + `X-Bigmodel-Authorization: <MaaS
+OAuth token>`）；两个 token 在 `login zcode` 时已随 key 一起落库/落盘，解析链为
+「数据库 → login 文件 → ZCode v2 加密文件 → 参考客户端文件」，业务 token 严格
+按渠道 family 取，禁止跨渠道回退。status 30 秒缓存且失败同样缓存，避免页面轮询
+放大上游限流；use 每次真实上行，成功后立即失效 status 缓存。核销是破坏性操作：
+`zcode_reset.allow_use` 默认 false，只接受显式 POST（要求 JSON 请求体以阻断
+跨站表单），请求主链路（生成、故障切换、探活、登录）绝不自动调用；`stats_public`
+也不豁免这两个端点。上表“账户面只读”仅指 bigmodel.cn 的用量看板，不包含这条
+独立的核销路径。
 
 ## 用量与隐私
 

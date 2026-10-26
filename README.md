@@ -419,6 +419,32 @@ Cookie、请求正文、prompt、模型回复或密钥。
 历史区块 5 分钟、套餐与账户区块 1 小时；上游故障时 10 分钟内降级返回旧值并标注 failures，凭据失效（401/1001）
 如实报错不降级。认证与统计页相同（Bearer、X-Api-Key 或浏览器 Basic 回退；stats_public 开启时匿名可看）。
 
+### 额度重置卡（查询 + 手动核销）
+
+重置卡接口不属于用量监控面：它用平台凭据对鉴权（`Authorization: Bearer <ZCode JWT>` +
+`X-Bigmodel-Authorization: <MaaS OAuth token>`），两个 token 在 `login zcode` 时已随
+api_key 一起落库/落盘，无需额外登录。网关提供两个端点：
+
+| 端点 | 行为 |
+| --- | --- |
+| `GET /v1/zcode/reset/status?channel=&refresh=1` | **只读**。返回 5 小时/周重置卡余量、最早到期时间、最近使用历史；30 秒缓存 |
+| `POST /v1/zcode/reset/use` | **核销**一张卡。默认关闭，需配置 `zcode_reset.allow_use: true` |
+
+```sh
+curl "http://127.0.0.1:8080/v1/zcode/reset/status" \
+  -H "Authorization: Bearer $NANOROUTER_API_KEY"
+
+curl -X POST "http://127.0.0.1:8080/v1/zcode/reset/use" \
+  -H "Authorization: Bearer $NANOROUTER_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"reset_type":"FIVE_HOUR","idempotency_key":"<uuid>"}'
+```
+
+- `reset_type` 只能是 `FIVE_HOUR` 或 `WEEK`；`channel` 可选 `bigmodel` / `zai`，缺省自动选择持有完整凭据的渠道，显式指定时不跨渠道回退。
+- `idempotency_key` 可选但**建议调用方自带**：网络错误后重试必须复用同一个键，否则一次重试可能消耗两张卡。未提供时由网关生成并在响应中返回。
+- 核销成功后 status 缓存立即失效；请求主链路（生成、故障切换、探活、登录）不会自动核销。
+- 认证同统计页（Bearer、X-Api-Key 或浏览器 Basic 回退）。`stats_public` **不豁免**这两个端点；核销还要求 `Content-Type: application/json`，阻断跨站表单。
+
 ## 查看用量
 
 ```sh
