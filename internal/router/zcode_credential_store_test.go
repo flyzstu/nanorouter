@@ -1,8 +1,10 @@
 package router
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 )
@@ -89,6 +91,34 @@ func TestZcodeCredentialStoreCacheInvalidatedBySave(t *testing.T) {
 	got, ok := store.get(ctx, ZcodeChannelBigmodel)
 	if !ok || got.APIKey != "fresh" {
 		t.Fatalf("写库后应立刻可见: %+v ok=%v", got, ok)
+	}
+}
+
+func TestZcodeCredentialStoreConcurrentLoad(t *testing.T) {
+	db := mustOpenMemoryDB(t)
+	store := newZcodeCredentialStore(db)
+	ctx := t.Context()
+	if err := store.save(ctx, ZcodeCredential{Channel: ZcodeChannelBigmodel, APIKey: "k"}); err != nil {
+		t.Fatal(err)
+	}
+	store.invalidate()
+
+	var wg sync.WaitGroup
+	errs := make(chan error, 32)
+	for i := 0; i < 32; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			got, ok := store.get(ctx, ZcodeChannelBigmodel)
+			if !ok || got.APIKey != "k" {
+				errs <- fmt.Errorf("get = %+v, %v", got, ok)
+			}
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Fatal(err)
 	}
 }
 

@@ -47,6 +47,10 @@ type zcodeCredentialStore struct {
 	loaded  bool
 	entries map[string]ZcodeCredential
 	at      time.Time
+
+	// loadMu 串行化缓存刷新；mu 只保护字段读写，不再横跨 DB 查询，
+	// 避免刷新期间阻塞仍命中缓存的请求。
+	loadMu sync.Mutex
 }
 
 const zcodeCredentialCacheTTL = 5 * time.Second
@@ -58,19 +62,38 @@ func newZcodeCredentialStore(db *sql.DB) *zcodeCredentialStore {
 // load 返回当前全部渠道的凭据，过期时重查。
 func (s *zcodeCredentialStore) load(ctx context.Context) (map[string]ZcodeCredential, error) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	if s.loaded && time.Since(s.at) < zcodeCredentialCacheTTL {
-		return s.entries, nil
+		entries := s.entries
+		s.mu.Unlock()
+		return entries, nil
 	}
+	s.mu.Unlock()
+
+	// 缓存过期时只让一个请求查库，其余请求等它完成后复用结果；
+	// 命中缓存的请求不会被这次刷新阻塞。
+	s.loadMu.Lock()
+	defer s.loadMu.Unlock()
+
+	s.mu.Lock()
+	if s.loaded && time.Since(s.at) < zcodeCredentialCacheTTL {
+		entries := s.entries
+		s.mu.Unlock()
+		return entries, nil
+	}
+	stale := s.entries
+	s.mu.Unlock()
+
 	entries, err := s.query(ctx)
 	if err != nil {
 		// 查询失败时沿用上一次的结果（含空表）：DB 抖动不该让正在服务的
 		// 候选突然失去凭据。下一轮缓存过期后自然重试。
-		return s.entries, err
+		return stale, err
 	}
+	s.mu.Lock()
 	s.entries = entries
 	s.loaded = true
 	s.at = time.Now()
+	s.mu.Unlock()
 	return entries, nil
 }
 
@@ -176,7 +199,10 @@ func (s *zcodeCredentialStore) save(ctx context.Context, c ZcodeCredential) erro
 }
 
 // invalidate 清空缓存。写库后必须调用，否则新凭据要等 5 秒才生效。
+// 先取 loadMu 等掉进行中的刷新，避免旧查询结果覆盖刚写入的凭据。
 func (s *zcodeCredentialStore) invalidate() {
+	s.loadMu.Lock()
+	defer s.loadMu.Unlock()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.loaded = false
