@@ -1,7 +1,6 @@
 package router
 
 import (
-	"bytes"
 	json "github.com/goccy/go-json"
 )
 
@@ -12,21 +11,6 @@ func usageFromJSON(b []byte) Usage {
 	}
 	if u, ok := findUsage(v); ok {
 		return u
-	}
-	return Usage{Source: "unavailable"}
-}
-
-// Responses 流会把 usage 放入 response.completed；Chat Completions 通常放在最后一个 data 帧。
-// 递归查找让供应商扩展字段也能被采集，同时不修改下游收到的原始 SSE 内容。
-func usageFromSSE(b []byte) Usage {
-	for _, line := range bytes.Split(b, []byte{'\n'}) {
-		line = bytes.TrimSpace(line)
-		if !bytes.HasPrefix(line, []byte("data:")) {
-			continue
-		}
-		if u := usageFromJSON(bytes.TrimSpace(bytes.TrimPrefix(line, []byte("data:")))); u.Source == "upstream" {
-			return u
-		}
 	}
 	return Usage{Source: "unavailable"}
 }

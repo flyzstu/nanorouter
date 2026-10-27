@@ -344,7 +344,7 @@ func (r *Router) auth(next http.Handler) http.Handler {
 			if strings.HasSuffix(q.URL.Path, "/messages") {
 				writeAnthropicAPIError(w, 401, "unauthorized", "authentication_error")
 			} else {
-				http.Error(w, `{"error":{"message":"unauthorized"}}`, 401)
+				http.Error(w, `{"error":{"message":"unauthorized"}}`, http.StatusUnauthorized)
 			}
 			return
 		}
@@ -858,7 +858,7 @@ func (r *Router) proxy(endpoint string, defaultRoutes ...string) http.HandlerFun
 			w.Header().Set("X-Nanorouter-Upstream", u.ID)
 			w.Header().Set("X-Nanorouter-Attempts", fmt.Sprint(attempt+1))
 			if streamed {
-				usage := Usage{Source: "unavailable"}
+				var usage Usage
 				var streamErr error
 				switch {
 				case adaptedResponses && u.Anthropic:
@@ -1176,7 +1176,7 @@ func (r *Router) do(ctx context.Context, u Candidate, endpoint string, body []by
 	if u.Anthropic && endpoint == "messages" {
 		path = zcodeMessagesPath(u)
 	}
-	req, err := http.NewRequestWithContext(ctx, "POST", base+"/"+path, bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, base+"/"+path, bytes.NewReader(body))
 	if err != nil {
 		return nil, err
 	}
@@ -1770,13 +1770,6 @@ func requestID(q *http.Request) string {
 }
 func max(a, b int) int {
 	if a > b {
-		return a
-	}
-	return b
-}
-
-func min(a, b int) int {
-	if a < b {
 		return a
 	}
 	return b
