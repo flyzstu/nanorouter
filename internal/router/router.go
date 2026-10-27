@@ -632,66 +632,19 @@ func (r *Router) proxy(endpoint string, defaultRoutes ...string) http.HandlerFun
 			}
 			// 同一请求中失败或拥塞的候选不再重复尝试，避免权重导致的原地重试。
 			attempted[u.ID] = true
-			// sanitizeRequest 会写时复制，这里无需再提前 clone。
-			p := payload
-			upstreamEndpoint := endpoint
-			adaptedResponses := false
-			switch {
-			case endpoint == "responses" && u.ResponsesViaChatCompletions:
-				p, err = responsesToChatCompletions(payload, u.ChatMaxTokensField)
-				if err != nil {
-					r.releaseProbe(u)
-					writeAPIErrorDialect(w, http.StatusBadRequest, err.Error(), "unsupported_response_feature", endpoint)
-					r.logRequestFailed(requestID, endpoint, routeName, streamed, http.StatusBadRequest, attempt, time.Since(startedAt), "unsupported_response_feature")
-					return
-				}
-				upstreamEndpoint = "chat_completions"
-				adaptedResponses = true
-			case endpoint == "responses" && u.Anthropic:
-				// Responses → Chat → Messages 链式降级：请求侧两跳，
-				// 响应侧按反向链路折返，复用两条各自已测的转换。
-				p, err = responsesToChatCompletions(payload, "")
-				if err != nil {
-					r.releaseProbe(u)
-					writeAPIErrorDialect(w, http.StatusBadRequest, err.Error(), "unsupported_response_feature", endpoint)
-					r.logRequestFailed(requestID, endpoint, routeName, streamed, http.StatusBadRequest, attempt, time.Since(startedAt), "unsupported_response_feature")
-					return
-				}
-				upstreamEndpoint = "chat_completions"
-				adaptedResponses = true
+			var prepared preparedAttempt
+			prepErr := r.prepareAttempt(ctx, payload, u, endpoint, requestID, routeName, &prepared)
+			if prepErr != nil {
+				r.releaseProbe(u)
+				writeAPIErrorDialect(w, http.StatusBadRequest, prepErr.message, prepErr.code, endpoint)
+				r.logRequestFailed(requestID, endpoint, routeName, streamed, http.StatusBadRequest, attempt, time.Since(startedAt), prepErr.code)
+				return
 			}
-			p, dropped := sanitizeRequest(p, u)
-			if len(dropped) > 0 && r.logger.Core().Enabled(zap.DebugLevel) {
-				r.logger.Debug(r.logMessage("request_sanitized"), eventFields("request_sanitized", zap.String("request_id", requestID), zap.String("route", routeName), zap.String("upstream", u.ID), zap.Strings("removed_fields", dropped))...)
-			}
-			p, clamped := clampRequestMaxTokens(p, u)
-			if len(clamped) > 0 && r.logger.Core().Enabled(zap.DebugLevel) {
-				r.logger.Debug(r.logMessage("request_tokens_clamped"), eventFields("request_tokens_clamped", zap.String("request_id", requestID), zap.String("route", routeName), zap.String("upstream", u.ID), zap.Strings("fields", clamped), zap.Int("max_tokens_limit", u.MaxTokensLimit))...)
-			}
-			if u.Anthropic && upstreamEndpoint == "chat_completions" {
-				p, err = chatCompletionsToMessages(p)
-				if err != nil {
-					r.releaseProbe(u)
-					writeAPIErrorDialect(w, http.StatusBadRequest, err.Error(), "unsupported_openai_feature", endpoint)
-					r.logRequestFailed(requestID, endpoint, routeName, streamed, http.StatusBadRequest, attempt, time.Since(startedAt), "unsupported_openai_feature")
-					return
-				}
-				upstreamEndpoint = "messages"
-			}
-			// 解析一次凭据仅供日志脱敏：上游可能把 Authorization 回显进错误
-			// 消息，key 不能随该字段进日志。真正的取用发生在 do() 内部。
-			credential := r.resolveCandidateAPIKey(ctx, u)
-			if u.SimulateZcode {
-				// 官方 CLI 把设备身份写进请求体的 metadata.user_id。注入放在
-				// 翻译之后：Responses→Chat 适配按白名单重建请求体，提前注入
-				// 的 metadata 会被丢弃，此处才能覆盖原生透传、Chat→Messages
-				// 与 Responses 链三条路径。
-				if userID := r.zcodeMetadataUserID(ctx, zcodeSessionIDFor(p)); userID != "" {
-					p["metadata"] = map[string]any{"user_id": userID}
-				}
-			}
-			p["model"] = u.Model
-			encoded, _ := json.Marshal(p)
+			p := prepared.payload
+			encoded := prepared.encoded
+			upstreamEndpoint := prepared.upstreamEndpoint
+			adaptedResponses := prepared.adaptedResponses
+			credential := prepared.credential
 			queueStart := time.Now()
 			release, acquired := r.acquire(ctx, u)
 			if !acquired {
@@ -738,52 +691,21 @@ func (r *Router) proxy(endpoint string, defaultRoutes ...string) http.HandlerFun
 			ttfbDuration := time.Since(start)
 			latency := int(ttfbDuration.Milliseconds())
 			r.ttfb.WithLabelValues(routeName, u.ID, endpoint).Observe(ttfbDuration.Seconds())
+			attemptState := proxyAttempt{
+				request: q, ctx: ctx, attemptCtx: attemptCtx,
+				cancelAttempt: cancelAttempt, release: release,
+				requestID: requestID, routeName: routeName, endpoint: endpoint,
+				u: u, attempt: attempt, streamed: streamed,
+				adaptedResponses: adaptedResponses, upstreamEndpoint: upstreamEndpoint,
+				credential: credential, latency: latency,
+				start: start, startedAt: startedAt, meta: meta,
+			}
 			if err != nil {
-				attemptTimedOut := errors.Is(attemptCtx.Err(), context.DeadlineExceeded) && ctx.Err() == nil
-				cancelAttempt()
-				release()
-				status := 0
-				kind := "network"
-				outcome := "network_error"
-				if attemptTimedOut {
-					status = http.StatusGatewayTimeout
-					kind = "attempt_timeout"
-					outcome = "attempt_timeout"
-				}
-				r.observeConcurrency(u, status, ttfbDuration, queueDuration > time.Millisecond)
-				// 客户端断开会取消请求 context；请求根本没发完，不能把它当成上游故障冷却。
-				clientCanceled := q.Context().Err() != nil
-				if clientCanceled {
-					status, kind, outcome = 499, "client_canceled", "client_canceled"
-				}
-				r.record(requestID, routeName, u, endpoint, status, latency, streamed, attempt, Usage{Source: "unavailable"}, kind, meta)
-				if clientCanceled {
-					r.releaseProbe(u)
-					if ctx.Err() != nil {
-						r.logRequestFailed(requestID, endpoint, routeName, streamed, 499, attempt+1, time.Since(startedAt), "client_canceled")
-						return
-					}
+				if r.handleAttemptError(w, err, attemptState, ttfbDuration, queueDuration) {
 					attempt++
 					continue
 				}
-				r.fail(routeName, u, 30*time.Second)
-				r.failovers.WithLabelValues(routeName, kind).Inc()
-				if r.logger.Core().Enabled(zap.WarnLevel) {
-					fields := failureLogFields(requestID, routeName, u, endpoint, attempt, latency, streamed, status, outcome, true, credential)
-					fields = append(fields, zap.Error(err))
-					r.logger.Warn(r.logMessage("upstream_attempt_finished"), eventFields("upstream_attempt_finished", fields...)...)
-				}
-				if ctx.Err() != nil {
-					if q.Context().Err() != nil {
-						r.logRequestFailed(requestID, endpoint, routeName, streamed, 499, attempt+1, time.Since(startedAt), "client_canceled")
-						return
-					}
-					writeAPIErrorDialect(w, http.StatusGatewayTimeout, "request deadline exceeded", "request_timeout", endpoint)
-					r.logRequestFailed(requestID, endpoint, routeName, streamed, http.StatusGatewayTimeout, attempt+1, time.Since(startedAt), "request_timeout")
-					return
-				}
-				attempt++
-				continue
+				return
 			}
 			r.observeConcurrency(u, resp.StatusCode, ttfbDuration, queueDuration > time.Millisecond)
 			// 收到上游响应头后立即记录下游请求到上游返回的完整等待时间，
@@ -794,62 +716,17 @@ func (r *Router) proxy(endpoint string, defaultRoutes ...string) http.HandlerFun
 				r.logger.Info(r.logMessage("upstream_response_received"), eventFields("upstream_response_received", responseFields...)...)
 			}
 			if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-				// expose_as 代表明确指定某个上游；此时不能用通用 503 掩盖
-				// 上游诊断；只有明确配置允许的临时状态才原地重试该候选。
-				// 普通路由仍先切换其他候选，避免重试拖慢健康上游的接管。
-				directUpstream := routeName == u.ExposeAs && u.ExposeAs != ""
-				policy, _ := u.Retry.resolve(r.cfg.Retry)
-				candidateRetry := internalRetryEligible(resp.StatusCode) && retryCounts[u.ID] < policy.MaxRetries
-				if (directUpstream && !candidateRetry) || !failoverEligible(resp.StatusCode) {
-					if failoverEligible(resp.StatusCode) {
-						r.fail(routeName, u, cooldown(resp))
-					} else {
-						r.success(u)
-					}
-					// 401/403 是凭据失效的信号，不是可切换的故障：冷却它没有意义，
-					// 换到另一个候选也只是把同一个坏凭据再试一遍。此时改为触发
-					// 一次登录，拿到新 key 后下一请求自然恢复。
-					if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
-						r.maybeTriggerZcodeRelogin(u, "upstream rejected the credential")
-					}
-					upstreamError := r.copyErrorResponse(w, resp, u, endpoint)
-					cancelAttempt()
-					release()
-					r.record(requestID, routeName, u, endpoint, resp.StatusCode, latency, streamed, attempt, Usage{Source: "unavailable"}, "client", meta)
-					if r.logger.Core().Enabled(zap.WarnLevel) {
-						fields := failureLogFields(requestID, routeName, u, endpoint, attempt, latency, streamed, resp.StatusCode, "upstream_rejected", false, credential)
-						fields = append(fields, upstreamError.logFields(true)...)
-						r.logger.Warn(r.logMessage("upstream_attempt_finished"), eventFields("upstream_attempt_finished", fields...)...)
-					}
-					r.logRequestFailed(requestID, endpoint, routeName, streamed, resp.StatusCode, attempt+1, time.Since(startedAt), "upstream_rejected")
-					return
-				}
-
-				upstreamError := readUpstreamError(resp)
-				cancelAttempt()
-				release()
-				if resp.StatusCode == http.StatusTooManyRequests {
-					rateLimited = true
-				}
-				if candidateRetry {
-					number := retryCounts[u.ID] + 1
-					delay := r.candidateRetryDelay(policy, number)
-					delay = maxDuration(delay, retryAfter(resp))
-					retryAt := time.Now().Add(delay)
+				result := r.handleUpstreamFailure(w, resp, attemptState, retryCounts)
+				rateLimited = rateLimited || result.rateLimited
+				if result.pending != nil {
 					if pendingRetries == nil {
 						pendingRetries = make(map[string]pendingCandidateRetry, 1)
 					}
-					pendingRetries[u.ID] = pendingCandidateRetry{Candidate: u, At: retryAt, Number: number, Status: resp.StatusCode, Policy: policy}
-					r.failUntil(u, retryAt)
-				} else {
-					r.fail(routeName, u, cooldown(resp))
+					pendingRetries[u.ID] = *result.pending
+					r.failUntil(u, result.pending.At)
 				}
-				r.record(requestID, routeName, u, endpoint, resp.StatusCode, latency, streamed, attempt, Usage{Source: "unavailable"}, "upstream", meta)
-				r.failovers.WithLabelValues(routeName, http.StatusText(resp.StatusCode)).Inc()
-				if r.logger.Core().Enabled(zap.WarnLevel) {
-					fields := failureLogFields(requestID, routeName, u, endpoint, attempt, latency, streamed, resp.StatusCode, "upstream_unavailable", true, credential)
-					fields = append(fields, upstreamError.logFields(true)...)
-					r.logger.Warn(r.logMessage("upstream_attempt_finished"), eventFields("upstream_attempt_finished", fields...)...)
+				if result.handled {
+					return
 				}
 				attempt++
 				continue
@@ -858,128 +735,338 @@ func (r *Router) proxy(endpoint string, defaultRoutes ...string) http.HandlerFun
 			w.Header().Set("X-Nanorouter-Upstream", u.ID)
 			w.Header().Set("X-Nanorouter-Attempts", fmt.Sprint(attempt+1))
 			if streamed {
-				var usage Usage
-				var streamErr error
-				switch {
-				case adaptedResponses && u.Anthropic:
-					usage, streamErr = r.streamMessagesAsChat(w, resp, true, routeName)
-				case u.Anthropic && endpoint == "chat_completions" && upstreamEndpoint == "messages":
-					usage, streamErr = r.streamMessagesAsChat(w, resp, false, routeName)
-				case adaptedResponses:
-					usage, streamErr = r.streamChatAsResponses(w, resp, routeName)
-				default:
-					// messages 端点的同方言透传也在默认分支：SSE 原样转发，
-					// usage 由 stream 内的合并逻辑采集。
-					usage, streamErr = r.stream(w, resp)
-				}
-				// cancelAttempt 会置空 attemptCtx 的 deadline，必须先判定再取消。
-				attemptTimedOut := errors.Is(attemptCtx.Err(), context.DeadlineExceeded) && ctx.Err() == nil
-				cancelAttempt()
-				release()
-				duration := int(time.Since(start).Milliseconds())
-				if streamErr != nil {
-					// 客户端取消或候选/全局超时都会中断对上游流的读取，但这些都不是
-					// 上游故障；冷却它们会让同一路由陷入无谓的 503 窗口。
-					// 只有真正的上游流错误才需要冷却并计入故障切换。
-					clientCanceled := q.Context().Err() != nil
-					kind, outcome, status := "stream", "stream_interrupted", 0
-					switch {
-					case clientCanceled:
-						kind, outcome, status = "client_canceled", "client_canceled", 499
-					case attemptTimedOut:
-						kind, outcome, status = "attempt_timeout", "attempt_timeout", http.StatusGatewayTimeout
-					case ctx.Err() != nil:
-						kind, outcome, status = "request_timeout", "request_timeout", http.StatusGatewayTimeout
-					default:
-						r.fail(routeName, u, 30*time.Second)
-					}
-					r.releaseProbe(u)
-					r.record(requestID, routeName, u, endpoint, status, duration, true, attempt, usage, kind, meta)
-					r.logRequestFailed(requestID, endpoint, routeName, true, status, attempt+1, time.Since(startedAt), outcome)
-					return
-				}
-				r.success(u)
-				r.record(requestID, routeName, u, endpoint, resp.StatusCode, duration, true, attempt, usage, "", meta)
-				if r.logger.Core().Enabled(zap.InfoLevel) {
-					r.logger.Info(r.logMessage("upstream_attempt_finished"), eventFields("upstream_attempt_finished", successLogFields(requestID, routeName, u, endpoint, attempt, latency, duration, true, resp.StatusCode, usage)...)...)
-				}
-				r.logRequestCompleted(requestID, endpoint, routeName, u, true, attempt+1, time.Since(startedAt), usage)
-			} else {
-				b, readErr := io.ReadAll(io.LimitReader(resp.Body, maxUpstreamResponseBody+1))
-				_ = resp.Body.Close()
-				if readErr == nil && int64(len(b)) > maxUpstreamResponseBody {
-					readErr = errUpstreamResponseTooLarge
-				}
-				cancelAttempt()
-				if readErr != nil {
-					release()
-					if errors.Is(readErr, errUpstreamResponseTooLarge) {
-						writeAPIErrorDialect(w, http.StatusBadGateway, "upstream response exceeds size limit", "upstream_response_too_large", endpoint)
-						r.record(requestID, routeName, u, endpoint, http.StatusBadGateway, int(time.Since(start).Milliseconds()), false, attempt, Usage{Source: "unavailable"}, "upstream_response_too_large", meta)
-						r.logRequestFailed(requestID, endpoint, routeName, false, http.StatusBadGateway, attempt+1, time.Since(startedAt), "upstream_response_too_large")
-						return
-					}
-					// 客户端取消会中断响应体读取，但这不是上游故障：释放探活租约
-					// 并直接返回，冷却候选会让紧随其后的正常请求误判为全部不可用。
-					if q.Context().Err() != nil {
-						r.releaseProbe(u)
-						r.record(requestID, routeName, u, endpoint, 499, int(time.Since(start).Milliseconds()), false, attempt, Usage{Source: "unavailable"}, "client_canceled", meta)
-						r.logRequestFailed(requestID, endpoint, routeName, false, 499, attempt+1, time.Since(startedAt), "client_canceled")
-						return
-					}
-					r.fail(routeName, u, 30*time.Second)
-					r.record(requestID, routeName, u, endpoint, http.StatusGatewayTimeout, int(time.Since(start).Milliseconds()), false, attempt, Usage{Source: "unavailable"}, "attempt_timeout", meta)
-					attempt++
-					continue
-				}
-				r.success(u)
-				if adaptedResponses {
-					if u.Anthropic {
-						b, err = messagesToChatCompletion(b, routeName)
-						if err != nil {
-							release()
-							writeAPIErrorDialect(w, http.StatusBadGateway, "cannot adapt upstream messages response: "+err.Error(), "upstream_error", endpoint)
-							r.record(requestID, routeName, u, endpoint, resp.StatusCode, latency, false, attempt, Usage{Source: "unavailable"}, "upstream", meta)
-							r.logRequestFailed(requestID, endpoint, routeName, false, http.StatusBadGateway, attempt+1, time.Since(startedAt), "response_adaptation_failed")
-							return
-						}
-					}
-					b, err = chatCompletionToResponse(b, routeName)
-					if err != nil {
-						release()
-						writeAPIErrorDialect(w, http.StatusBadGateway, "cannot adapt upstream chat response: "+err.Error(), "upstream_error", endpoint)
-						r.record(requestID, routeName, u, endpoint, resp.StatusCode, latency, false, attempt, Usage{Source: "unavailable"}, "upstream", meta)
-						r.logRequestFailed(requestID, endpoint, routeName, false, http.StatusBadGateway, attempt+1, time.Since(startedAt), "response_adaptation_failed")
-						return
-					}
-					w.Header().Set("Content-Type", "application/json")
-				} else if u.Anthropic && endpoint == "chat_completions" {
-					b, err = messagesToChatCompletion(b, routeName)
-					if err != nil {
-						release()
-						writeAPIErrorDialect(w, http.StatusBadGateway, "cannot adapt upstream messages response: "+err.Error(), "upstream_error", endpoint)
-						r.record(requestID, routeName, u, endpoint, resp.StatusCode, latency, false, attempt, Usage{Source: "unavailable"}, "upstream", meta)
-						r.logRequestFailed(requestID, endpoint, routeName, false, http.StatusBadGateway, attempt+1, time.Since(startedAt), "response_adaptation_failed")
-						return
-					}
-					w.Header().Set("Content-Type", "application/json")
-				} else {
-					r.copyHeaders(w, resp.Header)
-				}
-				w.WriteHeader(resp.StatusCode)
-				_, _ = w.Write(b)
-				release()
-				usage := usageFromJSON(b)
-				duration := int(time.Since(start).Milliseconds())
-				r.record(requestID, routeName, u, endpoint, resp.StatusCode, duration, false, attempt, usage, "", meta)
-				if r.logger.Core().Enabled(zap.InfoLevel) {
-					r.logger.Info(r.logMessage("upstream_attempt_finished"), eventFields("upstream_attempt_finished", successLogFields(requestID, routeName, u, endpoint, attempt, latency, duration, false, resp.StatusCode, usage)...)...)
-				}
-				r.logRequestCompleted(requestID, endpoint, routeName, u, false, attempt+1, time.Since(startedAt), usage)
+				r.handleStreamingResponse(w, resp, attemptState)
+			} else if r.handleNonStreamingResponse(w, resp, attemptState) {
+				attempt++
+				continue
 			}
 			return
 		}
 	}
+}
+
+type preparedAttempt struct {
+	payload          map[string]any
+	encoded          []byte
+	upstreamEndpoint string
+	adaptedResponses bool
+	credential       string
+}
+
+type proxyRequestError struct {
+	code    string
+	message string
+}
+
+// prepareAttempt 按候选协议生成上游请求体；返回的错误由调用方统一写回。
+func (r *Router) prepareAttempt(ctx context.Context, payload map[string]any, u Candidate, endpoint, requestID, routeName string, prepared *preparedAttempt) *proxyRequestError {
+	prepared.payload = payload
+	prepared.upstreamEndpoint = endpoint
+	switch {
+	case endpoint == "responses" && u.ResponsesViaChatCompletions:
+		adapted, err := responsesToChatCompletions(payload, u.ChatMaxTokensField)
+		if err != nil {
+			return &proxyRequestError{code: "unsupported_response_feature", message: err.Error()}
+		}
+		prepared.payload, prepared.upstreamEndpoint, prepared.adaptedResponses = adapted, "chat_completions", true
+	case endpoint == "responses" && u.Anthropic:
+		// Responses → Chat → Messages 链式降级：请求侧两跳，
+		// 响应侧按反向链路折返，复用两条各自已测的转换。
+		adapted, err := responsesToChatCompletions(payload, "")
+		if err != nil {
+			return &proxyRequestError{code: "unsupported_response_feature", message: err.Error()}
+		}
+		prepared.payload, prepared.upstreamEndpoint, prepared.adaptedResponses = adapted, "chat_completions", true
+	}
+	var dropped []string
+	prepared.payload, dropped = sanitizeRequest(prepared.payload, u)
+	if len(dropped) > 0 && r.logger.Core().Enabled(zap.DebugLevel) {
+		r.logger.Debug(r.logMessage("request_sanitized"), eventFields("request_sanitized", zap.String("request_id", requestID), zap.String("route", routeName), zap.String("upstream", u.ID), zap.Strings("removed_fields", dropped))...)
+	}
+	var clamped []string
+	prepared.payload, clamped = clampRequestMaxTokens(prepared.payload, u)
+	if len(clamped) > 0 && r.logger.Core().Enabled(zap.DebugLevel) {
+		r.logger.Debug(r.logMessage("request_tokens_clamped"), eventFields("request_tokens_clamped", zap.String("request_id", requestID), zap.String("route", routeName), zap.String("upstream", u.ID), zap.Strings("fields", clamped), zap.Int("max_tokens_limit", u.MaxTokensLimit))...)
+	}
+	if u.Anthropic && prepared.upstreamEndpoint == "chat_completions" {
+		adapted, err := chatCompletionsToMessages(prepared.payload)
+		if err != nil {
+			return &proxyRequestError{code: "unsupported_openai_feature", message: err.Error()}
+		}
+		prepared.payload, prepared.upstreamEndpoint = adapted, "messages"
+	}
+	// 解析一次凭据仅供日志脱敏：上游可能把 Authorization 回显进错误
+	// 消息，key 不能随该字段进日志。真正的取用发生在 do() 内部。
+	prepared.credential = r.resolveCandidateAPIKey(ctx, u)
+	if u.SimulateZcode {
+		// 官方 CLI 把设备身份写进请求体的 metadata.user_id。注入放在
+		// 翻译之后：Responses→Chat 适配按白名单重建请求体，提前注入
+		// 的 metadata 会被丢弃，此处才能覆盖原生透传、Chat→Messages
+		// 与 Responses 链三条路径。
+		if userID := r.zcodeMetadataUserID(ctx, zcodeSessionIDFor(prepared.payload)); userID != "" {
+			prepared.payload["metadata"] = map[string]any{"user_id": userID}
+		}
+	}
+	prepared.payload["model"] = u.Model
+	prepared.encoded, _ = json.Marshal(prepared.payload)
+	return nil
+}
+
+type proxyAttempt struct {
+	request          *http.Request
+	ctx              context.Context
+	attemptCtx       context.Context
+	cancelAttempt    context.CancelFunc
+	release          func()
+	requestID        string
+	routeName        string
+	endpoint         string
+	u                Candidate
+	attempt          int
+	streamed         bool
+	adaptedResponses bool
+	credential       string
+	upstreamEndpoint string
+	latency          int
+	start            time.Time
+	startedAt        time.Time
+	meta             requestMeta
+}
+
+func (r *Router) handleStreamingResponse(w http.ResponseWriter, resp *http.Response, a proxyAttempt) {
+	var usage Usage
+	var streamErr error
+	switch {
+	case a.adaptedResponses && a.u.Anthropic:
+		usage, streamErr = r.streamMessagesAsChat(w, resp, true, a.routeName)
+	case a.u.Anthropic && a.endpoint == "chat_completions" && a.upstreamEndpoint == "messages":
+		usage, streamErr = r.streamMessagesAsChat(w, resp, false, a.routeName)
+	case a.adaptedResponses:
+		usage, streamErr = r.streamChatAsResponses(w, resp, a.routeName)
+	default:
+		// messages 端点的同方言透传也在默认分支：SSE 原样转发，
+		// usage 由 stream 内的合并逻辑采集。
+		usage, streamErr = r.stream(w, resp)
+	}
+	// cancelAttempt 会置空 attemptCtx 的 deadline，必须先判定再取消。
+	attemptTimedOut := errors.Is(a.attemptCtx.Err(), context.DeadlineExceeded) && a.ctx.Err() == nil
+	a.cancelAttempt()
+	a.release()
+	duration := int(time.Since(a.start).Milliseconds())
+	if streamErr != nil {
+		// 客户端取消或候选/全局超时都会中断对上游流的读取，但这些都不是
+		// 上游故障；冷却它们会让同一路由陷入无谓的 503 窗口。
+		// 只有真正的上游流错误才需要冷却并计入故障切换。
+		clientCanceled := a.request.Context().Err() != nil
+		kind, outcome, status := "stream", "stream_interrupted", 0
+		switch {
+		case clientCanceled:
+			kind, outcome, status = "client_canceled", "client_canceled", 499
+		case attemptTimedOut:
+			kind, outcome, status = "attempt_timeout", "attempt_timeout", http.StatusGatewayTimeout
+		case a.ctx.Err() != nil:
+			kind, outcome, status = "request_timeout", "request_timeout", http.StatusGatewayTimeout
+		default:
+			r.fail(a.routeName, a.u, 30*time.Second)
+		}
+		r.releaseProbe(a.u)
+		r.record(a.requestID, a.routeName, a.u, a.endpoint, status, duration, true, a.attempt, usage, kind, a.meta)
+		r.logRequestFailed(a.requestID, a.endpoint, a.routeName, true, status, a.attempt+1, time.Since(a.startedAt), outcome)
+		return
+	}
+	r.success(a.u)
+	r.record(a.requestID, a.routeName, a.u, a.endpoint, resp.StatusCode, duration, true, a.attempt, usage, "", a.meta)
+	if r.logger.Core().Enabled(zap.InfoLevel) {
+		r.logger.Info(r.logMessage("upstream_attempt_finished"), eventFields("upstream_attempt_finished", successLogFields(a.requestID, a.routeName, a.u, a.endpoint, a.attempt, a.latency, duration, true, resp.StatusCode, usage)...)...)
+	}
+	r.logRequestCompleted(a.requestID, a.endpoint, a.routeName, a.u, true, a.attempt+1, time.Since(a.startedAt), usage)
+}
+
+type upstreamFailureResult struct {
+	handled     bool
+	rateLimited bool
+	pending     *pendingCandidateRetry
+}
+
+// handleAttemptError 处理网络/上下文错误，返回是否需要换候选继续。
+func (r *Router) handleAttemptError(w http.ResponseWriter, err error, a proxyAttempt, ttfbDuration, queueDuration time.Duration) bool {
+	attemptTimedOut := errors.Is(a.attemptCtx.Err(), context.DeadlineExceeded) && a.ctx.Err() == nil
+	a.cancelAttempt()
+	a.release()
+	status := 0
+	kind := "network"
+	outcome := "network_error"
+	if attemptTimedOut {
+		status = http.StatusGatewayTimeout
+		kind = "attempt_timeout"
+		outcome = "attempt_timeout"
+	}
+	r.observeConcurrency(a.u, status, ttfbDuration, queueDuration > time.Millisecond)
+	// 客户端断开会取消请求 context；请求根本没发完，不能把它当成上游故障冷却。
+	clientCanceled := a.request.Context().Err() != nil
+	if clientCanceled {
+		status, kind, outcome = 499, "client_canceled", "client_canceled"
+	}
+	r.record(a.requestID, a.routeName, a.u, a.endpoint, status, a.latency, a.streamed, a.attempt, Usage{Source: "unavailable"}, kind, a.meta)
+	if clientCanceled {
+		r.releaseProbe(a.u)
+		if a.ctx.Err() != nil {
+			r.logRequestFailed(a.requestID, a.endpoint, a.routeName, a.streamed, 499, a.attempt+1, time.Since(a.startedAt), "client_canceled")
+			return false
+		}
+		return true
+	}
+	r.fail(a.routeName, a.u, 30*time.Second)
+	r.failovers.WithLabelValues(a.routeName, kind).Inc()
+	if r.logger.Core().Enabled(zap.WarnLevel) {
+		fields := failureLogFields(a.requestID, a.routeName, a.u, a.endpoint, a.attempt, a.latency, a.streamed, status, outcome, true, a.credential)
+		fields = append(fields, zap.Error(err))
+		r.logger.Warn(r.logMessage("upstream_attempt_finished"), eventFields("upstream_attempt_finished", fields...)...)
+	}
+	if a.ctx.Err() != nil {
+		if a.request.Context().Err() != nil {
+			r.logRequestFailed(a.requestID, a.endpoint, a.routeName, a.streamed, 499, a.attempt+1, time.Since(a.startedAt), "client_canceled")
+			return false
+		}
+		writeAPIErrorDialect(w, http.StatusGatewayTimeout, "request deadline exceeded", "request_timeout", a.endpoint)
+		r.logRequestFailed(a.requestID, a.endpoint, a.routeName, a.streamed, http.StatusGatewayTimeout, a.attempt+1, time.Since(a.startedAt), "request_timeout")
+		return false
+	}
+	return true
+}
+
+// handleUpstreamFailure 处理非 2xx：要么直接回传错误，要么返回重试信息给主循环。
+func (r *Router) handleUpstreamFailure(w http.ResponseWriter, resp *http.Response, a proxyAttempt, retryCounts map[string]int) upstreamFailureResult {
+	// expose_as 代表明确指定某个上游；此时不能用通用 503 掩盖
+	// 上游诊断；只有明确配置允许的临时状态才原地重试该候选。
+	// 普通路由仍先切换其他候选，避免重试拖慢健康上游的接管。
+	directUpstream := a.routeName == a.u.ExposeAs && a.u.ExposeAs != ""
+	policy, _ := a.u.Retry.resolve(r.cfg.Retry)
+	candidateRetry := internalRetryEligible(resp.StatusCode) && retryCounts[a.u.ID] < policy.MaxRetries
+	if (directUpstream && !candidateRetry) || !failoverEligible(resp.StatusCode) {
+		if failoverEligible(resp.StatusCode) {
+			r.fail(a.routeName, a.u, cooldown(resp))
+		} else {
+			r.success(a.u)
+		}
+		// 401/403 是凭据失效的信号，不是可切换的故障：冷却它没有意义，
+		// 换到另一个候选也只是把同一个坏凭据再试一遍。此时改为触发
+		// 一次登录，拿到新 key 后下一请求自然恢复。
+		if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
+			r.maybeTriggerZcodeRelogin(a.u, "upstream rejected the credential")
+		}
+		upstreamError := r.copyErrorResponse(w, resp, a.u, a.endpoint)
+		a.cancelAttempt()
+		a.release()
+		r.record(a.requestID, a.routeName, a.u, a.endpoint, resp.StatusCode, a.latency, a.streamed, a.attempt, Usage{Source: "unavailable"}, "client", a.meta)
+		if r.logger.Core().Enabled(zap.WarnLevel) {
+			fields := failureLogFields(a.requestID, a.routeName, a.u, a.endpoint, a.attempt, a.latency, a.streamed, resp.StatusCode, "upstream_rejected", false, a.credential)
+			fields = append(fields, upstreamError.logFields(true)...)
+			r.logger.Warn(r.logMessage("upstream_attempt_finished"), eventFields("upstream_attempt_finished", fields...)...)
+		}
+		r.logRequestFailed(a.requestID, a.endpoint, a.routeName, a.streamed, resp.StatusCode, a.attempt+1, time.Since(a.startedAt), "upstream_rejected")
+		return upstreamFailureResult{handled: true}
+	}
+
+	upstreamError := readUpstreamError(resp)
+	a.cancelAttempt()
+	a.release()
+	result := upstreamFailureResult{rateLimited: resp.StatusCode == http.StatusTooManyRequests}
+	if candidateRetry {
+		number := retryCounts[a.u.ID] + 1
+		delay := r.candidateRetryDelay(policy, number)
+		delay = maxDuration(delay, retryAfter(resp))
+		result.pending = &pendingCandidateRetry{
+			Candidate: a.u, At: time.Now().Add(delay), Number: number,
+			Status: resp.StatusCode, Policy: policy,
+		}
+	} else {
+		r.fail(a.routeName, a.u, cooldown(resp))
+	}
+	r.record(a.requestID, a.routeName, a.u, a.endpoint, resp.StatusCode, a.latency, a.streamed, a.attempt, Usage{Source: "unavailable"}, "upstream", a.meta)
+	r.failovers.WithLabelValues(a.routeName, http.StatusText(resp.StatusCode)).Inc()
+	if r.logger.Core().Enabled(zap.WarnLevel) {
+		fields := failureLogFields(a.requestID, a.routeName, a.u, a.endpoint, a.attempt, a.latency, a.streamed, resp.StatusCode, "upstream_unavailable", true, a.credential)
+		fields = append(fields, upstreamError.logFields(true)...)
+		r.logger.Warn(r.logMessage("upstream_attempt_finished"), eventFields("upstream_attempt_finished", fields...)...)
+	}
+	return result
+}
+
+// handleNonStreamingResponse 写完或放弃响应后返回是否应换候选重试。
+func (r *Router) handleNonStreamingResponse(w http.ResponseWriter, resp *http.Response, a proxyAttempt) bool {
+	b, readErr := io.ReadAll(io.LimitReader(resp.Body, maxUpstreamResponseBody+1))
+	_ = resp.Body.Close()
+	if readErr == nil && int64(len(b)) > maxUpstreamResponseBody {
+		readErr = errUpstreamResponseTooLarge
+	}
+	a.cancelAttempt()
+	if readErr != nil {
+		a.release()
+		if errors.Is(readErr, errUpstreamResponseTooLarge) {
+			writeAPIErrorDialect(w, http.StatusBadGateway, "upstream response exceeds size limit", "upstream_response_too_large", a.endpoint)
+			r.record(a.requestID, a.routeName, a.u, a.endpoint, http.StatusBadGateway, int(time.Since(a.start).Milliseconds()), false, a.attempt, Usage{Source: "unavailable"}, "upstream_response_too_large", a.meta)
+			r.logRequestFailed(a.requestID, a.endpoint, a.routeName, false, http.StatusBadGateway, a.attempt+1, time.Since(a.startedAt), "upstream_response_too_large")
+			return false
+		}
+		// 客户端取消会中断响应体读取，但这不是上游故障：释放探活租约
+		// 并直接返回，冷却候选会让紧随其后的正常请求误判为全部不可用。
+		if a.request.Context().Err() != nil {
+			r.releaseProbe(a.u)
+			r.record(a.requestID, a.routeName, a.u, a.endpoint, 499, int(time.Since(a.start).Milliseconds()), false, a.attempt, Usage{Source: "unavailable"}, "client_canceled", a.meta)
+			r.logRequestFailed(a.requestID, a.endpoint, a.routeName, false, 499, a.attempt+1, time.Since(a.startedAt), "client_canceled")
+			return false
+		}
+		r.fail(a.routeName, a.u, 30*time.Second)
+		r.record(a.requestID, a.routeName, a.u, a.endpoint, http.StatusGatewayTimeout, int(time.Since(a.start).Milliseconds()), false, a.attempt, Usage{Source: "unavailable"}, "attempt_timeout", a.meta)
+		return true
+	}
+	r.success(a.u)
+	var err error
+	if a.adaptedResponses {
+		if a.u.Anthropic {
+			b, err = messagesToChatCompletion(b, a.routeName)
+			if err != nil {
+				a.release()
+				writeAPIErrorDialect(w, http.StatusBadGateway, "cannot adapt upstream messages response: "+err.Error(), "upstream_error", a.endpoint)
+				r.record(a.requestID, a.routeName, a.u, a.endpoint, resp.StatusCode, a.latency, false, a.attempt, Usage{Source: "unavailable"}, "upstream", a.meta)
+				r.logRequestFailed(a.requestID, a.endpoint, a.routeName, false, http.StatusBadGateway, a.attempt+1, time.Since(a.startedAt), "response_adaptation_failed")
+				return false
+			}
+		}
+		b, err = chatCompletionToResponse(b, a.routeName)
+		if err != nil {
+			a.release()
+			writeAPIErrorDialect(w, http.StatusBadGateway, "cannot adapt upstream chat response: "+err.Error(), "upstream_error", a.endpoint)
+			r.record(a.requestID, a.routeName, a.u, a.endpoint, resp.StatusCode, a.latency, false, a.attempt, Usage{Source: "unavailable"}, "upstream", a.meta)
+			r.logRequestFailed(a.requestID, a.endpoint, a.routeName, false, http.StatusBadGateway, a.attempt+1, time.Since(a.startedAt), "response_adaptation_failed")
+			return false
+		}
+		w.Header().Set("Content-Type", "application/json")
+	} else if a.u.Anthropic && a.endpoint == "chat_completions" {
+		b, err = messagesToChatCompletion(b, a.routeName)
+		if err != nil {
+			a.release()
+			writeAPIErrorDialect(w, http.StatusBadGateway, "cannot adapt upstream messages response: "+err.Error(), "upstream_error", a.endpoint)
+			r.record(a.requestID, a.routeName, a.u, a.endpoint, resp.StatusCode, a.latency, false, a.attempt, Usage{Source: "unavailable"}, "upstream", a.meta)
+			r.logRequestFailed(a.requestID, a.endpoint, a.routeName, false, http.StatusBadGateway, a.attempt+1, time.Since(a.startedAt), "response_adaptation_failed")
+			return false
+		}
+		w.Header().Set("Content-Type", "application/json")
+	} else {
+		r.copyHeaders(w, resp.Header)
+	}
+	w.WriteHeader(resp.StatusCode)
+	_, _ = w.Write(b)
+	a.release()
+	usage := usageFromJSON(b)
+	duration := int(time.Since(a.start).Milliseconds())
+	r.record(a.requestID, a.routeName, a.u, a.endpoint, resp.StatusCode, duration, false, a.attempt, usage, "", a.meta)
+	if r.logger.Core().Enabled(zap.InfoLevel) {
+		r.logger.Info(r.logMessage("upstream_attempt_finished"), eventFields("upstream_attempt_finished", successLogFields(a.requestID, a.routeName, a.u, a.endpoint, a.attempt, a.latency, duration, false, resp.StatusCode, usage)...)...)
+	}
+	r.logRequestCompleted(a.requestID, a.endpoint, a.routeName, a.u, false, a.attempt+1, time.Since(a.startedAt), usage)
+	return false
 }
 
 // acquire 在向上游发请求前占用候选槽位。它不把本地拥塞标记为上游故障，
