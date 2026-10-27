@@ -227,7 +227,7 @@ func (r *Router) executeProbe(parentCtx context.Context, u Candidate) {
 	if u.Anthropic {
 		probeEndpoint = "messages"
 	}
-	resp, err := r.do(ctx, u, probeEndpoint, body, nil, nil)
+	resp, err := r.do(ctx, u, probeEndpoint, body, nil, nil, "")
 	duration := time.Since(start)
 
 	if err != nil {

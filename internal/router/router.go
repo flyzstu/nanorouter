@@ -30,8 +30,11 @@ import (
 )
 
 const maxRequestBody = 16 << 20
+const maxUpstreamResponseBody int64 = 64 << 20
 const maxUpstreamErrorBody = 8 << 10
 const maxUpstreamErrorMessage = 512
+
+var errUpstreamResponseTooLarge = errors.New("upstream response exceeds size limit")
 
 // ledgerWriteTimeout 限制单次同步账本写入的时长。客户端取消请求时请求 context 会被取消，
 // 账本写入必须使用独立 context，否则取消会导致记录丢失并刷出无谓的 ledger_write_failed。
@@ -633,7 +636,8 @@ func (r *Router) proxy(endpoint string, defaultRoutes ...string) http.HandlerFun
 			}
 			// 同一请求中失败或拥塞的候选不再重复尝试，避免权重导致的原地重试。
 			attempted[u.ID] = true
-			p := clone(payload)
+			// sanitizeRequest 会写时复制，这里无需再提前 clone。
+			p := payload
 			upstreamEndpoint := endpoint
 			adaptedResponses := false
 			switch {
@@ -734,7 +738,7 @@ func (r *Router) proxy(endpoint string, defaultRoutes ...string) http.HandlerFun
 			}
 			attemptCtx, cancelAttempt := candidateAttemptContext(ctx, u.AttemptTimeout)
 			upstreamAttempts++
-			resp, err := r.do(attemptCtx, u, upstreamEndpoint, encoded, p, q)
+			resp, err := r.do(attemptCtx, u, upstreamEndpoint, encoded, p, q, credential)
 			ttfbDuration := time.Since(start)
 			latency := int(ttfbDuration.Milliseconds())
 			r.ttfb.WithLabelValues(routeName, u.ID, endpoint).Observe(ttfbDuration.Seconds())
@@ -905,11 +909,28 @@ func (r *Router) proxy(endpoint string, defaultRoutes ...string) http.HandlerFun
 				}
 				r.logRequestCompleted(requestID, endpoint, routeName, u, true, attempt+1, time.Since(startedAt), usage)
 			} else {
-				b, readErr := io.ReadAll(resp.Body)
-				resp.Body.Close()
+				b, readErr := io.ReadAll(io.LimitReader(resp.Body, maxUpstreamResponseBody+1))
+				_ = resp.Body.Close()
+				if readErr == nil && int64(len(b)) > maxUpstreamResponseBody {
+					readErr = errUpstreamResponseTooLarge
+				}
 				cancelAttempt()
 				if readErr != nil {
 					release()
+					if errors.Is(readErr, errUpstreamResponseTooLarge) {
+						writeAPIErrorDialect(w, http.StatusBadGateway, "upstream response exceeds size limit", "upstream_response_too_large", endpoint)
+						r.record(requestID, routeName, u, endpoint, http.StatusBadGateway, int(time.Since(start).Milliseconds()), false, attempt, Usage{Source: "unavailable"}, "upstream_response_too_large", meta)
+						r.logRequestFailed(requestID, endpoint, routeName, false, http.StatusBadGateway, attempt+1, time.Since(startedAt), "upstream_response_too_large")
+						return
+					}
+					// 客户端取消会中断响应体读取，但这不是上游故障：释放探活租约
+					// 并直接返回，冷却候选会让紧随其后的正常请求误判为全部不可用。
+					if q.Context().Err() != nil {
+						r.releaseProbe(u)
+						r.record(requestID, routeName, u, endpoint, 499, int(time.Since(start).Milliseconds()), false, attempt, Usage{Source: "unavailable"}, "client_canceled", meta)
+						r.logRequestFailed(requestID, endpoint, routeName, false, 499, attempt+1, time.Since(startedAt), "client_canceled")
+						return
+					}
 					r.fail(routeName, u, 30*time.Second)
 					r.record(requestID, routeName, u, endpoint, http.StatusGatewayTimeout, int(time.Since(start).Milliseconds()), false, attempt, Usage{Source: "unavailable"}, "attempt_timeout", meta)
 					attempt++
@@ -1161,7 +1182,7 @@ func successLogFields(requestID, route string, u Candidate, endpoint string, att
 		zap.String("usage_source", usage.Source),
 	)
 }
-func (r *Router) do(ctx context.Context, u Candidate, endpoint string, body []byte, payload map[string]any, incomingReq *http.Request) (*http.Response, error) {
+func (r *Router) do(ctx context.Context, u Candidate, endpoint string, body []byte, payload map[string]any, incomingReq *http.Request, credential string) (*http.Response, error) {
 	base := strings.TrimRight(u.BaseURL, "/")
 	// llama-server 的监听地址通常不带 /v1；保持其他 OpenAI 兼容上游的 base_url 语义不变。
 	if u.LlamaServer && !strings.HasSuffix(strings.ToLower(base), "/v1") {
@@ -1195,7 +1216,10 @@ func (r *Router) do(ctx context.Context, u Candidate, endpoint string, body []by
 		req.Header.Set("User-Agent", ua)
 	}
 	if u.Anthropic {
-		key := r.resolveCandidateAPIKey(ctx, u)
+		key := credential
+		if key == "" {
+			key = r.resolveCandidateAPIKey(ctx, u)
+		}
 		if key != "" {
 			// ZCode 网关要求 Bearer 与 x-api-key 并存；原生 Anthropic
 			// 忽略 Authorization，两个都发与两类上游兼容。
