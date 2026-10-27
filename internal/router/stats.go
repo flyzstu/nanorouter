@@ -109,6 +109,49 @@ var statsRanges = map[string]struct {
 	"30d": {10, "1d"},
 }
 
+type summaryCacheEntry struct {
+	at        time.Time
+	substrLen int
+	summary   StatsSummary
+}
+
+const statsSummaryCacheTTL = 10 * time.Second
+
+// SummaryCached 缓存同一范围与分桶的聚合结果：统计页每 10 秒轮询一次，
+// 页面多开或多人查看时不必重复执行整组聚合 SQL。
+func (s *Store) SummaryCached(ctx context.Context, rangeName string, since time.Time, bucketSubstrLen int) (StatsSummary, error) {
+	s.summaryMu.Lock()
+	if entry, ok := s.summaryCache[rangeName]; ok && entry.substrLen == bucketSubstrLen && time.Since(entry.at) < statsSummaryCacheTTL {
+		summary := entry.summary
+		s.summaryMu.Unlock()
+		return summary, nil
+	}
+	s.summaryMu.Unlock()
+
+	// 只让一个请求刷新，其余请求等它完成后复用结果。
+	s.summaryLoadMu.Lock()
+	defer s.summaryLoadMu.Unlock()
+	s.summaryMu.Lock()
+	if entry, ok := s.summaryCache[rangeName]; ok && entry.substrLen == bucketSubstrLen && time.Since(entry.at) < statsSummaryCacheTTL {
+		summary := entry.summary
+		s.summaryMu.Unlock()
+		return summary, nil
+	}
+	s.summaryMu.Unlock()
+
+	summary, err := s.Summary(ctx, since, bucketSubstrLen)
+	if err != nil {
+		return summary, err
+	}
+	s.summaryMu.Lock()
+	if s.summaryCache == nil {
+		s.summaryCache = map[string]summaryCacheEntry{}
+	}
+	s.summaryCache[rangeName] = summaryCacheEntry{at: time.Now(), substrLen: bucketSubstrLen, summary: summary}
+	s.summaryMu.Unlock()
+	return summary, nil
+}
+
 // Summary 聚合 since 之后的台账记录。bucketSubstrLen 见 statsRanges。
 func (s *Store) Summary(ctx context.Context, since time.Time, bucketSubstrLen int) (StatsSummary, error) {
 	summary := StatsSummary{Series: []StatsPoint{}, Models: []StatsModel{}, Failures: []StatsFailure{},
@@ -160,12 +203,16 @@ func (s *Store) Summary(ctx context.Context, since time.Time, bucketSubstrLen in
 	for rows.Next() {
 		var point StatsPoint
 		if err := rows.Scan(&point.Bucket, &point.Calls, &point.Failures); err != nil {
-			rows.Close()
+			closeRows(rows)
 			return summary, err
 		}
 		summary.Series = append(summary.Series, point)
 	}
-	rows.Close()
+	if err := rows.Err(); err != nil {
+		closeRows(rows)
+		return summary, err
+	}
+	closeRows(rows)
 
 	rows, err = s.db.QueryContext(ctx, s.rebind(
 		`SELECT route, upstream_model, COUNT(*), COALESCE(SUM(`+successExpr+`), 0),
@@ -182,13 +229,17 @@ func (s *Store) Summary(ctx context.Context, since time.Time, bucketSubstrLen in
 		// 统一落进 float64 再取整，避免按驱动差异各自处理。
 		var avgLatency float64
 		if err := rows.Scan(&m.Route, &m.UpstreamModel, &m.Calls, &m.Success, &m.TotalTokens, &avgLatency); err != nil {
-			rows.Close()
+			closeRows(rows)
 			return summary, err
 		}
 		m.AvgLatencyMS = int64(avgLatency + 0.5)
 		summary.Models = append(summary.Models, m)
 	}
-	rows.Close()
+	if err := rows.Err(); err != nil {
+		closeRows(rows)
+		return summary, err
+	}
+	closeRows(rows)
 
 	rows, err = s.db.QueryContext(ctx, s.rebind(
 		// 成功记录 kind 为空串；失败记录缺 kind 时（历史数据）退回状态码标签。
@@ -202,12 +253,16 @@ func (s *Store) Summary(ctx context.Context, since time.Time, bucketSubstrLen in
 	for rows.Next() {
 		var f StatsFailure
 		if err := rows.Scan(&f.Key, &f.Count); err != nil {
-			rows.Close()
+			closeRows(rows)
 			return summary, err
 		}
 		summary.Failures = append(summary.Failures, f)
 	}
-	rows.Close()
+	if err := rows.Err(); err != nil {
+		closeRows(rows)
+		return summary, err
+	}
+	closeRows(rows)
 
 	rows, err = s.db.QueryContext(ctx, s.rebind(
 		`SELECT upstream_id, COUNT(*), COALESCE(SUM(`+successExpr+`), 0),
@@ -222,13 +277,17 @@ func (s *Store) Summary(ctx context.Context, since time.Time, bucketSubstrLen in
 		var u StatsUpstream
 		var avgLatency float64
 		if err := rows.Scan(&u.UpstreamID, &u.Calls, &u.Success, &u.TotalTokens, &avgLatency); err != nil {
-			rows.Close()
+			closeRows(rows)
 			return summary, err
 		}
 		u.AvgLatencyMS = int64(avgLatency + 0.5)
 		summary.Upstreams = append(summary.Upstreams, u)
 	}
-	rows.Close()
+	if err := rows.Err(); err != nil {
+		closeRows(rows)
+		return summary, err
+	}
+	closeRows(rows)
 
 	rows, err = s.db.QueryContext(ctx, s.rebind(
 		// 旧数据 client_ip 为空串：归入"未知"而不是丢掉调用量。
@@ -243,12 +302,16 @@ func (s *Store) Summary(ctx context.Context, since time.Time, bucketSubstrLen in
 	for rows.Next() {
 		var c StatsClient
 		if err := rows.Scan(&c.ClientIP, &c.Calls, &c.Success, &c.TotalTokens, &c.LastSeen); err != nil {
-			rows.Close()
+			closeRows(rows)
 			return summary, err
 		}
 		summary.Clients = append(summary.Clients, c)
 	}
-	rows.Close()
+	if err := rows.Err(); err != nil {
+		closeRows(rows)
+		return summary, err
+	}
+	closeRows(rows)
 
 	rows, err = s.db.QueryContext(ctx, s.rebind(
 		`SELECT COALESCE(NULLIF(client_agent, ''), '(未知)'), COUNT(*), COALESCE(SUM(`+successExpr+`), 0)
@@ -261,12 +324,16 @@ func (s *Store) Summary(ctx context.Context, since time.Time, bucketSubstrLen in
 	for rows.Next() {
 		var a StatsAgent
 		if err := rows.Scan(&a.Agent, &a.Calls, &a.Success); err != nil {
-			rows.Close()
+			closeRows(rows)
 			return summary, err
 		}
 		summary.Agents = append(summary.Agents, a)
 	}
-	rows.Close()
+	if err := rows.Err(); err != nil {
+		closeRows(rows)
+		return summary, err
+	}
+	closeRows(rows)
 
 	// 工具榜没有跨方言的 JSON 展开函数（json_each vs jsonb_array_elements），
 	// 把范围内的工具名拉回 Go 侧聚合；范围上限 30 天、每行至多 2KB，量级可控。
@@ -280,7 +347,7 @@ func (s *Store) Summary(ctx context.Context, since time.Time, bucketSubstrLen in
 	for rows.Next() {
 		var encoded string
 		if err := rows.Scan(&encoded); err != nil {
-			rows.Close()
+			closeRows(rows)
 			return summary, err
 		}
 		var names []string
@@ -295,10 +362,11 @@ func (s *Store) Summary(ctx context.Context, since time.Time, bucketSubstrLen in
 			tally[name]++
 		}
 	}
-	rows.Close()
 	if err := rows.Err(); err != nil {
+		closeRows(rows)
 		return summary, err
 	}
+	closeRows(rows)
 	for name, count := range tally {
 		summary.Tools = append(summary.Tools, StatsTool{Name: name, Count: count})
 	}
@@ -325,7 +393,7 @@ func (r *Router) statsSummary(w http.ResponseWriter, q *http.Request) {
 		rangeName = "24h"
 		spec = statsRanges[rangeName]
 	}
-	summary, err := r.db.Summary(q.Context(), time.Now().Add(-statsRangeDuration(rangeName)), spec.SubstrLen)
+	summary, err := r.db.SummaryCached(q.Context(), rangeName, time.Now().Add(-statsRangeDuration(rangeName)), spec.SubstrLen)
 	if err != nil {
 		if r.logger != nil && r.logger.Core().Enabled(zap.WarnLevel) {
 			r.logger.Warn(r.logMessage("stats_query_failed"), zap.Error(err), zap.String("range", rangeName))

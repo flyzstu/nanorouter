@@ -460,6 +460,53 @@ func TestNewRequestMetaShapesAndLimits(t *testing.T) {
 	}
 }
 
+func TestMigrateCreatesStatsLatencyIndex(t *testing.T) {
+	db := mustOpenMemoryDB(t)
+	if err := Migrate(context.Background(), db); err != nil {
+		t.Fatal(err)
+	}
+	var name string
+	if err := db.QueryRow(`SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'llm_requests_created_at_latency'`).Scan(&name); err != nil {
+		t.Fatalf("composite index missing: %v", err)
+	}
+}
+
+func TestSummaryCachedHitsUntilExpiry(t *testing.T) {
+	store := statsTestStore(t)
+	ctx := context.Background()
+	since := time.Now().Add(-time.Hour)
+	first, err := store.SummaryCached(ctx, "1h", since, 16)
+	if err != nil {
+		t.Fatal(err)
+	}
+	insertStatsRecord(t, store, Record{
+		ID: "summary-cache", Route: "r", UpstreamID: "u", UpstreamModel: "m",
+		Endpoint: "chat_completions", Status: http.StatusOK, LatencyMS: 5,
+		Usage: Usage{Total: 1, Source: "upstream"}, CreatedAt: time.Now(),
+	})
+	cached, err := store.SummaryCached(ctx, "1h", since, 16)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cached.Totals.Requests != first.Totals.Requests {
+		t.Fatalf("expected cache hit, got requests=%d want=%d", cached.Totals.Requests, first.Totals.Requests)
+	}
+
+	store.summaryMu.Lock()
+	entry := store.summaryCache["1h"]
+	entry.at = time.Now().Add(-2 * statsSummaryCacheTTL)
+	store.summaryCache["1h"] = entry
+	store.summaryMu.Unlock()
+
+	refreshed, err := store.SummaryCached(ctx, "1h", since, 16)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if refreshed.Totals.Requests != first.Totals.Requests+1 {
+		t.Fatalf("expected refreshed requests=%d, got %d", first.Totals.Requests+1, refreshed.Totals.Requests)
+	}
+}
+
 func TestPostgresSummary(t *testing.T) {
 	dsn := os.Getenv("NANOROUTER_TEST_POSTGRES_DSN")
 	if dsn == "" {

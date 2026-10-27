@@ -21,7 +21,11 @@ func Migrate(ctx context.Context, db *sql.DB) error {
  prompt_tokens BIGINT, completion_tokens BIGINT, total_tokens BIGINT, usage_source TEXT NOT NULL, error_kind TEXT,
  tools_count INTEGER NOT NULL DEFAULT 0, client_ip TEXT NOT NULL DEFAULT '', client_agent TEXT NOT NULL DEFAULT '',
  tool_names TEXT NOT NULL DEFAULT ''
-);`, `CREATE INDEX IF NOT EXISTS llm_requests_created_at ON llm_requests(created_at);`}
+);`,
+		// 复合索引同时覆盖 created_at 范围过滤与 latency_ms 排序，
+		// 统计页的 p50/p95 不再需要额外排序；旧的单列索引随之冗余。
+		`CREATE INDEX IF NOT EXISTS llm_requests_created_at_latency ON llm_requests(created_at, latency_ms);`,
+		`DROP INDEX IF EXISTS llm_requests_created_at;`}
 	for _, statement := range statements {
 		if _, err := db.ExecContext(ctx, statement); err != nil {
 			return err
@@ -122,7 +126,14 @@ type Store struct {
 	dropped     atomic.Uint64
 	writeErrors atomic.Uint64
 	closed      atomic.Bool
+
+	summaryMu     sync.Mutex
+	summaryLoadMu sync.Mutex
+	summaryCache  map[string]summaryCacheEntry
 }
+
+// closeRows 忽略 Close 错误：迭代错误统一由 rows.Err() 上报。
+func closeRows(rows *sql.Rows) { _ = rows.Close() }
 
 func NewStore(db *sql.DB, driver string) *Store {
 	return NewStoreWithConfig(db, DatabaseConfig{Driver: driver})
