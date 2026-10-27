@@ -333,6 +333,30 @@ func TestZcodeResetUpstreamErrorsMapToStableStatus(t *testing.T) {
 	if res.StatusCode != http.StatusTooManyRequests || res.Header.Get("Retry-After") != "60" {
 		t.Fatalf("429 mapping status = %d retry-after = %q", res.StatusCode, res.Header.Get("Retry-After"))
 	}
+
+	// 3001（scope 不合法）映射 400，错误消息保留上游业务码。
+	stub.setStatus(http.StatusBadRequest, `{"code":3001,"msg":"invalid scope"}`)
+	r.zcodeResetShared().invalidate(ZcodeChannelBigmodel)
+	res, body = getZcodeResetStatus(t, r, "")
+	if res.StatusCode != http.StatusBadRequest {
+		t.Fatalf("3001 mapping = %d, body = %v", res.StatusCode, body)
+	}
+
+	// data 形状异常是协议错误，不能当成空余量。
+	stub.setStatus(http.StatusOK, `{"code":0,"data":"not-an-object"}`)
+	r.zcodeResetShared().invalidate(ZcodeChannelBigmodel)
+	res, body = getZcodeResetStatus(t, r, "")
+	if res.StatusCode != http.StatusBadGateway {
+		t.Fatalf("protocol error mapping = %d, body = %v", res.StatusCode, body)
+	}
+
+	// 上游明确回 used=false 时不能谎报核销成功。
+	stub.setUse(http.StatusOK, `{"code":0,"data":{"used":false}}`)
+	useRouter := newZcodeResetRouter(t, stub, true)
+	useRes, useBody := postZcodeResetUse(t, useRouter, `{"reset_type":"FIVE_HOUR"}`)
+	if useRes.StatusCode != http.StatusBadGateway {
+		t.Fatalf("used=false mapping = %d, body = %v", useRes.StatusCode, useBody)
+	}
 }
 
 func TestParseZcodeResetTokenDocumentShapes(t *testing.T) {
@@ -432,48 +456,152 @@ func TestZcodeResetCredentialFileChainAndAutoChannel(t *testing.T) {
 }
 
 func TestZcodeResetEndpointsAuthMatrix(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
-	resetZcodeTokenCache()
-	t.Cleanup(resetZcodeTokenCache)
-	t.Setenv("NANOROUTER_RESET_AUTH_TEST_KEY", "secret-key")
+	for _, tc := range []struct {
+		name         string
+		statsPublic  bool
+		resetPublic  bool
+		anonymous    int
+		withBasic    int
+		anonymousUse int
+	}{
+		// 未开启任何豁免：匿名被网关拦下，Basic 回退可过鉴权层。
+		{"default keeps reset behind auth", false, false, http.StatusUnauthorized, http.StatusServiceUnavailable, http.StatusUnauthorized},
+		// 关键边界：stats_public 只豁免统计面，不得顺带放开核销。
+		{"stats_public does not exempt reset", true, false, http.StatusUnauthorized, http.StatusServiceUnavailable, http.StatusUnauthorized},
+		// 独立开关：网关放行，交给反代；无凭据进入 handler 时回 503；
+		// 核销默认闸门回 403（未触碰上游）。
+		{"zcode_reset.public exempts reset surface", false, true, http.StatusServiceUnavailable, http.StatusServiceUnavailable, http.StatusForbidden},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("HOME", t.TempDir())
+			resetZcodeTokenCache()
+			t.Cleanup(resetZcodeTokenCache)
+			t.Setenv("NANOROUTER_RESET_AUTH_TEST_KEY", "secret-key")
 
-	r, err := New(Config{
-		AuthEnv:     "NANOROUTER_RESET_AUTH_TEST_KEY",
-		StatsPublic: true,
-		Routes: map[string]Route{"zcode": {Candidates: []Candidate{{
-			ID: "z", BaseURL: "http://127.0.0.1:1", Model: "glm-5.3", Anthropic: true,
-		}}}},
-	}, mustOpenMemoryDB(t))
+			r, err := New(Config{
+				AuthEnv:     "NANOROUTER_RESET_AUTH_TEST_KEY",
+				StatsPublic: tc.statsPublic,
+				ZcodeReset:  ZcodeResetConfig{Public: tc.resetPublic},
+				Routes: map[string]Route{"zcode": {Candidates: []Candidate{{
+					ID: "z", BaseURL: "http://127.0.0.1:1", Model: "glm-5.3", Anthropic: true,
+				}}}},
+			}, mustOpenMemoryDB(t))
+			if err != nil {
+				t.Fatal(err)
+			}
+			handler := r.Handler()
+
+			// 无凭据进入 handler 时回 503；401 只可能来自鉴权层。
+			req := httptest.NewRequest(http.MethodGet, "/v1/zcode/reset/status", nil)
+			rec := httptest.NewRecorder()
+			handler.ServeHTTP(rec, req)
+			if rec.Code != tc.anonymous {
+				t.Fatalf("anonymous reset status = %d, want %d", rec.Code, tc.anonymous)
+			}
+
+			req = httptest.NewRequest(http.MethodGet, "/v1/zcode/reset/status", nil)
+			req.SetBasicAuth("secret-key", "")
+			rec = httptest.NewRecorder()
+			handler.ServeHTTP(rec, req)
+			if rec.Code != tc.withBasic {
+				t.Fatalf("basic reset status = %d, want %d", rec.Code, tc.withBasic)
+			}
+
+			req = httptest.NewRequest(http.MethodPost, "/v1/zcode/reset/use", strings.NewReader(`{"reset_type":"FIVE_HOUR"}`))
+			req.Header.Set("Content-Type", "application/json")
+			rec = httptest.NewRecorder()
+			handler.ServeHTTP(rec, req)
+			if rec.Code != tc.anonymousUse {
+				t.Fatalf("anonymous reset use = %d, want %d", rec.Code, tc.anonymousUse)
+			}
+		})
+	}
+}
+
+func TestConfigZcodeResetOptions(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	document := "zcode_reset:\n  allow_use: true\n  public: true\nroutes:\n  r:\n    candidates:\n      - id: u\n        base_url: http://example.test\n        model: m\n"
+	if err := os.WriteFile(path, []byte(document), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	c, err := LoadConfig(path)
 	if err != nil {
 		t.Fatal(err)
 	}
+	if !c.ZcodeReset.AllowUse || !c.ZcodeReset.Public {
+		t.Fatalf("zcode_reset = %+v", c.ZcodeReset)
+	}
+}
+
+// TestZcodeResetPublicEndToEnd 走真实 Handler：验证 zcode_reset.public 时
+// 匿名请求能完成查询与核销，同时生成端点不被顺带放开。
+func TestZcodeResetPublicEndToEnd(t *testing.T) {
+	stub := newZcodeResetStub(t)
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("NANOROUTER_RESET_E2E_KEY", "secret-key")
+
+	store := statsTestStore(t)
+	credStore := newZcodeCredentialStore(store.db)
+	if err := credStore.save(context.Background(), ZcodeCredential{
+		Channel: ZcodeChannelBigmodel, APIKey: "db-test-key",
+		PlatformJWT: "db-zcode-jwt", OAuthToken: "db-maas-token",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	r, err := New(Config{
+		AuthEnv: "NANOROUTER_RESET_E2E_KEY",
+		ZcodeReset: ZcodeResetConfig{
+			AllowUse: true,
+			Public:   true,
+		},
+		Routes: map[string]Route{"zcode": {Candidates: []Candidate{{
+			ID: "z", BaseURL: stub.server.URL, Model: "glm-5.3", Anthropic: true,
+		}}}},
+	}, store.db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r.zcodeResetShared().baseURL = stub.server.URL
 	handler := r.Handler()
 
-	// stats_public 只豁免统计面；重置卡端点匿名仍 401（核销不可匿名触发）。
+	// 匿名查询：放行并真实取到上游数据。
 	req := httptest.NewRequest(http.MethodGet, "/v1/zcode/reset/status", nil)
 	rec := httptest.NewRecorder()
 	handler.ServeHTTP(rec, req)
-	if rec.Code != http.StatusUnauthorized {
-		t.Fatalf("anonymous reset status = %d, want 401", rec.Code)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("anonymous status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	var status zcodeResetStatusResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &status); err != nil {
+		t.Fatal(err)
+	}
+	if status.Channel != ZcodeChannelBigmodel || len(status.AvailableFiveHourResets) != 2 {
+		t.Fatalf("status = %+v", status)
+	}
+	if !status.UseEnabled {
+		t.Fatal("use_enabled should be true")
 	}
 
-	// 浏览器 Basic 回退可过鉴权层；无凭据时由 handler 回 503。
-	req = httptest.NewRequest(http.MethodGet, "/v1/zcode/reset/status", nil)
-	req.SetBasicAuth("secret-key", "")
-	rec = httptest.NewRecorder()
-	handler.ServeHTTP(rec, req)
-	if rec.Code != http.StatusServiceUnavailable {
-		t.Fatalf("basic reset status = %d, want 503 (auth passed)", rec.Code)
-	}
-
-	// 核销端点同样接受 Basic，但默认闸门回 403，且不会触碰上游。
-	req = httptest.NewRequest(http.MethodPost, "/v1/zcode/reset/use", strings.NewReader(`{"reset_type":"FIVE_HOUR"}`))
-	req.SetBasicAuth("secret-key", "")
+	// 匿名核销：放行并打到桩上游。
+	req = httptest.NewRequest(http.MethodPost, "/v1/zcode/reset/use",
+		strings.NewReader(`{"reset_type":"FIVE_HOUR","idempotency_key":"e2e-key"}`))
 	req.Header.Set("Content-Type", "application/json")
 	rec = httptest.NewRecorder()
 	handler.ServeHTTP(rec, req)
-	if rec.Code != http.StatusForbidden {
-		t.Fatalf("basic reset use = %d, want 403 (use disabled)", rec.Code)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("anonymous use = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	hits := stub.hits()
+	if len(hits) != 2 || hits[1].Path != zcodeResetBasePath+"/use" || !strings.Contains(hits[1].Body, "e2e-key") {
+		t.Fatalf("upstream hits = %+v", hits)
+	}
+
+	// 豁免只覆盖 reset：生成端点匿名仍然 401。
+	req = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"zcode"}`))
+	rec = httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("anonymous generation = %d, want 401", rec.Code)
 	}
 }
 

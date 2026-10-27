@@ -777,13 +777,22 @@ function zRenderReset(data) {
   }
   zKV("zresethistory", rows);
 }
+// 反代（Authelia/Traefik）在会话过期时可能把 fetch 跳到登录页并回 200 HTML。
+// 不能把这种响应当成“零张卡”，否则页面会误报暂无可用。
+async function zResetJSON(res) {
+  const type = (res.headers.get("content-type") || "").toLowerCase();
+  if (!type.includes("application/json")) {
+    throw new Error(res.redirected ? "登录状态已过期，请刷新页面重新登录" : "边缘代理返回了非 JSON 响应");
+  }
+  return res.json().catch(() => ({}));
+}
 async function zLoadReset() {
   const host = $("zresetrows");
   try {
     const res = await fetch("/v1/zcode/reset/status", { headers: { "Accept": "application/json" } });
-    const body = await res.json().catch(() => ({}));
+    const body = await zResetJSON(res);
     if (!res.ok) {
-      if (res.status === 401) throw new Error("需要登录（stats_public 不豁免重置卡查询）");
+      if (res.status === 401) throw new Error("需要登录或携带网关 Key");
       throw new Error((body.error && body.error.message) || ("HTTP " + res.status));
     }
     zRenderReset(body);
@@ -818,7 +827,7 @@ async function zUseReset(type, button) {
       headers: { "Content-Type": "application/json", "Accept": "application/json" },
       body: JSON.stringify({ reset_type: type, idempotency_key: key }),
     });
-    const body = await res.json().catch(() => ({}));
+    const body = await zResetJSON(res);
     if (!res.ok) {
       throw new Error((body.error && body.error.message) || ("HTTP " + res.status));
     }

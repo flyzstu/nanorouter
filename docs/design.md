@@ -266,9 +266,10 @@ jsonb_array_elements_text），拉回 Go 侧归并。调用方 IP 直连记 TCP 
 `/v1/zcode/reset/use`），生成端点不放宽。
 `/healthz` 恒免鉴权：只回 200、无业务数据，k8s 存活/就绪探针无头可带，
 `auth_env` 下若拦截探针会把自己杀死；`/metrics` 不豁免（含调用量）。
-`stats_public: true` 时这三个路径整体豁免鉴权——为反代层或内网已自管访问控制的
+`stats_public: true` 时统计面三个路径整体豁免鉴权——为反代层或内网已自管访问控制的
 部署准备；豁免面不含任何生成端点，`/v1/zcode/usage` 的账户级数据公开与匿名外呼
-是开启者显式接受的取舍。
+是开启者显式接受的取舍。重置卡面由独立开关 `zcode_reset.public` 控制，不随
+`stats_public` 一起放开：统计面公开不等于允许匿名花卡。
 
 ZCode 用量看板（`GET /v1/zcode/usage`，渲染在统计页下半区）是唯一主动外呼厂商
 biz 主机的辅助路径：网关按 glm-usage 移植的八个只读端点（四个用量监控：配额、
@@ -291,9 +292,12 @@ OAuth token>`）；两个 token 在 `login zcode` 时已随 key 一起落库/落
 按渠道 family 取，禁止跨渠道回退。status 30 秒缓存且失败同样缓存，避免页面轮询
 放大上游限流；use 每次真实上行，成功后立即失效 status 缓存。核销是破坏性操作：
 `zcode_reset.allow_use` 默认 false，只接受显式 POST（要求 JSON 请求体以阻断
-跨站表单），请求主链路（生成、故障切换、探活、登录）绝不自动调用；`stats_public`
-也不豁免这两个端点。上表“账户面只读”仅指 bigmodel.cn 的用量看板，不包含这条
-独立的核销路径。
+跨站表单），请求主链路（生成、故障切换、探活、登录）绝不自动调用。只有
+`zcode_reset.public: true` 时这两个端点才跳过网关鉴权，访问控制完全交给边缘层；
+部署时必须让 reset 路径强制经过反代鉴权（Traefik/Authelia），否则任何能直连
+网关端口的人都可匿名核销。它刻意不复用 `stats_public`，避免“统计页公开”顺带
+获得核销能力。上表“账户面只读”仅指 bigmodel.cn 的用量看板，不包含这条独立的
+核销路径。
 
 ## 用量与隐私
 

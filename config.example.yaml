@@ -30,6 +30,11 @@ auth_env: NANOROUTER_API_KEY
 # 无人值守服务，请确认实例只有可信调用方后再打开。请求主链路不会自动核销。
 zcode_reset:
   allow_use: false
+  # 让 reset 端点在网关层跳过 auth_env 鉴权，交给反代（如 Traefik + Authelia）。
+  # 与 stats_public 刻意分开：统计面公开不等于允许匿名花卡。开启时必须让反代
+  # 强制 /v1/zcode/reset 经过身份验证，且不能让「带认证头即绕过反代」的规则
+  # 覆盖它们，否则等于公开核销。默认 false。
+  # public: true
 request_timeout: 90s
 # 全局覆盖转发到上游的 User-Agent。默认 Go-http-client/x.x 会被部分上游
 # （如 Nous Research 的 Cloudflare WAF）拦截并返回 403；可设为常规客户端 UA，

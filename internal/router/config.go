@@ -75,6 +75,11 @@ type ProfilingConfig struct {
 // POST 就消耗用户的资产。需要时在配置里显式打开。
 type ZcodeResetConfig struct {
 	AllowUse bool `yaml:"allow_use"`
+	// Public 让两个 reset 端点在网关层跳过 auth_env 鉴权，交给反代（如
+	// Traefik + Authelia）承担访问控制。它与 stats_public 刻意分开：统计面
+	// 公开不等于允许匿名花卡。开启时必须让反代强制这些路径经过身份验证，
+	// 且不能让「携带认证头即绕过反代」的规则覆盖它们；否则等于公开核销。
+	Public bool `yaml:"public"`
 }
 
 // HealthCheckConfig 控制熔断后的后台异步探活机制。

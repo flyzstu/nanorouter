@@ -284,9 +284,13 @@ func (r *Router) auth(next http.Handler) http.Handler {
 	// 浏览器没有 Bearer 头的注入点；统计页与它的数据端点额外接受 Basic
 	// 凭据（用户名或密码位放 API key 均可），401 带 WWW-Authenticate 让
 	// 浏览器弹出原生登录框。生成端点不放宽，避免削弱网关认证面。
-	// statsAuthPaths 同时是 stats_public 的豁免名单；重置卡端点只允许 Basic
-	// 回退、不参与匿名豁免（核销是破坏性操作）。
+	// statsAuthPaths 同时是 stats_public 的豁免名单；重置卡端点不在此列——
+	// 统计面公开不等于允许匿名花卡，两者由独立开关控制。
 	statsAuthPaths := map[string]bool{"/stats": true, "/v1/stats/summary": true, "/v1/zcode/usage": true}
+	// resetAuthPaths 只由 zcode_reset.public 豁免。开启时访问控制完全交给
+	// 反代（如 Traefik + Authelia）；部署方必须强制这些路径经过边缘鉴权，
+	// 且不能让「携带认证头即绕过反代」的规则覆盖它们，否则等于公开核销。
+	resetAuthPaths := map[string]bool{"/v1/zcode/reset/status": true, "/v1/zcode/reset/use": true}
 	basicAuthPaths := map[string]bool{
 		"/stats":                 true,
 		"/v1/stats/summary":      true,
@@ -310,8 +314,12 @@ func (r *Router) auth(next http.Handler) http.Handler {
 			next.ServeHTTP(w, q)
 			return
 		}
-		// stats_public 豁免的只是统计面（内网/反代层自管访问控制的部署），
-		// 生成端点不在豁免名单，照常要求 key。
+		if r.cfg.ZcodeReset.Public && resetAuthPaths[q.URL.Path] {
+			next.ServeHTTP(w, q)
+			return
+		}
+		// stats_public / zcode_reset.public 豁免的只是面板与 reset 面（由反代
+		// 承担访问控制的部署），生成端点不在豁免名单，照常要求 key。
 		// 两种传参并存：OpenAI 系客户端惯用 Bearer，Anthropic 系惯用
 		// x-api-key——同一把 key 两种头都认，客户端不用为网关改认证方式。
 		authorized := false

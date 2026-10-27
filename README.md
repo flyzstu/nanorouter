@@ -406,6 +406,7 @@ Cookie、请求正文、prompt、模型回复或密钥。
 未认证访问会弹出原生登录框，用户名或密码任一位填 API key 即可。生成端点不接受 Basic 回退，认证面不放宽。
 内网或反代层已自管访问控制时，可设 `stats_public: true` 将统计面（页面与 `/v1/stats/summary`、`/v1/zcode/usage`
 两个数据端点）整体豁免鉴权、匿名可看——注意用量端点会匿名触发网关外呼智谱并暴露账户级数据，生成端点仍要求 key。
+重置卡端点不受 `stats_public` 影响，需要单独设置 `zcode_reset.public: true`（见下文）。
 `tools_count`/`tool_names`/`client_ip`/`client_agent` 四列来自请求侧元数据（旧库自动迁移补列）：工具名取请求
 `tools` 数组（兼容 OpenAI 与 Anthropic 两种形状），不含响应侧 tool_calls 次数；调用方 IP 直连部署记录 TCP 对端
 地址，前面有可信反代时开启 `trust_forwarded_for: true` 改取 `X-Forwarded-For` 首值。这些列不含 prompt 与回复内容。
@@ -443,7 +444,7 @@ curl -X POST "http://127.0.0.1:8080/v1/zcode/reset/use" \
 - `reset_type` 只能是 `FIVE_HOUR` 或 `WEEK`；`channel` 可选 `bigmodel` / `zai`，缺省自动选择持有完整凭据的渠道，显式指定时不跨渠道回退。
 - `idempotency_key` 可选但**建议调用方自带**：网络错误后重试必须复用同一个键，否则一次重试可能消耗两张卡。未提供时由网关生成并在响应中返回。
 - 核销成功后 status 缓存立即失效；请求主链路（生成、故障切换、探活、登录）不会自动核销。
-- 认证同统计页（Bearer、X-Api-Key 或浏览器 Basic 回退）。`stats_public` **不豁免**这两个端点；核销还要求 `Content-Type: application/json`，阻断跨站表单。
+- 认证同统计页（Bearer、X-Api-Key 或浏览器 Basic 回退）。设置 `zcode_reset.public: true` 时这两个端点跳过网关鉴权，交给反代（如 Traefik + Authelia）；必须强制这些路径经过边缘鉴权，防止伪造认证头绕过。`stats_public` **不会**顺带放开 reset。核销还要求 `Content-Type: application/json`，阻断跨站表单。
 
 ## 查看用量
 
