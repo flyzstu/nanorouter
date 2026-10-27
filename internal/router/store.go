@@ -135,10 +135,6 @@ type Store struct {
 // closeRows 忽略 Close 错误：迭代错误统一由 rows.Err() 上报。
 func closeRows(rows *sql.Rows) { _ = rows.Close() }
 
-func NewStore(db *sql.DB, driver string) *Store {
-	return NewStoreWithConfig(db, DatabaseConfig{Driver: driver})
-}
-
 func NewStoreWithConfig(db *sql.DB, cfg DatabaseConfig) *Store {
 	driver := cfg.Driver
 	store := &Store{db: db, now: time.Now, rebind: func(query string) string { return query }}

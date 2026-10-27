@@ -200,7 +200,7 @@ func TestProberRecoversCandidateAfterFailure(t *testing.T) {
 	if err != nil {
 		t.Fatalf("new router: %v", err)
 	}
-	defer r.Close(context.Background())
+	defer func() { _ = r.Close(context.Background()) }()
 
 	// 1. 发起第一次请求，上游返回 503，导致候选进入熔断
 	rec := httptest.NewRecorder()
@@ -293,7 +293,7 @@ func TestProberBackoffOnContinuedFailure(t *testing.T) {
 	if err != nil {
 		t.Fatalf("new router: %v", err)
 	}
-	defer r.Close(context.Background())
+	defer func() { _ = r.Close(context.Background()) }()
 
 	// 人工设置一次失败，并让 until 过期触发 probe
 	r.failUntil(Candidate{ID: "broken-model", Model: "broken-model"}, time.Now().Add(-1*time.Millisecond))
@@ -418,7 +418,7 @@ func TestProberExposeAsFastFailsWhileCoolingAndRecovers(t *testing.T) {
 	if err != nil {
 		t.Fatalf("new router: %v", err)
 	}
-	defer r.Close(context.Background())
+	defer func() { _ = r.Close(context.Background()) }()
 
 	// 1. 首次直连访问，上游返回 503
 	rec1 := httptest.NewRecorder()
@@ -531,7 +531,7 @@ func TestProberAggregatedFailoverSkipsCoolingCandidate(t *testing.T) {
 	if err != nil {
 		t.Fatalf("new router: %v", err)
 	}
-	defer r.Close(context.Background())
+	defer func() { _ = r.Close(context.Background()) }()
 
 	// 人工将 broken 候选设为冷却（failures=1）
 	r.failUntil(Candidate{ID: "broken-candidate", Model: "broken-candidate"}, time.Now().Add(10*time.Minute))
@@ -608,7 +608,7 @@ func TestProberSendsCandidateHeadersAndAuth(t *testing.T) {
 	if err != nil {
 		t.Fatalf("new router: %v", err)
 	}
-	defer r.Close(context.Background())
+	defer func() { _ = r.Close(context.Background()) }()
 
 	// 标记失败并触发探活
 	r.failUntil(Candidate{ID: "test-candidate", Model: "test-candidate"}, time.Now().Add(-1*time.Millisecond))

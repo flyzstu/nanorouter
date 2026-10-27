@@ -103,7 +103,7 @@ func (s *zcodeCredentialStore) query(ctx context.Context) (map[string]ZcodeCrede
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer closeRows(rows)
 	entries := map[string]ZcodeCredential{}
 	for rows.Next() {
 		var c ZcodeCredential

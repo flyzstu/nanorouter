@@ -61,7 +61,7 @@ func runServer(configPath string, debug bool) {
 	if err != nil {
 		panic(err)
 	}
-	defer logger.Sync()
+	defer func() { _ = logger.Sync() }()
 
 	message := func(english, chinese string) string {
 		if cfg.Logging.Language == "zh-CN" {

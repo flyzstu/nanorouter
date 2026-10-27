@@ -98,11 +98,11 @@ func zcodeLoginHeaders(pollToken string) map[string]string {
 }
 
 type zcodeDeviceCode struct {
-	flowID     string
-	pollToken  string
-	authURL    string
-	intervalMs time.Duration
-	expiresAt  time.Time
+	flowID       string
+	pollToken    string
+	authURL      string
+	pollInterval time.Duration
+	expiresAt    time.Time
 }
 
 // parseZcodeDeviceCode 解析 /oauth/cli/init 的回答；不可用返回错误。
@@ -144,11 +144,11 @@ func parseZcodeDeviceCode(body []byte, origin string) (zcodeDeviceCode, error) {
 		expiresAt = time.Unix(int64(data.ExpiresAt), 0)
 	}
 	return zcodeDeviceCode{
-		flowID:     data.FlowID,
-		pollToken:  data.PollToken,
-		authURL:    parsed.String(),
-		intervalMs: interval,
-		expiresAt:  expiresAt,
+		flowID:       data.FlowID,
+		pollToken:    data.PollToken,
+		authURL:      parsed.String(),
+		pollInterval: interval,
+		expiresAt:    expiresAt,
 	}, nil
 }
 
@@ -590,7 +590,7 @@ func RunZcodeLogin(ctx context.Context, opts ZcodeLoginOptions) (string, error) 
 	if device.expiresAt.Before(deadline) {
 		deadline = device.expiresAt
 	}
-	wait := device.intervalMs
+	wait := device.pollInterval
 	for {
 		if time.Now().After(deadline) {
 			return "", fmt.Errorf("no approval arrived before the authorization expired")
@@ -732,11 +732,11 @@ func storeZcodeToken(path, channel, key, jwt, oauthToken, user string, store *zc
 		return "", fmt.Errorf("write credential file failed: %w", err)
 	}
 	if err := os.Chmod(tmp, 0o600); err != nil {
-		os.Remove(tmp)
+		_ = os.Remove(tmp)
 		return "", fmt.Errorf("tighten credential file permissions failed: %w", err)
 	}
 	if err := os.Rename(tmp, path); err != nil {
-		os.Remove(tmp)
+		_ = os.Remove(tmp)
 		return "", fmt.Errorf("replace credential file failed: %w", err)
 	}
 	return path, nil

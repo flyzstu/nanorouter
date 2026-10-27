@@ -64,7 +64,7 @@ func TestLoggerUsesConfiguredLevel(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer logger.Sync()
+	defer func() { _ = logger.Sync() }()
 	if logger.Core().Enabled(zapcore.InfoLevel) {
 		t.Fatal("INFO should be disabled at WARN level")
 	}
@@ -78,7 +78,7 @@ func TestDebugFlagOverridesConfiguredLevel(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer logger.Sync()
+	defer func() { _ = logger.Sync() }()
 	if !logger.Core().Enabled(zapcore.DebugLevel) {
 		t.Fatal("debug flag should enable DEBUG logs")
 	}

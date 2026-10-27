@@ -104,10 +104,6 @@ type state struct {
 	lastProbeErr  string
 }
 
-func New(cfg Config, db *sql.DB) (*Router, error) {
-	return NewWithLogger(cfg, db, zap.NewNop())
-}
-
 // NewWithLogger 让命令入口注入生产日志器，而单元测试保持安静。
 func NewWithLogger(cfg Config, db *sql.DB, logger *zap.Logger) (*Router, error) {
 	if cfg.RequestTimeout == 0 {

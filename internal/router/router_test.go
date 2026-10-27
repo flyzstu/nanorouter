@@ -242,10 +242,12 @@ func TestPostgresStore(t *testing.T) {
 	}
 	id := "postgres-store-" + time.Now().UTC().Format("20060102150405.000000000")
 	t.Cleanup(func() { _, _ = db.Exec(`DELETE FROM llm_requests WHERE id = $1`, id) })
-	NewStore(db, "postgres").Insert(context.Background(), Record{
+	if err := NewStore(db, "postgres").Insert(context.Background(), Record{
 		ID: id, Route: "test", UpstreamID: "postgres", UpstreamModel: "test-model", Endpoint: "chat_completions",
 		Status: http.StatusOK, LatencyMS: 1, Attempt: 0, Usage: Usage{Prompt: 2, Completion: 3, Total: 5, Source: "upstream"},
-	})
+	}); err != nil {
+		t.Fatal(err)
+	}
 	var total int64
 	if err := db.QueryRow(`SELECT total_tokens FROM llm_requests WHERE id = $1`, id).Scan(&total); err != nil || total != 5 {
 		t.Fatalf("total=%d err=%v", total, err)
