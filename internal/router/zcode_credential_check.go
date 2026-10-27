@@ -54,7 +54,7 @@ func (r *Router) startZcodeCredentialCheck() {
 			r.logger.Info(r.logMessage("zcode_credential_verified"),
 				eventFields("zcode_credential_verified",
 					zap.String("channel", channel),
-					zap.String("last_verified", credential.LastVerified.Format(time.RFC3339)))...)
+					zap.String("credential_updated_at", credential.LastVerified.Format(time.RFC3339)))...)
 		}
 	}()
 }

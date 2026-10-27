@@ -8,7 +8,7 @@ package router
 // 也是唯一能让「登录一次、长期复用」成立的位置。
 //
 // 有效期不落库：智谱的设备码流程不回传 key 的有效期（见 storeZcodeToken 的
-// 说明），任何本地过期时间都是猜测。last_verified 只记录「上次探测通过的时刻」
+// 说明），任何本地过期时间都是猜测。last_verified 只记录上次登录写入的时刻
 // 供观测，失效判定一律靠探测。
 
 import (
@@ -170,17 +170,6 @@ func (s *zcodeCredentialStore) save(ctx context.Context, c ZcodeCredential) erro
 			return nil
 		}
 		return fmt.Errorf("insert zcode credential failed: %w", err)
-	}
-	s.invalidate()
-	return nil
-}
-
-// touch 只刷新 last_verified，用于「探测通过但没有换新key」的场景。
-func (s *zcodeCredentialStore) touch(ctx context.Context, channel string) error {
-	if _, err := s.db.ExecContext(ctx,
-		`UPDATE zcode_credentials SET last_verified=$1 WHERE channel=$2`,
-		time.Now().UTC().Format(time.RFC3339Nano), channel); err != nil {
-		return fmt.Errorf("touch zcode credential failed: %w", err)
 	}
 	s.invalidate()
 	return nil
