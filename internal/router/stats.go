@@ -370,7 +370,13 @@ func (s *Store) Summary(ctx context.Context, since time.Time, bucketSubstrLen in
 	for name, count := range tally {
 		summary.Tools = append(summary.Tools, StatsTool{Name: name, Count: count})
 	}
-	sort.Slice(summary.Tools, func(i, j int) bool { return summary.Tools[i].Count > summary.Tools[j].Count })
+	sort.Slice(summary.Tools, func(i, j int) bool {
+		if summary.Tools[i].Count != summary.Tools[j].Count {
+			return summary.Tools[i].Count > summary.Tools[j].Count
+		}
+		// 同票数按名称排序：map 遍历顺序不稳定，否则接口输出和测试会抖动。
+		return summary.Tools[i].Name < summary.Tools[j].Name
+	})
 	if len(summary.Tools) > 15 {
 		summary.Tools = summary.Tools[:15]
 	}
