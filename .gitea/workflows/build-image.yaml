@@ -4,6 +4,8 @@ on:
   push:
     branches:
       - main
+    tags:
+      - '*'
   pull_request:
   workflow_dispatch:
 
@@ -50,7 +52,9 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Build image
-        run: docker build --pull --build-arg VERSION="${{ gitea.ref_name }}" --tag "$IMAGE:$IMAGE_TAG" .
+        env:
+          VERSION: ${{ gitea.ref_name }}
+        run: docker build --pull --build-arg VERSION="$VERSION" --tag "$IMAGE:$IMAGE_TAG" .
 
       - name: Log in to Gitea container registry
         if: gitea.event_name == 'push' || gitea.event_name == 'workflow_dispatch'
@@ -61,7 +65,21 @@ jobs:
 
       - name: Push image tags
         if: gitea.event_name == 'push' || gitea.event_name == 'workflow_dispatch'
+        env:
+          REF: ${{ gitea.ref }}
+          REF_NAME: ${{ gitea.ref_name }}
         run: |
-          docker tag "$IMAGE:$IMAGE_TAG" "$IMAGE:latest"
+          # 始终推 commit sha，便于回溯。
           docker push "$IMAGE:$IMAGE_TAG"
-          docker push "$IMAGE:latest"
+          if [[ "$REF" == refs/tags/* ]]; then
+            # tag 构建：推指定版本号，并把 latest 指向最新正式版本。
+            TAG="${REF_NAME//\//-}"
+            docker tag "$IMAGE:$IMAGE_TAG" "$IMAGE:$TAG"
+            docker tag "$IMAGE:$IMAGE_TAG" "$IMAGE:latest"
+            docker push "$IMAGE:$TAG"
+            docker push "$IMAGE:latest"
+          elif [[ "$REF" == refs/heads/main ]]; then
+            # main 构建：推 main 作为滚动开发镜像，不动 latest。
+            docker tag "$IMAGE:$IMAGE_TAG" "$IMAGE:main"
+            docker push "$IMAGE:main"
+          fi
