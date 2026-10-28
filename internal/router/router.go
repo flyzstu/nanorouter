@@ -82,6 +82,8 @@ type Router struct {
 	// zcodeCredentials 是凭据的数据库存储。登录完成后写库、后续请求读库，
 	// 不再依赖只读的文件或 Secret 挂载。测试里可为 nil（退回文件源）。
 	zcodeCredentials *zcodeCredentialStore
+	// apiKeys 是页面创建的 API Key 存储与认证缓存。
+	apiKeys *apiKeyStore
 	// zcodeUsage 是 ZCode 用量查询的进程内缓存，懒初始化（见 zcode_usage.go），
 	// 让测试可以直接构造 Router{}。
 	zcodeUsage     *zcodeUsageCache
@@ -130,7 +132,7 @@ func NewWithLogger(cfg Config, db *sql.DB, logger *zap.Logger) (*Router, error) 
 	if logger == nil {
 		logger = zap.NewNop()
 	}
-	r := &Router{cfg: cfg, db: NewStoreWithConfig(db, cfg.Database), client: newUpstreamHTTPClient(), userAgent: cfg.UserAgent, states: map[string]*state{}, limiters: map[string]*candidateLimiter{}, admission: newAdmissionController(cfg.Backpressure), retryBudgets: map[string]*retryBudget{}, next: map[string]int{}, registry: prometheus.NewRegistry(), logger: logger, retryWait: waitForRetry, candidates: map[string]Candidate{}, zcodeCredentials: newZcodeCredentialStore(db)}
+	r := &Router{cfg: cfg, db: NewStoreWithConfig(db, cfg.Database), client: newUpstreamHTTPClient(), userAgent: cfg.UserAgent, states: map[string]*state{}, limiters: map[string]*candidateLimiter{}, admission: newAdmissionController(cfg.Backpressure), retryBudgets: map[string]*retryBudget{}, next: map[string]int{}, registry: prometheus.NewRegistry(), logger: logger, retryWait: waitForRetry, candidates: map[string]Candidate{}, zcodeCredentials: newZcodeCredentialStore(db), apiKeys: newAPIKeyStore(db)}
 	r.retryBackoff = func(retry int) time.Duration {
 		return jitteredExponentialBackoff(retry, cfg.Retry.BaseDelay, cfg.Retry.MaxDelay)
 	}
@@ -234,6 +236,13 @@ func (r *Router) Handler() http.Handler {
 	mux.Get("/v1/zcode/reset/status", r.zcodeResetStatusHandler)
 	mux.Post("/v1/zcode/reset/use", r.zcodeResetUseHandler)
 
+	// API Key 管理：列表/创建/吊销。启用 api_keys.enabled 后，业务 Key
+	// 只放行生成端点；管理端点只认根 auth_env Key 或 manage_public 的
+	// 反代 SSO。
+	mux.Get("/v1/api-keys", r.listAPIKeys)
+	mux.Post("/v1/api-keys", r.createAPIKey)
+	mux.Delete("/v1/api-keys/{id}", r.revokeAPIKey)
+
 	// zhipu-aicoding 专属端点路径：允许将客户端 Base URL 直接配置为 /zhipu-aicoding 或 /zhipuaicoding
 	mountZhipu := func(sub chi.Router) {
 		sub.Get("/models", r.models)
@@ -275,14 +284,58 @@ func (r *Router) Close(ctx context.Context) error {
 	}
 	return r.db.Close(ctx)
 }
+
+type authRole int
+
+const (
+	authRoleNone authRole = iota
+	authRoleRoot
+	authRoleManaged
+)
+
+type authRoleContextKey struct{}
+
+func authRoleFromContext(ctx context.Context) authRole {
+	role, _ := ctx.Value(authRoleContextKey{}).(authRole)
+	return role
+}
+
+// isAPIKeyAdminPath 匹配 API Key 管理端点（列表/创建/吊销）。
+func isAPIKeyAdminPath(path string) bool {
+	return path == "/v1/api-keys" || strings.HasPrefix(path, "/v1/api-keys/")
+}
+
+// isGenerationPath 是业务 Key 的唯一放行面。models 是客户端常用的只读
+// 发现端点，和生成端点一起放行；统计、用量、重置卡、管理端点都在拒绝面。
+func isGenerationPath(path string) bool {
+	switch path {
+	case "/v1/chat/completions", "/chat/completions",
+		"/v1/responses", "/responses",
+		"/v1/messages", "/messages",
+		"/v1/models", "/models":
+		return true
+	}
+	return strings.HasPrefix(path, "/zhipu-aicoding/") || strings.HasPrefix(path, "/zhipuaicoding/")
+}
+
+// isBasicAuthPath 是浏览器可以走 Basic 回退的路径。生成端点不接受 Basic，
+// 保持原有认证面。
+func isBasicAuthPath(path string) bool {
+	switch path {
+	case "/stats", "/v1/stats/summary", "/v1/zcode/usage",
+		"/v1/zcode/reset/status", "/v1/zcode/reset/use":
+		return true
+	}
+	return isAPIKeyAdminPath(path)
+}
+
 func (r *Router) auth(next http.Handler) http.Handler {
-	expected := os.Getenv(r.cfg.AuthEnv)
-	if expected == "" {
+	envKey := os.Getenv(r.cfg.AuthEnv)
+	// 既没有根 Key 也没有启用业务 Key：保持旧行为（完全开放）。启用
+	// api_keys.enabled 后即使没有 auth_env，也必须检查数据库里的业务 Key。
+	if envKey == "" && !r.cfg.APIKeys.Enabled {
 		return next
 	}
-	// 浏览器没有 Bearer 头的注入点；统计页与它的数据端点额外接受 Basic
-	// 凭据（用户名或密码位放 API key 均可），401 带 WWW-Authenticate 让
-	// 浏览器弹出原生登录框。生成端点不放宽，避免削弱网关认证面。
 	// statsAuthPaths 同时是 stats_public 的豁免名单；重置卡端点不在此列——
 	// 统计面公开不等于允许匿名花卡，两者由独立开关控制。
 	statsAuthPaths := map[string]bool{"/stats": true, "/v1/stats/summary": true, "/v1/zcode/usage": true}
@@ -290,64 +343,109 @@ func (r *Router) auth(next http.Handler) http.Handler {
 	// 反代（如 Traefik + Authelia）；部署方必须强制这些路径经过边缘鉴权，
 	// 且不能让「携带认证头即绕过反代」的规则覆盖它们，否则等于公开核销。
 	resetAuthPaths := map[string]bool{"/v1/zcode/reset/status": true, "/v1/zcode/reset/use": true}
-	basicAuthPaths := map[string]bool{
-		"/stats":                 true,
-		"/v1/stats/summary":      true,
-		"/v1/zcode/usage":        true,
-		"/v1/zcode/reset/status": true,
-		"/v1/zcode/reset/use":    true,
-	}
 	// keyMatches 常量时间比较：逐字节短路的不等比较存在计时侧信道，
 	// 网关又是长期暴露的服务，不值得省这个包。
 	keyMatches := func(presented string) bool {
-		return subtle.ConstantTimeCompare([]byte(presented), []byte(expected)) == 1
+		if envKey == "" {
+			return false
+		}
+		return subtle.ConstantTimeCompare([]byte(presented), []byte(envKey)) == 1
+	}
+	authenticate := func(ctx context.Context, presented string) (authRole, bool) {
+		presented = strings.TrimSpace(presented)
+		if presented == "" {
+			return authRoleNone, false
+		}
+		if keyMatches(presented) {
+			return authRoleRoot, true
+		}
+		if r.cfg.APIKeys.Enabled && r.apiKeys != nil {
+			ok, err := r.apiKeys.authenticate(ctx, presented)
+			if err != nil {
+				r.logger.Warn(r.logMessage("api_key_auth_failed"),
+					eventFields("api_key_auth_failed", zap.String("reason", err.Error()))...)
+				return authRoleNone, false
+			}
+			if ok {
+				return authRoleManaged, true
+			}
+		}
+		return authRoleNone, false
 	}
 	return http.HandlerFunc(func(w http.ResponseWriter, q *http.Request) {
 		// /healthz 恒为免鉴权：只回 200 无业务数据，k8s 存活/就绪探针无头可带，
 		// auth_env 一配探针即 401 把自己杀死。/metrics 不豁免（含调用量）。
-		if q.URL.Path == "/healthz" {
+		path := q.URL.Path
+		if path == "/healthz" {
 			next.ServeHTTP(w, q)
 			return
 		}
-		if r.cfg.StatsPublic && statsAuthPaths[q.URL.Path] {
+		if r.cfg.StatsPublic && statsAuthPaths[path] {
 			next.ServeHTTP(w, q)
 			return
 		}
-		if r.cfg.ZcodeReset.Public && resetAuthPaths[q.URL.Path] {
+		if r.cfg.ZcodeReset.Public && resetAuthPaths[path] {
 			next.ServeHTTP(w, q)
 			return
 		}
-		// stats_public / zcode_reset.public 豁免的只是面板与 reset 面（由反代
-		// 承担访问控制的部署），生成端点不在豁免名单，照常要求 key。
+		// 管理端点只由 manage_public 豁免；业务 Key 不能管理 Key。
+		if r.cfg.APIKeys.Enabled && r.cfg.APIKeys.ManagePublic && isAPIKeyAdminPath(path) {
+			next.ServeHTTP(w, q)
+			return
+		}
+		// 启用业务 Key 但没有根 Key、也没有 manage_public 时，管理端点
+		// 没有任何可用的管理员凭据；直接给出配置级错误，而不是让浏览器
+		// 反复收到 401。
+		if isAPIKeyAdminPath(path) && r.cfg.APIKeys.Enabled && !r.cfg.APIKeys.ManagePublic && envKey == "" {
+			writeJSONError(w, http.StatusServiceUnavailable,
+				"管理 API Key 需要配置 auth_env，或设置 api_keys.manage_public 由反代鉴权",
+				"api_keys_admin_unavailable")
+			return
+		}
 		// 两种传参并存：OpenAI 系客户端惯用 Bearer，Anthropic 系惯用
 		// x-api-key——同一把 key 两种头都认，客户端不用为网关改认证方式。
+		var role authRole
 		authorized := false
 		if authHeader := q.Header.Get("Authorization"); strings.HasPrefix(authHeader, "Bearer ") {
-			authorized = keyMatches(strings.TrimPrefix(authHeader, "Bearer "))
+			role, authorized = authenticate(q.Context(), strings.TrimPrefix(authHeader, "Bearer "))
 		}
 		if !authorized {
-			authorized = keyMatches(q.Header.Get("X-Api-Key"))
+			role, authorized = authenticate(q.Context(), q.Header.Get("X-Api-Key"))
 		}
-		if !authorized {
-			if basicAuthPaths[q.URL.Path] {
-				// key 填在密码位或用户名位（浏览器登录框首格）都接受。
-				if user, pass, ok := q.BasicAuth(); ok && (pass == expected || user == expected) {
-					next.ServeHTTP(w, q)
-					return
+		if !authorized && isBasicAuthPath(path) {
+			// key 填在密码位或用户名位（浏览器登录框首格）都接受。
+			if user, pass, ok := q.BasicAuth(); ok {
+				if role, authorized = authenticate(q.Context(), pass); !authorized {
+					role, authorized = authenticate(q.Context(), user)
 				}
+			}
+		}
+		if !authorized {
+			if isBasicAuthPath(path) {
 				w.Header().Set("WWW-Authenticate", `Basic realm="nanorouter", charset="UTF-8"`)
 				http.Error(w, "unauthorized", http.StatusUnauthorized)
 				return
 			}
 			// 按请求路径选错误方言：Messages 端点的客户端期望 Anthropic 信封。
-			if strings.HasSuffix(q.URL.Path, "/messages") {
+			if strings.HasSuffix(path, "/messages") {
 				writeAnthropicAPIError(w, 401, "unauthorized", "authentication_error")
 			} else {
 				http.Error(w, `{"error":{"message":"unauthorized"}}`, http.StatusUnauthorized)
 			}
 			return
 		}
-		next.ServeHTTP(w, q)
+		// 管理端点先判：业务 Key 管理 Key 给出明确的管理错误码，而不是
+		// 泛化的 scope 错误。
+		if isAPIKeyAdminPath(path) && role != authRoleRoot {
+			writeJSONError(w, http.StatusForbidden, "只有根 auth_env Key 可以管理 API Key", "api_keys_admin_required")
+			return
+		}
+		// 业务 Key 只放行生成面；统计/用量/重置卡/metrics 一律 403。
+		if role == authRoleManaged && !isGenerationPath(path) {
+			writeJSONError(w, http.StatusForbidden, "该 API Key 仅允许调用生成端点", "api_key_scope_forbidden")
+			return
+		}
+		next.ServeHTTP(w, q.WithContext(context.WithValue(q.Context(), authRoleContextKey{}, role)))
 	})
 }
 

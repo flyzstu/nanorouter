@@ -165,6 +165,24 @@
   .zresetbtn:hover:not(:disabled) { border-color: var(--accent-1); color: #fff; background: linear-gradient(135deg, var(--accent-1), var(--accent-2)); }
   .zresetbtn:disabled { opacity: .45; cursor: not-allowed; }
   .zresetbtn:focus-visible { outline: 2px solid var(--accent-1); outline-offset: 2px; }
+  .zresetbtn.danger { color: var(--bad); border-color: rgba(251,113,133,.4); }
+  .zresetbtn.danger:hover:not(:disabled) { background: linear-gradient(135deg, #FB7185, #F43F5E); border-color: var(--bad); color: #fff; }
+  .apikey-toolbar { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 12px; }
+  .apikey-input {
+    flex: 1; min-width: 200px; padding: 7px 10px; border-radius: 8px;
+    border: 1px solid var(--border-strong); background: var(--card); color: var(--fg);
+    font: 13px var(--sans);
+  }
+  .apikey-input:focus { outline: 2px solid var(--accent-1); outline-offset: 1px; }
+  #apikey-reveal-value { font-family: var(--mono); font-size: 12.5px; }
+  .apikey-dialog {
+    width: min(560px, calc(100vw - 2rem)); padding: 18px; border-radius: 14px;
+    border: 1px solid var(--border-strong); background: var(--card-solid); color: var(--fg);
+  }
+  .apikey-dialog::backdrop { background: rgba(0, 0, 0, .55); }
+  .apikey-dialog h3 { margin: 0 0 8px; font-size: 15px; }
+  .apikey-warning { margin: 0 0 10px; color: var(--bad); font-size: 12.5px; }
+  .apikey-dialog-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 12px; }
   footer { color: var(--muted); font-size: 12px; margin-top: 14px; }
   footer .legal { display: flex; flex-wrap: wrap; gap: 6px 12px; justify-content: center; align-items: center; margin-top: 10px; }
   footer .legal a { color: inherit; text-decoration: none; }
@@ -298,8 +316,31 @@
   </div>
 </div>
 
+<div class="zdiv"><span>API Keys</span><span class="pill" id="apikeys-mode"></span></div>
+<section class="card">
+  <h2>API Keys <span class="pill" id="apikeys-state"></span></h2>
+  <div class="apikey-toolbar">
+    <input id="apikey-name" class="apikey-input" maxlength="64" placeholder="名称，例如 laptop / ci" autocomplete="off">
+    <button type="button" class="zresetbtn" id="apikey-create-btn">创建 API Key</button>
+  </div>
+  <table id="apikeys-table">
+    <thead><tr><th>名称</th><th>Key 前缀</th><th>创建时间</th><th>状态</th><th class="num">操作</th></tr></thead>
+    <tbody></tbody>
+  </table>
+  <div class="zaxis" id="apikeys-hint"></div>
+</section>
+<dialog id="apikey-reveal" class="apikey-dialog">
+  <h3>API Key 已创建</h3>
+  <p class="apikey-warning">只显示这一次。关闭后无法再次查看，请立即复制保存。</p>
+  <input id="apikey-reveal-value" class="apikey-input" readonly autocomplete="off" spellcheck="false">
+  <div class="apikey-dialog-actions">
+    <button type="button" class="zresetbtn" id="apikey-copy-btn">复制</button>
+    <button type="button" class="zresetbtn" id="apikey-close-btn">关闭</button>
+  </div>
+</dialog>
+
 <footer>
-  <div>数据来自 llm_requests 台账（请求侧元数据，不含对话内容）。usage_source=unavailable 的请求 token 计为零；client_ip / client_agent / 工具名为调用方元数据，直连部署记录 TCP 对端地址，开启 trust_forwarded_for 后取 X-Forwarded-For 首值。ZCode 用量来自智谱 bigmodel.cn 监控端点，凭据复用网关登录链，配额缓存 60s、历史区块 5 分钟、套餐与账户区块 1 小时；账户面只读。额度重置卡查询走 ZCode 平台 reset 端点（30s 缓存），核销默认关闭且只能由本页显式确认触发。</div>
+  <div>数据来自 llm_requests 台账（请求侧元数据，不含对话内容）。usage_source=unavailable 的请求 token 计为零；client_ip / client_agent / 工具名为调用方元数据，直连部署记录 TCP 对端地址，开启 trust_forwarded_for 后取 X-Forwarded-For 首值。ZCode 用量来自智谱 bigmodel.cn 监控端点，凭据复用网关登录链，配额缓存 60s、历史区块 5 分钟、套餐与账户区块 1 小时；账户面只读。额度重置卡查询走 ZCode 平台 reset 端点（30s 缓存），核销默认关闭且只能由本页显式确认触发。API Key 只保存 SHA-256 哈希，完整 Key 仅创建时显示一次；业务 Key 只允许生成端点。</div>
   <div class="legal">
     <a href="https://beian.miit.gov.cn/" target="_blank" rel="noopener noreferrer">浙ICP备2026085501号-1</a>
     <span>版权所有 © 2026 飞哥的个人随想</span>
@@ -840,6 +881,162 @@ async function zUseReset(type, button) {
     await zLoadReset();
   }
 }
+function zAPIKeyHint(message, bad) {
+  const hint = $("apikeys-hint");
+  hint.textContent = message || "";
+  hint.style.color = bad ? "var(--bad)" : "";
+}
+function zAPIKeyDate(value) {
+  if (!value) return "–";
+  const date = new Date(value);
+  return isNaN(date.getTime()) ? value : date.toLocaleString("zh-CN", { hour12: false });
+}
+function zRenderAPIKeys(data) {
+  const body = $("apikeys-table").querySelector("tbody");
+  body.textContent = "";
+  const keys = Array.isArray(data.keys) ? data.keys : [];
+  $("apikeys-mode").textContent = data.manage_public ? "SSO 管理" : "根 Key 管理";
+  $("apikeys-state").textContent = keys.length ? keys.length + " 个" : "";
+  if (!keys.length) {
+    body.innerHTML = '<tr><td colspan="5" class="empty">暂无 API Key</td></tr>';
+  } else {
+    for (const key of keys) {
+      const tr = document.createElement("tr");
+      const name = document.createElement("td");
+      name.textContent = key.name || "–";
+      const prefix = document.createElement("td");
+      const code = document.createElement("code");
+      code.textContent = key.prefix || "–";
+      prefix.append(code);
+      const created = document.createElement("td");
+      created.textContent = zAPIKeyDate(key.created_at);
+      const status = document.createElement("td");
+      const pill = document.createElement("span");
+      const active = key.status === "active";
+      pill.className = "pill " + (active ? "ok" : "bad");
+      pill.textContent = active ? "有效" : "已吊销";
+      status.append(pill);
+      const action = document.createElement("td");
+      action.className = "num";
+      if (active) {
+        const button = document.createElement("button");
+        button.type = "button";
+        button.className = "zresetbtn danger";
+        button.textContent = "吊销";
+        button.addEventListener("click", () => zRevokeAPIKey(key.id, key.name || ""));
+        action.append(button);
+      } else {
+        action.textContent = "–";
+      }
+      tr.append(name, prefix, created, status, action);
+      body.append(tr);
+    }
+  }
+  zAPIKeyHint(data.manage_public
+    ? "管理已交由反代/Authelia；业务 Key 只允许生成端点"
+    : "管理需要根 auth_env Key；业务 Key 只允许生成端点", false);
+}
+async function zLoadAPIKeys() {
+  try {
+    const res = await fetch("/v1/api-keys", { headers: { "Accept": "application/json" } });
+    const body = await zResetJSON(res);
+    if (!res.ok) {
+      if (res.status === 401) throw new Error("需要登录或根 auth_env Key");
+      throw new Error((body.error && body.error.message) || ("HTTP " + res.status));
+    }
+    zRenderAPIKeys(body);
+  } catch (err) {
+    const body = $("apikeys-table").querySelector("tbody");
+    body.innerHTML = '<tr><td colspan="5" class="empty">–</td></tr>';
+    $("apikeys-mode").textContent = "";
+    $("apikeys-state").textContent = "";
+    zAPIKeyHint("API Key 读取失败：" + err.message, true);
+  }
+}
+async function zCreateAPIKey() {
+  const input = $("apikey-name");
+  const name = input.value.trim();
+  if (!name) {
+    zAPIKeyHint("请输入 API Key 名称", true);
+    input.focus();
+    return;
+  }
+  const button = $("apikey-create-btn");
+  button.disabled = true;
+  button.textContent = "创建中…";
+  try {
+    const res = await fetch("/v1/api-keys", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "Accept": "application/json" },
+      body: JSON.stringify({ name: name }),
+    });
+    const body = await zResetJSON(res);
+    if (!res.ok) {
+      if (res.status === 401) throw new Error("需要登录或根 auth_env Key");
+      throw new Error((body.error && body.error.message) || ("HTTP " + res.status));
+    }
+    input.value = "";
+    zShowAPIKeyDialog(body.key);
+    await zLoadAPIKeys();
+  } catch (err) {
+    zAPIKeyHint("创建失败：" + err.message, true);
+  } finally {
+    button.disabled = false;
+    button.textContent = "创建 API Key";
+  }
+}
+async function zRevokeAPIKey(id, name) {
+  if (!window.confirm("吊销 API Key「" + name + "」？使用它的客户端会立即失去访问。")) return;
+  try {
+    const res = await fetch("/v1/api-keys/" + encodeURIComponent(id), {
+      method: "DELETE",
+      headers: { "Accept": "application/json" },
+    });
+    const body = await zResetJSON(res);
+    if (!res.ok) {
+      if (res.status === 401) throw new Error("需要登录或根 auth_env Key");
+      throw new Error((body.error && body.error.message) || ("HTTP " + res.status));
+    }
+    await zLoadAPIKeys();
+    zAPIKeyHint(body.already_revoked ? "该 Key 已经是吊销状态" : "已吊销", false);
+  } catch (err) {
+    zAPIKeyHint("吊销失败：" + err.message, true);
+  }
+}
+function zShowAPIKeyDialog(key) {
+  const dialog = $("apikey-reveal");
+  $("apikey-reveal-value").value = key;
+  if (dialog && typeof dialog.showModal === "function") {
+    dialog.showModal();
+  } else {
+    window.prompt("API Key（只显示一次，请立即保存）", key);
+  }
+}
+function zCloseAPIKeyDialog() {
+  const dialog = $("apikey-reveal");
+  if (dialog && dialog.open) dialog.close();
+  $("apikey-reveal-value").value = "";
+}
+async function zCopyAPIKey() {
+  const input = $("apikey-reveal-value");
+  const value = input.value;
+  if (!value) return;
+  try {
+    if (window.navigator && navigator.clipboard) {
+      await navigator.clipboard.writeText(value);
+    } else {
+      input.select();
+      document.execCommand("copy");
+    }
+    const button = $("apikey-copy-btn");
+    const old = button.textContent;
+    button.textContent = "已复制";
+    window.setTimeout(() => { button.textContent = old; }, 1500);
+  } catch (_) {
+    input.select();
+    document.execCommand("copy");
+  }
+}
 async function zLoad() {
   const wanted = state.zdays;
   try {
@@ -988,9 +1185,17 @@ if (zdaysHost) {
     zdaysHost.append(link, document.createTextNode(" "));
   }
 }
+$("apikey-create-btn").addEventListener("click", zCreateAPIKey);
+$("apikey-name").addEventListener("keydown", (e) => {
+  if (e.key === "Enter") { e.preventDefault(); zCreateAPIKey(); }
+});
+$("apikey-copy-btn").addEventListener("click", zCopyAPIKey);
+$("apikey-close-btn").addEventListener("click", zCloseAPIKeyDialog);
+$("apikey-reveal").addEventListener("close", () => { $("apikey-reveal-value").value = ""; });
 load();
 zLoad();
 zLoadReset();
+zLoadAPIKeys();
 </script>
 </body>
 </html>

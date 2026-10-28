@@ -26,6 +26,7 @@ type Config struct {
 	// 仅在网关前面有可信反代时开启；直连部署开启会让调用方伪造来源。
 	TrustForwardedFor bool               `yaml:"trust_forwarded_for"`
 	ZcodeReset        ZcodeResetConfig   `yaml:"zcode_reset"`
+	APIKeys           APIKeysConfig      `yaml:"api_keys"`
 	RequestTimeout    time.Duration      `yaml:"request_timeout"`
 	Retry             RetryConfig        `yaml:"retry"`
 	Backpressure      BackpressureConfig `yaml:"backpressure"`
@@ -80,6 +81,21 @@ type ZcodeResetConfig struct {
 	// 公开不等于允许匿名花卡。开启时必须让反代强制这些路径经过身份验证，
 	// 且不能让「携带认证头即绕过反代」的规则覆盖它们；否则等于公开核销。
 	Public bool `yaml:"public"`
+}
+
+// APIKeysConfig 控制页面创建的 API Key。
+//
+// Enabled 打开后，生成端点必须携带数据库里的业务 Key（或可选的根
+// auth_env Key）。业务 Key 只放行生成端点；统计、用量、重置卡、metrics
+// 和 Key 管理都拒绝。
+//
+// ManagePublic 让 /v1/api-keys 在网关层跳过鉴权，交给反代（如 Traefik +
+// Authelia）承担管理授权。它与 stats_public 刻意分开：统计面公开不等于
+// 允许发 Key。开启时必须让反代强制 /v1/api-keys 经过身份验证，并阻止
+// 「携带认证头即绕过反代」的规则覆盖它。
+type APIKeysConfig struct {
+	Enabled      bool `yaml:"enabled"`
+	ManagePublic bool `yaml:"manage_public"`
 }
 
 // HealthCheckConfig 控制熔断后的后台异步探活机制。

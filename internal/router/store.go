@@ -51,6 +51,9 @@ func Migrate(ctx context.Context, db *sql.DB) error {
 	if err := ensureZcodeCredentialTable(ctx, db); err != nil {
 		return err
 	}
+	if err := ensureAPIKeyTable(ctx, db); err != nil {
+		return err
+	}
 	return nil
 }
 
