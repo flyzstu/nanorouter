@@ -11,3 +11,19 @@ nanorouter.db-*
 .env
 .env.*
 reasonix.toml
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Local tool state
+.commandcode/
+
+# Deployment secrets and runtime data
+deploy/**/acme/out/
+deploy/**/certs/**
+!deploy/**/certs/.gitignore
+deploy/**/data/
+deploy/**/config/users_database.yml
+deploy/**/config/configuration.yml
+deploy/**/config/configuration.yml.bak.*
