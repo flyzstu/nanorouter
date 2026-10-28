@@ -1,4 +1,4 @@
-.PHONY: build run
+.PHONY: build run smoke-api-keys
 
 BINARY := bin/nanorouter
 CONFIG ?= config.yaml
@@ -11,3 +11,7 @@ build:
 
 run:
 	go run ./cmd/nanorouter --config $(CONFIG)
+
+# 启动三个真实网关实例，验证 API Key 的三种鉴权模式（需要 go/python3）。
+smoke-api-keys:
+	./scripts/api-keys-smoke.sh

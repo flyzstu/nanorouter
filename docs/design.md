@@ -53,6 +53,7 @@ Agent / Open WebUI
 | `anthropic_adapter.go` | Chat↔Messages 双向翻译与 SSE 事件改写 | 映射不可表达的 OpenAI 特性（显式 400） |
 | `zcode.go` / `zcode_login.go` | ZCode 网关常量、id 派生、凭据文件、登录链 | 写参考客户端的 token 文件 |
 | `zcode_usage.go` / `zcode_reset.go` | ZCode 用量看板与重置卡查询/手动核销 | 自动核销，或在生成路径里消费重置卡 |
+| `api_keys.go` / `api_keys_http.go` | API Key 的哈希存储、认证缓存、创建/列表/吊销 | 保存明文 Key，或让业务 Key 访问管理/统计面 |
 
 代理只将 JSON 解为 `map[string]any`，修改 `model` 后重新编码，保留其余字段。因此 `tools`、图片、结构化输出等新增字段不需要随网关升级逐一建模。
 
@@ -261,9 +262,9 @@ X-Session-Id），重启清零，条目上限 5000 防异常流量撑内存。
 tool_calls 计数；工具榜聚合因 JSON 展开函数跨方言不统一（json_each vs
 jsonb_array_elements_text），拉回 Go 侧归并。调用方 IP 直连记 TCP 对端地址，开启
 `trust_forwarded_for` 后取 `X-Forwarded-For` 首值（仅限可信反代后部署，否则来源可
-伪造）。统计与重置卡路径的认证在 Bearer/`X-Api-Key` 之外为浏览器放宽 Basic（仅
-`/stats`、`/v1/stats/summary`、`/v1/zcode/usage`、`/v1/zcode/reset/status` 与
-`/v1/zcode/reset/use`），生成端点不放宽。
+伪造）。统计、重置卡与 API Key 管理路径的认证在 Bearer/`X-Api-Key` 之外为浏览器放宽
+Basic（仅 `/stats`、`/v1/stats/summary`、`/v1/zcode/usage`、`/v1/zcode/reset/status`、
+`/v1/zcode/reset/use` 与 `/v1/api-keys*`），生成端点不放宽。
 `/healthz` 恒免鉴权：只回 200、无业务数据，k8s 存活/就绪探针无头可带，
 `auth_env` 下若拦截探针会把自己杀死；`/metrics` 不豁免（含调用量）。
 `stats_public: true` 时统计面三个路径整体豁免鉴权——为反代层或内网已自管访问控制的
@@ -298,6 +299,17 @@ OAuth token>`）；两个 token 在 `login zcode` 时已随 key 一起落库/落
 网关端口的人都可匿名核销。它刻意不复用 `stats_public`，避免“统计页公开”顺带
 获得核销能力。上表“账户面只读”仅指 bigmodel.cn 的用量看板，不包含这条独立的
 核销路径。
+
+API Key 管理是第三条独立的账号路径。`api_keys.enabled: true` 后，生成端点必须携带
+数据库里的业务 Key；认证只比较 SHA-256 哈希，进程内缓存 5 秒，本实例创建/吊销立即
+失效。业务 Key 有固定 scope：只放行生成端点（含 `/v1/models` 与 zhipu 前缀），统计、
+用量、重置卡、metrics 和管理端点一律 403；根 `auth_env` Key 仍是可选的 break-glass
+全权限凭据。管理端点默认只认根 Key；`manage_public: true` 时跳过网关鉴权，交给反代
+SSO。`stats_public`、`zcode_reset.public`、`api_keys.manage_public` 三个豁免互不
+牵连。三者都假设“网关只被反代访问”：部署时应把 nanorouter 放在只和反代共享的独立
+Docker 网络，反代与 SSO 各自使用独立网络，避免同网容器绕过反代直连 8089。Key 表
+`api_keys(id, name, key_hash, key_prefix, created_at, revoked_at)` 只新增、不改旧表；
+吊销写 `revoked_at` 保留审计，完整 Key 只在创建响应出现一次。
 
 ## 用量与隐私
 

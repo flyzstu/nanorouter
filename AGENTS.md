@@ -16,6 +16,8 @@ duplicating the full design rationale in this file.
 - `go run ./cmd/nanorouter --config config.yaml` — run the gateway locally; `--debug` forces colored text logs at DEBUG level. `make build` (outputs `bin/nanorouter`) and `make run` are equivalent shortcuts.
 - `go test ./...` — run all unit tests; execute before every handoff. Focused runs: `go test ./internal/router` or `go test ./internal/router -run '^Test<Name>$'`. Perf work uses the benchmarks in `internal/router/benchmark_test.go` or `scripts/bench.sh` / `scripts/profile.sh`.
 - `go vet ./...` — detect common Go correctness issues.
+- `make smoke-api-keys` — build the binary and start three temporary gateways to verify API Key auth modes, generation scope and revocation; requires `go` and `python3`.
+- `NANOROUTER_TEST_POSTGRES_DSN=... go test ./internal/router -run APIKeyPostgres` — PostgreSQL migration/store test; skipped when the DSN is unset.
 - `go build -buildvcs=false ./cmd/nanorouter` — build without requiring Git metadata; use this in this workspace (the Dockerfile also builds this way).
 - `gofmt -w cmd internal` — format changed Go files before testing.
 

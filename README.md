@@ -446,6 +446,58 @@ curl -X POST "http://127.0.0.1:8080/v1/zcode/reset/use" \
 - 核销成功后 status 缓存立即失效；请求主链路（生成、故障切换、探活、登录）不会自动核销。
 - 认证同统计页（Bearer、X-Api-Key 或浏览器 Basic 回退）。设置 `zcode_reset.public: true` 时这两个端点跳过网关鉴权，交给反代（如 Traefik + Authelia）；必须强制这些路径经过边缘鉴权，防止伪造认证头绕过。`stats_public` **不会**顺带放开 reset。核销还要求 `Content-Type: application/json`，阻断跨站表单。
 
+### API Key 管理
+
+`api_keys.enabled: true` 后，生成端点必须携带页面创建的 API Key（或可选的根
+`auth_env` Key）。业务 Key 只保存 SHA-256 哈希，完整 Key 只在创建响应中出现一次。
+
+| 端点 | 行为 |
+| --- | --- |
+| `GET /v1/api-keys` | 列出 Key（名称、前缀、创建时间、状态），不含完整 Key |
+| `POST /v1/api-keys` | 创建，body `{"name":"laptop"}`；**仅此一次**返回完整 Key |
+| `DELETE /v1/api-keys/{id}` | 吊销；记录保留并显示为“已吊销” |
+
+```yaml
+api_keys:
+  enabled: true
+  manage_public: false   # 管理端点交给反代 SSO 时设为 true
+```
+
+- 业务 Key 只放行 `/v1/chat/completions`、`/v1/responses`、`/v1/messages`、对应无 `/v1` 别名、`/zhipu-aicoding/*`、`/zhipuaicoding/*` 与 `/v1/models`；统计、用量、重置卡、`/metrics`、Key 管理一律 403。
+- `manage_public: false`（默认）：管理端点要求根 `auth_env` Key（Bearer/X-Api-Key/Basic）；业务 Key 不能管理 Key。
+- `manage_public: true`：管理端点在网关层跳过鉴权，交给反代（如 Traefik + Authelia）。必须把 `/v1/api-keys` 加入强制 Authelia 的高优先级规则，否则伪造认证头即可匿名创建/吊销 Key。推荐把 nanorouter 放在只和反代共享的 Docker 网络里。
+- `auth_env` 可留空。留空且 `manage_public: false` 时没有管理凭据，管理端点不可用；`api_keys.enabled: false` 且 `auth_env` 为空时保持旧的开放行为。
+- `auth_env` 留空且 `api_keys.enabled: true` 时，管理页面本身还需要 `stats_public: true`（并由反代保护），否则 `/stats` 会 401，无法创建第一把 Key。
+- `stats_public` 开启时统计面本来就是公开的；业务 Key 的 scope 限制只对需要鉴权的路径生效。
+- 吊销在本实例立即生效；多副本部署最多 5 秒后感知。
+
+```sh
+curl -X POST "http://127.0.0.1:8080/v1/api-keys" \
+  -H "Authorization: Bearer $NANOROUTER_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"name":"laptop"}'
+
+curl "http://127.0.0.1:8080/v1/models" \
+  -H "Authorization: Bearer nr_your-key-here"
+```
+
+## 测试
+
+- 单元测试：`go test ./...`。使用 SQLite 内存库，覆盖 API Key 存储、鉴权矩阵、路径 scope、吊销、缓存传播和迁移幂等。
+- 真实二进制冒烟：`make smoke-api-keys`。脚本构建二进制并启动三个临时网关（根+业务、无根+SSO、仅根），验证创建/认证/吊销/scope，以及数据库只存哈希。需要 `go` 与 `python3`；失败时临时目录和日志会保留。
+- PostgreSQL：`TestAPIKeyPostgresStore` 默认跳过，设置 `NANOROUTER_TEST_POSTGRES_DSN` 后执行：
+
+  ```sh
+  docker run --rm -d --name nr-pg \
+    -e POSTGRES_PASSWORD=postgres -e POSTGRES_DB=nanorouter_test \
+    -p 5432:5432 postgres:16
+
+  NANOROUTER_TEST_POSTGRES_DSN='postgres://postgres:postgres@127.0.0.1:5432/nanorouter_test?sslmode=disable' \
+    go test ./internal/router -run APIKeyPostgres -count=1 -v
+  ```
+
+- CI：`.gitea/workflows/build-image.yaml` 的 `test` job 使用 `services: postgres`，运行 `go test ./...`、race 测试和 `make smoke-api-keys`；镜像构建依赖测试通过。`services` 只在容器 job 中启动，当前 `ubuntu-latest` 标签映射到 Docker 镜像；旧 runner 不等待 service healthcheck，Postgres 测试内部会重试连接。
+
 ## 查看用量
 
 ```sh

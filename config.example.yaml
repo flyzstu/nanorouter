@@ -35,6 +35,14 @@ zcode_reset:
   # 强制 /v1/zcode/reset 经过身份验证，且不能让「带认证头即绕过反代」的规则
   # 覆盖它们，否则等于公开核销。默认 false。
   # public: true
+# 页面创建的 API Key。enabled 打开后，生成端点必须携带业务 Key；业务 Key
+# 只放行生成端点，不能访问统计、用量、重置卡、metrics 和 Key 管理。
+# manage_public 让 /v1/api-keys 在网关层跳过鉴权，交给反代（如 Traefik +
+# Authelia）承担管理授权；开启时必须强制 /v1/api-keys 经过边缘身份验证，
+# 并阻止「携带认证头即绕过反代」的规则覆盖它。
+api_keys:
+  enabled: false
+  manage_public: false
 request_timeout: 90s
 # 全局覆盖转发到上游的 User-Agent。默认 Go-http-client/x.x 会被部分上游
 # （如 Nous Research 的 Cloudflare WAF）拦截并返回 403；可设为常规客户端 UA，

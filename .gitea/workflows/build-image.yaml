@@ -8,7 +8,38 @@ on:
   workflow_dispatch:
 
 jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: nanorouter_test
+    env:
+      # job 容器内通过 service id 访问；不要用 127.0.0.1。
+      NANOROUTER_TEST_POSTGRES_DSN: postgres://postgres:postgres@postgres:5432/nanorouter_test?sslmode=disable
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Unit and PostgreSQL tests
+        run: go test ./... -count=1
+
+      - name: Race tests
+        run: go test -race ./internal/router -run 'APIKey|Auth' -count=1
+
+      - name: API key smoke (SQLite)
+        run: ./scripts/api-keys-smoke.sh
+
   build:
+    needs: test
     runs-on: ubuntu-latest
     env:
       REGISTRY: coding.fly97.fun:8443
