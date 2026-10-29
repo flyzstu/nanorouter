@@ -21,18 +21,20 @@ import (
 
 func main() {
 	var (
-		listen           = flag.String("listen", envString("AGY_BRIDGE_LISTEN", "127.0.0.1:8090"), "HTTP listen address")
-		agyBin           = flag.String("agy-bin", envString("AGY_BIN", "agy"), "path to the agy binary")
-		mode             = flag.String("mode", envString("AGY_BRIDGE_MODE", "plan"), "agy permission mode: plan, accept-edits or skip")
-		effort           = flag.String("effort", envString("AGY_BRIDGE_EFFORT", ""), "optional agy reasoning effort")
-		workDir          = flag.String("workdir", envString("AGY_BRIDGE_WORKDIR", ""), "working directory for agy (default: isolated temp dir)")
-		timeout          = flag.Duration("timeout", envDuration("AGY_BRIDGE_TIMEOUT", 10*time.Minute), "per-request timeout")
-		token            = flag.String("token", envString("AGY_BRIDGE_TOKEN", ""), "optional bearer token required from clients")
-		models           = flag.String("models", envString("AGY_BRIDGE_MODELS", ""), "comma-separated model IDs exposed by /v1/models")
-		defaultModel     = flag.String("default-model", envString("AGY_BRIDGE_DEFAULT_MODEL", ""), "model used when the request omits model")
-		emitThinking     = flag.Bool("emit-thinking", envBool("AGY_BRIDGE_EMIT_THINKING", true), "stream agy thinking as reasoning_content (OpenAI only)")
-		emitToolActivity = flag.Bool("emit-tool-activity", envBool("AGY_BRIDGE_EMIT_TOOL_ACTIVITY", false), "stream completed agy tool steps as reasoning annotations")
-		allowInsecure    = flag.Bool("allow-insecure", envBool("AGY_BRIDGE_ALLOW_INSECURE", false), "allow non-loopback listen without a token")
+		listen        = flag.String("listen", envString("AGY_BRIDGE_LISTEN", "127.0.0.1:8090"), "HTTP listen address")
+		agyBin        = flag.String("agy-bin", envString("AGY_BIN", "agy"), "path to the agy binary")
+		mode          = flag.String("mode", envString("AGY_BRIDGE_MODE", "plan"), "agy permission mode: plan, accept-edits or skip")
+		effort        = flag.String("effort", envString("AGY_BRIDGE_EFFORT", ""), "optional agy reasoning effort")
+		workDir       = flag.String("workdir", envString("AGY_BRIDGE_WORKDIR", ""), "working directory for agy (default: isolated temp dir)")
+		timeout       = flag.Duration("timeout", envDuration("AGY_BRIDGE_TIMEOUT", 10*time.Minute), "per-request timeout")
+		token         = flag.String("token", envString("AGY_BRIDGE_TOKEN", ""), "optional bearer token required from clients")
+		models        = flag.String("models", envString("AGY_BRIDGE_MODELS", ""), "comma-separated model IDs exposed by /v1/models")
+		defaultModel  = flag.String("default-model", envString("AGY_BRIDGE_DEFAULT_MODEL", ""), "model used when the request omits model")
+		emitThinking  = flag.Bool("emit-thinking", envBool("AGY_BRIDGE_EMIT_THINKING", true), "stream agy thinking as reasoning_content (OpenAI only)")
+		toolMode      = flag.String("tool-mode", envString("AGY_BRIDGE_TOOL_MODE", "annotate"), "tool activity mapping: annotate, passthrough or none")
+		sessionFile   = flag.String("session-file", envString("AGY_BRIDGE_SESSION_FILE", ""), "optional JSON file persisting session -> agy conversation bindings")
+		sessionTTL    = flag.Duration("session-ttl", envDuration("AGY_BRIDGE_SESSION_TTL", 24*time.Hour), "session binding TTL")
+		allowInsecure = flag.Bool("allow-insecure", envBool("AGY_BRIDGE_ALLOW_INSECURE", false), "allow non-loopback listen without a token")
 	)
 	flag.Parse()
 
@@ -40,6 +42,11 @@ func main() {
 	case "plan", "accept-edits", "skip":
 	default:
 		log.Fatalf("invalid -mode %q: want plan, accept-edits or skip", *mode)
+	}
+	switch *toolMode {
+	case "annotate", "passthrough", "none":
+	default:
+		log.Fatalf("invalid -tool-mode %q: want annotate, passthrough or none", *toolMode)
 	}
 	if *token == "" && !*allowInsecure && !isLoopbackListen(*listen) {
 		log.Fatalf("refusing to listen on %s without -token; bind 127.0.0.1 or pass -allow-insecure", *listen)
@@ -57,16 +64,18 @@ func main() {
 
 	modelList := splitModels(*models)
 	cfg := agybridge.Config{
-		Bin:              *agyBin,
-		WorkDir:          *workDir,
-		Mode:             *mode,
-		Effort:           *effort,
-		Timeout:          *timeout,
-		Token:            *token,
-		Models:           modelList,
-		DefaultModel:     *defaultModel,
-		EmitThinking:     *emitThinking,
-		EmitToolActivity: *emitToolActivity,
+		Bin:          *agyBin,
+		WorkDir:      *workDir,
+		Mode:         *mode,
+		Effort:       *effort,
+		Timeout:      *timeout,
+		Token:        *token,
+		Models:       modelList,
+		DefaultModel: *defaultModel,
+		EmitThinking: *emitThinking,
+		ToolMode:     *toolMode,
+		SessionFile:  *sessionFile,
+		SessionTTL:   *sessionTTL,
 	}
 	bridge := agybridge.NewBridge(cfg)
 	server := &http.Server{
@@ -75,7 +84,7 @@ func main() {
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 
-	log.Printf("agy-bridge listening on %s (bin=%s mode=%s workdir=%s models=%s)", *listen, *agyBin, *mode, *workDir, strings.Join(bridgeModels(cfg), ","))
+	log.Printf("agy-bridge listening on %s (bin=%s mode=%s tool=%s workdir=%s models=%s)", *listen, *agyBin, *mode, *toolMode, *workDir, strings.Join(bridgeModels(cfg), ","))
 	runErr := make(chan error, 1)
 	go func() {
 		runErr <- server.ListenAndServe()

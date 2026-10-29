@@ -46,7 +46,9 @@ go build -o bin/agy-bridge ./cmd/agy-bridge
 | `-models` | `AGY_BRIDGE_MODELS` | 空 | 逗号分隔，供 `/v1/models` 展示 |
 | `-default-model` | `AGY_BRIDGE_DEFAULT_MODEL` | 空 | 请求未带 model 时使用 |
 | `-emit-thinking` | `AGY_BRIDGE_EMIT_THINKING` | `true` | OpenAI 流里输出 `reasoning_content` |
-| `-emit-tool-activity` | `AGY_BRIDGE_EMIT_TOOL_ACTIVITY` | `false` | 把完成的 agy 工具步骤写成 reasoning 注解 |
+| `-tool-mode` | `AGY_BRIDGE_TOOL_MODE` | `annotate` | `annotate` / `passthrough` / `none` |
+| `-session-file` | `AGY_BRIDGE_SESSION_FILE` | 空 | 可选，持久化会话绑定；为空时只存内存 |
+| `-session-ttl` | `AGY_BRIDGE_SESSION_TTL` | `24h` | 会话绑定有效期 |
 | `-allow-insecure` | `AGY_BRIDGE_ALLOW_INSECURE` | `false` | 允许非回环监听且无 token |
 
 ## nanorouter 接入
@@ -93,18 +95,38 @@ routes:
 
 注意 OpenAI 候选的 `base_url` 带 `/v1`，Anthropic 候选不带，路径由 `anthropic_messages_path` 指定。
 
+## 会话连续性
+
+bridge 读取下游请求的 `X-Session-Affinity`（回退 `X-Session-Id`），把同一个会话键 + 模型绑定到 agy 的 `conversation_id`：
+
+- 首轮：完整 messages 拼成 prompt，不传 `--conversation`；从 init/result 捕获 conversation ID 并保存。
+- 后续轮：传 `--conversation <id>`，只发送最后一条 user 及其后的 tool 结果；历史由 agy 自己维护。
+- conversation 过期/不存在时，自动删除绑定并用完整 prompt 重开一轮。
+- `-session-file` 可以跨进程重启保留绑定（JSON，键是会话键的 SHA-256）；不配置则只存内存。
+- 没有会话头时保持无状态，每轮发送完整 prompt。
+
+nanorouter 会原样转发 `X-Session-Affinity` / `X-Session-Id`，客户端只要在请求头里带上稳定的会话键即可。
+
 ## 流式行为
 
 - OpenAI：`chat.completion.chunk`，文本走 `delta.content`，思考走 `delta.reasoning_content`；结束时发 `finish_reason: "stop"` 和 usage（有 token 数据时），最后 `data: [DONE]`。
 - Anthropic：`message_start` → `content_block_start` → `content_block_delta(text_delta)` → `content_block_stop` → `message_delta` → `message_stop`。
 - usage：agy 的 result 信封优先；否则取各 step 的最大值。Anthropic 的 `message_start.input_tokens` 先发 0，最终 `message_delta` 带 `output_tokens`。
+- 工具：`-tool-mode=annotate`（默认）把完成的工具步骤写进 reasoning；`passthrough` 映射成 OpenAI `tool_calls` / Anthropic `tool_use`，并以 `tool_calls` / `tool_use` 结束；`none` 完全忽略工具步骤。
+- 错误：按 auth / rate_limit / context_window / eligibility / network / timeout / no_result 分类，响应头带 `X-Agy-Error-Kind`，429 带 `Retry-After`（如果能确定），错误体带稳定 code。
+
+## 工具映射的语义
+
+agy 是一个会自己执行工具的 agent。`passthrough` 模式把 agy **已经执行过**的工具步骤回放成标准 tool call，适合日志、审计或只渲染工具卡片的客户端；**不要让客户端再次执行这些 tool call**，否则会重复执行命令/写文件。默认的 `annotate` 模式不会产生可执行的 tool call，是网关场景更安全的选择。
+
+下游请求里的 `tools` 目前只作为上下文的一部分，不会被 bridge 转成 agy 可调用的工具；agy 仍然使用它自己的工具集。
 
 ## 已知边界
 
-- **下游 tools 不会被执行**：agy 使用自己的工具；下游传入的 `tools` 只作为上下文保留，bridge 不会把它们映射成可执行的 `tool_calls`。需要看 agy 工具活动时可开 `-emit-tool-activity`（仅 OpenAI reasoning）。
+- **下游 tools 不会被执行**：agy 使用自己的工具；下游传入的 `tools` 只作为上下文保留。需要看 agy 工具活动时用 `-tool-mode=annotate`；`passthrough` 仅用于可观测/回放，客户端不应重复执行。
 - **图片不落盘**：消息里的图片统一记为 `[image omitted]`。
 - **无 Anthropic thinking block**：Anthropic 的 thinking block 需要签名，agy 不提供；bridge 默认只在 OpenAI 侧输出 `reasoning_content`。
-- **无会话持久化**：每次请求把完整 messages 拼成 prompt，不传 `--conversation`；多轮上下文由调用方每轮完整发送。后续可按 `X-Session-Affinity` 增加 `--conversation` 绑定。
+- **会话需要客户端带头**：没有 `X-Session-Affinity` / `X-Session-Id` 时无法绑定 agy conversation；客户端换了模型也会按“会话键 + 模型”重新绑定。
 - **每请求一个 agy 进程**：延迟高于常驻 HTTP 上游，不适合高 QPS；建议 `max_concurrency` 控制在 2–4。
 - **ToS 风险**：Antigravity 是 Google 的订阅服务，把它作为共享网关上游可能违反服务条款，请自行评估账号风险。
 

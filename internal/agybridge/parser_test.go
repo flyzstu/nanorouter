@@ -98,7 +98,7 @@ func TestStreamParserGarbageAndAuthFailure(t *testing.T) {
 }
 
 func TestCollectorSnapshotSuffix(t *testing.T) {
-	collector := newStreamCollector(false)
+	collector := newStreamCollector("annotate")
 	var text strings.Builder
 	for _, ev := range []Event{
 		{Kind: EventStep, StepKey: "1", StepKind: StepText, Text: "Hello"},
@@ -117,5 +117,19 @@ func TestCollectorSnapshotSuffix(t *testing.T) {
 	usage := collector.usage()
 	if usage.InputTokens != 2 || usage.OutputTokens != 3 {
 		t.Fatalf("usage=%+v", usage)
+	}
+}
+
+func TestCollectorPrefersStepUsageOverCumulativeResult(t *testing.T) {
+	collector := newStreamCollector("annotate")
+	collector.consume(Event{Kind: EventStep, StepKey: "1", StepKind: StepText, Text: "ok", Usage: &Usage{
+		InputTokens: 100, OutputTokens: 5, TotalTokens: 105,
+	}})
+	collector.consume(Event{Kind: EventResult, OK: true, Response: "ok", Usage: &Usage{
+		InputTokens: 500, OutputTokens: 10, TotalTokens: 510,
+	}})
+	usage := collector.usage()
+	if usage.InputTokens != 100 || usage.OutputTokens != 5 || usage.TotalTokens != 105 {
+		t.Fatalf("usage=%+v; want per-step 100/5/105", usage)
 	}
 }

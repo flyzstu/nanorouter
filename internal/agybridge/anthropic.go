@@ -19,13 +19,13 @@ func (b *Bridge) handleAnthropic(w http.ResponseWriter, r *http.Request) {
 	}
 	model := b.modelFor(req.Model)
 	if req.Stream {
-		b.streamAnthropic(w, r, prompt, model)
+		b.streamAnthropic(w, r, req, prompt, model)
 		return
 	}
-	b.completeAnthropic(w, r, prompt, model)
+	b.completeAnthropic(w, r, req, prompt, model)
 }
 
-func (b *Bridge) streamAnthropic(w http.ResponseWriter, r *http.Request, prompt, model string) {
+func (b *Bridge) streamAnthropic(w http.ResponseWriter, r *http.Request, req anthropicRequest, prompt, model string) {
 	sse, err := newSSEWriter(w)
 	if err != nil {
 		writeAnthropicError(w, http.StatusInternalServerError, "api_error", err.Error())
@@ -45,7 +45,9 @@ func (b *Bridge) streamAnthropic(w http.ResponseWriter, r *http.Request, prompt,
 		"content_block": map[string]any{"type": "text", "text": ""},
 	})
 
-	collector, runErr := b.run(r.Context(), prompt, model, func(text, _ string) error {
+	collector, runErr := b.runWithContinuity(r.Context(), r, model, prompt, func() (string, bool) {
+		return anthropicContinuation(req)
+	}, func(text, _ string) error {
 		if text == "" {
 			return nil
 		}
@@ -53,14 +55,15 @@ func (b *Bridge) streamAnthropic(w http.ResponseWriter, r *http.Request, prompt,
 			"type": "content_block_delta", "index": 0,
 			"delta": map[string]any{"type": "text_delta", "text": text},
 		})
-	}, b.cfg.EmitToolActivity)
+	})
 	if runErr != nil {
 		if errors.Is(runErr, context.Canceled) || errors.Is(runErr, context.DeadlineExceeded) {
 			return
 		}
+		info := classifyError(runErr)
 		_ = sse.event("error", map[string]any{
 			"type":  "error",
-			"error": map[string]any{"type": "api_error", "message": runErr.Error()},
+			"error": map[string]any{"type": anthropicErrorType(info.Kind), "message": info.Message},
 		})
 		return
 	}
@@ -72,20 +75,40 @@ func (b *Bridge) streamAnthropic(w http.ResponseWriter, r *http.Request, prompt,
 		return
 	}
 	_ = sse.event("content_block_stop", map[string]any{"type": "content_block_stop", "index": 0})
+	tools := collector.toolEvents()
+	for i, tool := range tools {
+		index := i + 1
+		_ = sse.event("content_block_start", map[string]any{
+			"type": "content_block_start", "index": index,
+			"content_block": map[string]any{
+				"type": "tool_use", "id": "toolu_" + randomID(), "name": tool.Name, "input": map[string]any{},
+			},
+		})
+		_ = sse.event("content_block_delta", map[string]any{
+			"type": "content_block_delta", "index": index,
+			"delta": map[string]any{"type": "input_json_delta", "partial_json": toolArgsJSON(tool.Input)},
+		})
+		_ = sse.event("content_block_stop", map[string]any{"type": "content_block_stop", "index": index})
+	}
+	stopReason := "end_turn"
+	if len(tools) > 0 {
+		stopReason = "tool_use"
+	}
 	usage := collector.usage()
 	_ = sse.event("message_delta", map[string]any{
 		"type":  "message_delta",
-		"delta": map[string]any{"stop_reason": "end_turn", "stop_sequence": nil},
+		"delta": map[string]any{"stop_reason": stopReason, "stop_sequence": nil},
 		"usage": map[string]any{"output_tokens": usage.OutputTokens},
 	})
 	_ = sse.event("message_stop", map[string]any{"type": "message_stop"})
 }
 
-func (b *Bridge) completeAnthropic(w http.ResponseWriter, r *http.Request, prompt, model string) {
-	collector, err := b.run(r.Context(), prompt, model, nil, false)
+func (b *Bridge) completeAnthropic(w http.ResponseWriter, r *http.Request, req anthropicRequest, prompt, model string) {
+	collector, err := b.runWithContinuity(r.Context(), r, model, prompt, func() (string, bool) {
+		return anthropicContinuation(req)
+	}, nil)
 	if err != nil {
-		status, _ := bridgeErrorStatus(err)
-		writeAnthropicError(w, status, "api_error", err.Error())
+		writeClassifiedAnthropicError(w, err)
 		return
 	}
 	text := collector.textString()
@@ -93,18 +116,49 @@ func (b *Bridge) completeAnthropic(w http.ResponseWriter, r *http.Request, promp
 		writeAnthropicError(w, http.StatusBadGateway, "api_error", collector.resultErr)
 		return
 	}
+	content := []any{map[string]any{"type": "text", "text": text}}
+	stopReason := "end_turn"
+	if tools := collector.toolEvents(); len(tools) > 0 {
+		stopReason = "tool_use"
+		for _, tool := range tools {
+			content = append(content, map[string]any{
+				"type": "tool_use", "id": "toolu_" + randomID(), "name": tool.Name, "input": tool.Input,
+			})
+		}
+	}
 	usage := collector.usage()
 	writeJSON(w, http.StatusOK, map[string]any{
 		"id":            "msg_" + randomID(),
 		"type":          "message",
 		"role":          "assistant",
 		"model":         model,
-		"content":       []any{map[string]any{"type": "text", "text": text}},
-		"stop_reason":   "end_turn",
+		"content":       content,
+		"stop_reason":   stopReason,
 		"stop_sequence": nil,
 		"usage": map[string]any{
 			"input_tokens":  usage.InputTokens,
 			"output_tokens": usage.OutputTokens,
 		},
 	})
+}
+
+func writeClassifiedAnthropicError(w http.ResponseWriter, err error) {
+	info := classifyError(err)
+	w.Header().Set("X-Agy-Error-Kind", info.Kind)
+	writeAnthropicError(w, info.Status, anthropicErrorType(info.Kind), info.Message)
+}
+
+func anthropicErrorType(kind string) string {
+	switch kind {
+	case "auth":
+		return "authentication_error"
+	case "rate_limit":
+		return "rate_limit_error"
+	case "context_window":
+		return "invalid_request_error"
+	case "eligibility":
+		return "permission_error"
+	default:
+		return "api_error"
+	}
 }

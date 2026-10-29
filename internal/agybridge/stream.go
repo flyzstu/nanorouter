@@ -19,15 +19,24 @@ type streamCollector struct {
 	convID    string
 	resultErr string
 
-	emitTools bool
+	toolMode string
+	tools    []ToolEvent
 }
 
-func newStreamCollector(emitTools bool) *streamCollector {
+// ToolEvent 是 completed agy 工具步骤的归一化结果。
+type ToolEvent struct {
+	Name   string
+	Input  any
+	Output any
+	Error  string
+}
+
+func newStreamCollector(toolMode string) *streamCollector {
 	return &streamCollector{
 		stepText:     map[string]string{},
 		stepThinking: map[string]string{},
 		toolSeen:     map[string]bool{},
-		emitTools:    emitTools,
+		toolMode:     toolMode,
 	}
 }
 
@@ -59,8 +68,24 @@ func (c *streamCollector) consume(ev Event) (string, string) {
 			}
 			return "", delta
 		case StepTool:
-			if c.emitTools && ev.Tool != nil && !c.toolSeen[ev.StepKey] {
-				c.toolSeen[ev.StepKey] = true
+			if ev.Tool == nil || c.toolSeen[ev.StepKey] {
+				break
+			}
+			completed := ev.State == "DONE" || ev.State == "ERROR" ||
+				(ev.State == "" && (ev.Tool.Output != nil || ev.Tool.Error != ""))
+			if !completed {
+				break
+			}
+			c.toolSeen[ev.StepKey] = true
+			switch c.toolMode {
+			case "none":
+				// 不输出工具事件。
+			case "passthrough":
+				c.tools = append(c.tools, ToolEvent{
+					Name: ev.Tool.Name, Input: ev.Tool.Args,
+					Output: ev.Tool.Output, Error: ev.Tool.Error,
+				})
+			default:
 				line := "[tool] " + ev.Tool.Name + "\n"
 				if ev.Tool.Error != "" {
 					line = "[tool] " + ev.Tool.Name + " failed: " + ev.Tool.Error + "\n"
@@ -116,14 +141,35 @@ func (c *streamCollector) mergeUsage(u *Usage) {
 }
 
 func (c *streamCollector) usage() Usage {
+	u := c.stepUsage
 	if c.final != nil {
-		return *c.final
+		// result 信封的 input/total 在续聊里是累计值，不能直接当本轮用量；
+		// 只用它补齐 step 没给的字段。
+		if u.InputTokens == 0 {
+			u.InputTokens = c.final.InputTokens
+		}
+		if u.OutputTokens == 0 {
+			u.OutputTokens = c.final.OutputTokens
+		}
+		if u.ThinkingTokens == 0 {
+			u.ThinkingTokens = c.final.ThinkingTokens
+		}
+		if u.CacheReadTokens == 0 {
+			u.CacheReadTokens = c.final.CacheReadTokens
+		}
+		if u.CacheWriteTokens == 0 {
+			u.CacheWriteTokens = c.final.CacheWriteTokens
+		}
 	}
-	return c.stepUsage
+	if u.TotalTokens == 0 {
+		u.TotalTokens = u.InputTokens + u.OutputTokens
+	}
+	return u
 }
 
-func (c *streamCollector) textString() string     { return c.text.String() }
-func (c *streamCollector) thinkingString() string { return c.thinking.String() }
+func (c *streamCollector) textString() string      { return c.text.String() }
+func (c *streamCollector) toolEvents() []ToolEvent { return c.tools }
+func (c *streamCollector) thinkingString() string  { return c.thinking.String() }
 
 func suffixDelta(prev, next string) string {
 	if next == prev {

@@ -1,6 +1,7 @@
 package agybridge
 
 import (
+	"context"
 	"crypto/subtle"
 	"io"
 	"net/http"
@@ -12,27 +13,33 @@ import (
 
 // Config 是 sidecar 的运行时配置。
 type Config struct {
-	Bin              string
-	WorkDir          string
-	Mode             string
-	Effort           string
-	Timeout          time.Duration
-	Token            string
-	Models           []string
-	DefaultModel     string
-	EmitThinking     bool
-	EmitToolActivity bool
+	Bin          string
+	WorkDir      string
+	Mode         string
+	Effort       string
+	Timeout      time.Duration
+	Token        string
+	Models       []string
+	DefaultModel string
+	EmitThinking bool
+	ToolMode     string
+	SessionFile  string
+	SessionTTL   time.Duration
 }
 
 // Bridge 把 agy CLI 包装成 OpenAI / Anthropic 兼容的流式 HTTP 端点。
 type Bridge struct {
-	cfg    Config
-	runner *Runner
+	cfg      Config
+	runner   *Runner
+	sessions *SessionStore
 }
 
 func NewBridge(cfg Config) *Bridge {
 	if cfg.Timeout <= 0 {
 		cfg.Timeout = 10 * time.Minute
+	}
+	if cfg.ToolMode == "" {
+		cfg.ToolMode = "annotate"
 	}
 	return &Bridge{
 		cfg: cfg,
@@ -43,6 +50,7 @@ func NewBridge(cfg Config) *Bridge {
 			Effort:  cfg.Effort,
 			Timeout: cfg.Timeout,
 		},
+		sessions: NewSessionStore(cfg.SessionFile, cfg.SessionTTL),
 	}
 }
 
@@ -117,6 +125,38 @@ func readJSONBody(w http.ResponseWriter, r *http.Request, dst any) error {
 		return err
 	}
 	return json.Unmarshal(body, dst)
+}
+
+func sessionKeyFromRequest(r *http.Request) string {
+	key := strings.TrimSpace(r.Header.Get("X-Session-Affinity"))
+	if key == "" {
+		key = strings.TrimSpace(r.Header.Get("X-Session-Id"))
+	}
+	return key
+}
+
+func (b *Bridge) runWithContinuity(ctx context.Context, r *http.Request, model, fullPrompt string, continuation func() (string, bool), onDelta func(string, string) error) (*streamCollector, error) {
+	sessionKey := sessionKeyFromRequest(r)
+	prompt := fullPrompt
+	conversationID := ""
+	if sessionKey != "" {
+		if id, ok := b.sessions.Get(sessionKey, model); ok {
+			if next, ok := continuation(); ok {
+				prompt = next
+				conversationID = id
+			}
+		}
+	}
+	collector, err := b.run(ctx, prompt, model, conversationID, onDelta)
+	if err != nil && conversationID != "" && collector.textString() == "" && isStaleConversation(err) {
+		// agy 的 conversation 可能过期/被清理：退回完整 prompt 重开一轮。
+		b.sessions.Delete(sessionKey, model)
+		collector, err = b.run(ctx, fullPrompt, model, "", onDelta)
+	}
+	if err == nil && sessionKey != "" && collector.convID != "" {
+		b.sessions.Put(sessionKey, model, collector.convID)
+	}
+	return collector, err
 }
 
 func writeAnthropicError(w http.ResponseWriter, status int, typ, message string) {

@@ -213,3 +213,74 @@ func formatAnthropicContent(v any) string {
 		return fmt.Sprint(v)
 	}
 }
+
+// openAIContinuation 只保留最后一条 user 及其后的 tool 结果。
+// 会话已经绑定 agy conversation 时，历史由 agy 自己维护，不能整段重发。
+func openAIContinuation(req openAIRequest) (string, bool) {
+	start := -1
+	for i := len(req.Messages) - 1; i >= 0; i-- {
+		role := strings.ToLower(strings.TrimSpace(req.Messages[i].Role))
+		if role == "user" {
+			start = i
+			break
+		}
+		if role == "assistant" {
+			break
+		}
+	}
+	if start < 0 {
+		return "", false
+	}
+	var b strings.Builder
+	for _, msg := range req.Messages[start:] {
+		role := strings.ToLower(strings.TrimSpace(msg.Role))
+		content := formatOpenAIContent(msg.Content)
+		switch role {
+		case "assistant":
+			writePromptSection(&b, "assistant", content)
+		case "tool", "function":
+			label := "tool result"
+			if msg.Name != "" {
+				label += " " + msg.Name
+			}
+			if msg.ToolCallID != "" {
+				label += " (" + msg.ToolCallID + ")"
+			}
+			writePromptSection(&b, label, content)
+		default:
+			writePromptSection(&b, "user", content)
+		}
+	}
+	prompt := strings.TrimSpace(b.String())
+	return prompt, prompt != ""
+}
+
+// anthropicContinuation 与 openAIContinuation 同理。
+func anthropicContinuation(req anthropicRequest) (string, bool) {
+	start := -1
+	for i := len(req.Messages) - 1; i >= 0; i-- {
+		role := strings.ToLower(strings.TrimSpace(req.Messages[i].Role))
+		if role == "user" {
+			start = i
+			break
+		}
+		if role == "assistant" {
+			break
+		}
+	}
+	if start < 0 {
+		return "", false
+	}
+	var b strings.Builder
+	for _, msg := range req.Messages[start:] {
+		role := strings.ToLower(strings.TrimSpace(msg.Role))
+		content := formatAnthropicContent(msg.Content)
+		if role == "assistant" {
+			writePromptSection(&b, "assistant", content)
+		} else {
+			writePromptSection(&b, "user", content)
+		}
+	}
+	prompt := strings.TrimSpace(b.String())
+	return prompt, prompt != ""
+}

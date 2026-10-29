@@ -163,6 +163,13 @@ func (r *Runner) Run(ctx context.Context, req RunRequest, onEvent func(Event) er
 		}
 		return &AuthError{Message: msg}
 	}
+	if result != nil && !result.OK && result.Response == "" {
+		msg := result.Error
+		if msg == "" {
+			msg = "agy returned an error result"
+		}
+		return &ResultError{Message: msg}
+	}
 	if waitErr != nil {
 		if result != nil && (result.OK || result.Response != "") {
 			return nil

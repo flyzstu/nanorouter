@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"net/http"
 	"time"
+
+	json "github.com/goccy/go-json"
 )
 
 func (b *Bridge) handleOpenAI(w http.ResponseWriter, r *http.Request) {
@@ -26,7 +28,7 @@ func (b *Bridge) handleOpenAI(w http.ResponseWriter, r *http.Request) {
 		b.streamOpenAI(w, r, req, prompt, model)
 		return
 	}
-	b.completeOpenAI(w, r, prompt, model)
+	b.completeOpenAI(w, r, req, prompt, model)
 }
 
 func (b *Bridge) streamOpenAI(w http.ResponseWriter, r *http.Request, req openAIRequest, prompt, model string) {
@@ -39,7 +41,9 @@ func (b *Bridge) streamOpenAI(w http.ResponseWriter, r *http.Request, req openAI
 	created := time.Now().Unix()
 	_ = writeOpenAIChunk(sse, id, created, model, map[string]any{"role": "assistant"}, nil)
 
-	collector, runErr := b.run(r.Context(), prompt, model, func(text, thinking string) error {
+	collector, runErr := b.runWithContinuity(r.Context(), r, model, prompt, func() (string, bool) {
+		return openAIContinuation(req)
+	}, func(text, thinking string) error {
 		if text != "" {
 			if err := writeOpenAIChunk(sse, id, created, model, map[string]any{"content": text}, nil); err != nil {
 				return err
@@ -51,20 +55,38 @@ func (b *Bridge) streamOpenAI(w http.ResponseWriter, r *http.Request, req openAI
 			}
 		}
 		return nil
-	}, b.cfg.EmitToolActivity)
+	})
 	if runErr != nil {
 		if errors.Is(runErr, context.Canceled) || errors.Is(runErr, context.DeadlineExceeded) {
 			return
 		}
+		info := classifyError(runErr)
 		_ = sse.data(map[string]any{"error": map[string]any{
-			"message": runErr.Error(),
+			"message": info.Message,
 			"type":    "upstream_error",
-			"code":    "agy_error",
+			"code":    info.Code,
 		}})
 		_ = sse.raw("data: [DONE]\n\n")
 		return
 	}
+	tools := collector.toolEvents()
+	for i, tool := range tools {
+		_ = sse.data(map[string]any{
+			"id": id, "object": "chat.completion.chunk", "created": created, "model": model,
+			"choices": []any{map[string]any{
+				"index": 0,
+				"delta": map[string]any{"tool_calls": []any{map[string]any{
+					"index": i, "id": "call_" + randomID(), "type": "function",
+					"function": map[string]any{"name": tool.Name, "arguments": toolArgsJSON(tool.Input)},
+				}}},
+				"finish_reason": nil,
+			}},
+		})
+	}
 	stop := "stop"
+	if len(tools) > 0 {
+		stop = "tool_calls"
+	}
 	_ = writeOpenAIChunk(sse, id, created, model, map[string]any{}, &stop)
 	usage := collector.usage()
 	if (req.StreamOptions != nil && req.StreamOptions.IncludeUsage) || usage.InputTokens+usage.OutputTokens+usage.TotalTokens > 0 {
@@ -80,11 +102,12 @@ func (b *Bridge) streamOpenAI(w http.ResponseWriter, r *http.Request, req openAI
 	_ = sse.raw("data: [DONE]\n\n")
 }
 
-func (b *Bridge) completeOpenAI(w http.ResponseWriter, r *http.Request, prompt, model string) {
-	collector, err := b.run(r.Context(), prompt, model, nil, false)
+func (b *Bridge) completeOpenAI(w http.ResponseWriter, r *http.Request, req openAIRequest, prompt, model string) {
+	collector, err := b.runWithContinuity(r.Context(), r, model, prompt, func() (string, bool) {
+		return openAIContinuation(req)
+	}, nil)
 	if err != nil {
-		status, code := bridgeErrorStatus(err)
-		writeAPIError(w, status, err.Error(), code)
+		writeClassifiedOpenAIError(w, err)
 		return
 	}
 	text := collector.textString()
@@ -96,6 +119,18 @@ func (b *Bridge) completeOpenAI(w http.ResponseWriter, r *http.Request, prompt, 
 	if thinking := collector.thinkingString(); thinking != "" && b.cfg.EmitThinking {
 		message["reasoning_content"] = thinking
 	}
+	finishReason := "stop"
+	if tools := collector.toolEvents(); len(tools) > 0 {
+		finishReason = "tool_calls"
+		calls := make([]any, 0, len(tools))
+		for _, tool := range tools {
+			calls = append(calls, map[string]any{
+				"id": "call_" + randomID(), "type": "function",
+				"function": map[string]any{"name": tool.Name, "arguments": toolArgsJSON(tool.Input)},
+			})
+		}
+		message["tool_calls"] = calls
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"id":      "chatcmpl-" + randomID(),
 		"object":  "chat.completion",
@@ -104,15 +139,15 @@ func (b *Bridge) completeOpenAI(w http.ResponseWriter, r *http.Request, prompt, 
 		"choices": []any{map[string]any{
 			"index":         0,
 			"message":       message,
-			"finish_reason": "stop",
+			"finish_reason": finishReason,
 		}},
 		"usage": openAIUsage(collector.usage()),
 	})
 }
 
-func (b *Bridge) run(ctx context.Context, prompt, model string, onDelta func(text, thinking string) error, emitTools bool) (*streamCollector, error) {
-	collector := newStreamCollector(emitTools)
-	err := b.runner.Run(ctx, RunRequest{Prompt: prompt, Model: model}, func(ev Event) error {
+func (b *Bridge) run(ctx context.Context, prompt, model, conversationID string, onDelta func(text, thinking string) error) (*streamCollector, error) {
+	collector := newStreamCollector(b.cfg.ToolMode)
+	err := b.runner.Run(ctx, RunRequest{Prompt: prompt, Model: model, ConversationID: conversationID}, func(ev Event) error {
 		text, thinking := collector.consume(ev)
 		if onDelta != nil && (text != "" || thinking != "") {
 			return onDelta(text, thinking)
@@ -155,15 +190,24 @@ func openAIUsage(u Usage) map[string]any {
 	return out
 }
 
-func bridgeErrorStatus(err error) (int, string) {
-	var auth *AuthError
-	if errors.As(err, &auth) {
-		return http.StatusBadGateway, "agy_auth_required"
+func writeClassifiedOpenAIError(w http.ResponseWriter, err error) {
+	info := classifyError(err)
+	if info.RetryAfter > 0 {
+		w.Header().Set("Retry-After", fmt.Sprintf("%d", int(info.RetryAfter.Seconds())))
 	}
-	if errors.Is(err, ErrNoResult) {
-		return http.StatusBadGateway, "agy_no_result"
+	w.Header().Set("X-Agy-Error-Kind", info.Kind)
+	writeAPIError(w, info.Status, info.Message, info.Code)
+}
+
+func toolArgsJSON(v any) string {
+	if v == nil {
+		return "{}"
 	}
-	return http.StatusBadGateway, "agy_error"
+	encoded, err := json.Marshal(v)
+	if err != nil {
+		return "{}"
+	}
+	return string(encoded)
 }
 
 func randomID() string {
