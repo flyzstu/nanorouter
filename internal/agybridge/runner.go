@@ -153,8 +153,8 @@ func (r *Runner) Run(ctx context.Context, req RunRequest, onEvent func(Event) er
 	if scanErr != nil {
 		return scanErr
 	}
-	if ctx.Err() != nil {
-		return ctx.Err()
+	if runCtx.Err() != nil {
+		return runCtx.Err()
 	}
 	if parser.AuthFailure && (result == nil || !result.OK) {
 		msg := parser.AuthFailureText

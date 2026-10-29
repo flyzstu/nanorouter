@@ -133,3 +133,53 @@ func TestCollectorPrefersStepUsageOverCumulativeResult(t *testing.T) {
 		t.Fatalf("usage=%+v; want per-step 100/5/105", usage)
 	}
 }
+
+func TestStreamParserBareNestedAndNumericStep(t *testing.T) {
+	parser := &StreamParser{}
+	events := parser.Feed([]byte(strings.Join([]string{
+		`{"step_update":{"step_index":2,"state":"DONE","step_type":15,"text":"hi"}}`,
+		`{"event":"step_update","step_index":3,"step_type":5,"tool_info":{"name":"run_command"}}`,
+		`{"step_type":"thinking","text":"hm"}`,
+	}, "\n") + "\n"))
+	if len(events) != 3 {
+		t.Fatalf("events=%d", len(events))
+	}
+	if events[0].StepKind != StepText || events[0].Text != "hi" {
+		t.Fatalf("text=%+v", events[0])
+	}
+	if events[1].StepKind != StepTool || events[1].Tool == nil || events[1].Tool.Name != "run_command" {
+		t.Fatalf("tool=%+v", events[1])
+	}
+	if events[2].StepKind != StepThinking || events[2].Text != "hm" {
+		t.Fatalf("thinking=%+v", events[2])
+	}
+}
+
+func TestStreamParserOversizedLineDropsBuffer(t *testing.T) {
+	parser := &StreamParser{}
+	events := parser.Feed([]byte(strings.Repeat("x", maxStreamLineBytes+1)))
+	if len(events) == 0 || events[0].Kind != EventGarbage {
+		t.Fatalf("oversized line not reported as garbage: %+v", events)
+	}
+	events = parser.Feed([]byte(`{"event":"init","conversation_id":"c-ok"}` + "\n"))
+	if len(events) != 1 || events[0].ConversationID != "c-ok" {
+		t.Fatalf("parser did not recover: %+v", events)
+	}
+}
+
+func TestStreamParserUsageFieldsAndErrorResponse(t *testing.T) {
+	parser := &StreamParser{}
+	events := parser.Feed([]byte(`{"event":"result","result":{"status":"ERROR","response":"partial","error":"tool failed","usage":{"input_tokens":1,"output_tokens":2,"thinking_tokens":3,"cache_read_tokens":4,"cache_write_tokens":5,"total_tokens":15}}}` + "\n"))
+	if len(events) != 1 {
+		t.Fatalf("events=%d", len(events))
+	}
+	ev := events[0]
+	if ev.OK || ev.Response != "partial" || ev.Error != "tool failed" {
+		t.Fatalf("result=%+v", ev)
+	}
+	if ev.Usage == nil || ev.Usage.InputTokens != 1 || ev.Usage.OutputTokens != 2 ||
+		ev.Usage.ThinkingTokens != 3 || ev.Usage.CacheReadTokens != 4 ||
+		ev.Usage.CacheWriteTokens != 5 || ev.Usage.TotalTokens != 15 {
+		t.Fatalf("usage=%+v", ev.Usage)
+	}
+}

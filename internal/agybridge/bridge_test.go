@@ -19,37 +19,57 @@ const fakeStream = `{"event":"init","conversation_id":"c1","model":"fake-model"}
 {"event":"result","result":{"conversation_id":"c1","status":"DONE","response":"Hello world","usage":{"input_tokens":3,"output_tokens":2,"thinking_tokens":1}}}`
 
 func fakeAgy(t *testing.T, body string) string {
+	return fakeAgyScript(t, `if [ -n "$FAKE_ARGS_FILE" ]; then printf '%s\n' "$@" > "$FAKE_ARGS_FILE"; fi
+cat <<'EOF'
+`+body+`
+EOF`)
+}
+
+func fakeAgyScript(t *testing.T, script string) string {
 	t.Helper()
 	if runtime.GOOS == "windows" {
 		t.Skip("fake agy uses a POSIX shell script")
 	}
 	dir := t.TempDir()
 	path := filepath.Join(dir, "agy")
-	script := "#!/bin/sh\nif [ -n \"$FAKE_ARGS_FILE\" ]; then printf '%s\\n' \"$@\" > \"$FAKE_ARGS_FILE\"; fi\ncat <<'EOF'\n" + body + "\nEOF\n"
-	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
+	if err := os.WriteFile(path, []byte("#!/bin/sh\n"+script+"\n"), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	return path
 }
 
 func testBridge(t *testing.T, bin, token string) *httptest.Server {
-	return testBridgeWithToolMode(t, bin, token, "annotate")
+	return testBridgeWithConfig(t, Config{Bin: bin, Token: token})
 }
 
 func testBridgeWithToolMode(t *testing.T, bin, token, toolMode string) *httptest.Server {
+	return testBridgeWithConfig(t, Config{Bin: bin, Token: token, ToolMode: toolMode})
+}
+
+func testBridgeWithConfig(t *testing.T, cfg Config) *httptest.Server {
 	t.Helper()
-	bridge := NewBridge(Config{
-		Bin:          bin,
-		WorkDir:      t.TempDir(),
-		Mode:         "plan",
-		Timeout:      10 * time.Second,
-		Token:        token,
-		Models:       []string{"fake-model"},
-		DefaultModel: "fake-model",
-		EmitThinking: true,
-		ToolMode:     toolMode,
-	})
-	server := httptest.NewServer(bridge.Handler())
+	if cfg.WorkDir == "" {
+		cfg.WorkDir = t.TempDir()
+	}
+	if cfg.Mode == "" {
+		cfg.Mode = "plan"
+	}
+	if cfg.Timeout == 0 {
+		cfg.Timeout = 10 * time.Second
+	}
+	if len(cfg.Models) == 0 {
+		cfg.Models = []string{"fake-model"}
+	}
+	if cfg.DefaultModel == "" {
+		cfg.DefaultModel = "fake-model"
+	}
+	if !cfg.EmitThinking {
+		cfg.EmitThinking = true
+	}
+	if cfg.ToolMode == "" {
+		cfg.ToolMode = "annotate"
+	}
+	server := httptest.NewServer(NewBridge(cfg).Handler())
 	t.Cleanup(server.Close)
 	return server
 }
@@ -325,5 +345,241 @@ func TestErrorClassificationContextWindow(t *testing.T) {
 	}
 	if got := resp.Header.Get("X-Agy-Error-Kind"); got != "context_window" {
 		t.Fatalf("kind=%q", got)
+	}
+}
+
+func TestOpenAIStreamUsageWithoutFlag(t *testing.T) {
+	server := testBridge(t, fakeAgy(t, fakeStream), "")
+	resp := postJSON(t, server.URL+"/v1/chat/completions", `{
+		"model":"fake-model","messages":[{"role":"user","content":"hi"}],"stream":true
+	}`, "")
+	body, _ := io.ReadAll(resp.Body)
+	if !strings.Contains(string(body), `"usage"`) {
+		t.Fatalf("expected usage chunk:\n%s", body)
+	}
+}
+
+func TestAnthropicNonStream(t *testing.T) {
+	server := testBridge(t, fakeAgy(t, fakeStream), "")
+	resp := postJSON(t, server.URL+"/v1/messages", `{
+		"model":"fake-model","max_tokens":16,"messages":[{"role":"user","content":"hi"}]
+	}`, "")
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status=%d", resp.StatusCode)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	text := string(body)
+	for _, want := range []string{
+		`"content":[{"text":"Hello world","type":"text"}]`,
+		`"stop_reason":"end_turn"`,
+		`"input_tokens":3`,
+		`"output_tokens":2`,
+	} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("response missing %q:\n%s", want, text)
+		}
+	}
+}
+
+func TestToolModeNoneIgnoresTools(t *testing.T) {
+	server := testBridgeWithToolMode(t, fakeAgy(t, fakeToolStream), "", "none")
+	resp := postJSON(t, server.URL+"/v1/chat/completions", `{
+		"model":"fake-model","messages":[{"role":"user","content":"run ls"}],"stream":true
+	}`, "")
+	body, _ := io.ReadAll(resp.Body)
+	text := string(body)
+	if strings.Contains(text, "tool_calls") {
+		t.Fatalf("none mode should not emit tool_calls:\n%s", text)
+	}
+	if !strings.Contains(text, `"finish_reason":"stop"`) {
+		t.Fatalf("expected stop finish:\n%s", text)
+	}
+}
+
+const fakeTwoTools = `{"event":"init","conversation_id":"c1","model":"fake-model"}
+{"event":"step_update","step_index":3,"state":"DONE","step_type":"tool","tool_info":{"name":"run_command","parameters":{"CommandLine":"ls"},"output":"ok"}}
+{"event":"step_update","step_index":4,"state":"DONE","step_type":"tool","tool_info":{"name":"view_file","parameters":{"Path":"a.txt"},"output":"content"}}
+{"event":"step_update","idx":5,"step_type":"text","text":"done"}
+{"event":"result","result":{"conversation_id":"c1","status":"DONE","response":"done","usage":{"input_tokens":5,"output_tokens":2}}}`
+
+func TestMultipleToolPassthrough(t *testing.T) {
+	server := testBridgeWithToolMode(t, fakeAgy(t, fakeTwoTools), "", "passthrough")
+	resp := postJSON(t, server.URL+"/v1/chat/completions", `{
+		"model":"fake-model","messages":[{"role":"user","content":"run"}],"stream":true
+	}`, "")
+	body, _ := io.ReadAll(resp.Body)
+	text := string(body)
+	for _, want := range []string{`"index":0`, `"index":1`, `"name":"run_command"`, `"name":"view_file"`, `"finish_reason":"tool_calls"`} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("stream missing %q:\n%s", want, text)
+		}
+	}
+
+	resp = postJSON(t, server.URL+"/v1/messages", `{
+		"model":"fake-model","max_tokens":16,"messages":[{"role":"user","content":"run"}],"stream":true
+	}`, "")
+	body, _ = io.ReadAll(resp.Body)
+	if strings.Count(string(body), `"type":"tool_use"`) != 2 {
+		t.Fatalf("expected two tool_use blocks:\n%s", body)
+	}
+}
+
+func TestErrorClassificationNetwork(t *testing.T) {
+	bin := fakeAgyScript(t, `echo 'net/http: TLS handshake timeout' >&2
+exit 1`)
+	server := testBridge(t, bin, "")
+	resp := postJSON(t, server.URL+"/v1/chat/completions", `{"model":"fake-model","messages":[{"role":"user","content":"hi"}]}`, "")
+	if resp.StatusCode != http.StatusBadGateway {
+		t.Fatalf("status=%d", resp.StatusCode)
+	}
+	if got := resp.Header.Get("X-Agy-Error-Kind"); got != "network" {
+		t.Fatalf("kind=%q", got)
+	}
+}
+
+func TestErrorClassificationNoResult(t *testing.T) {
+	bin := fakeAgyScript(t, `exit 0`)
+	server := testBridge(t, bin, "")
+	resp := postJSON(t, server.URL+"/v1/chat/completions", `{"model":"fake-model","messages":[{"role":"user","content":"hi"}]}`, "")
+	if resp.StatusCode != http.StatusBadGateway {
+		t.Fatalf("status=%d", resp.StatusCode)
+	}
+	if got := resp.Header.Get("X-Agy-Error-Kind"); got != "no_result" {
+		t.Fatalf("kind=%q", got)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	if !strings.Contains(string(body), "agy_no_result") {
+		t.Fatalf("body=%s", body)
+	}
+}
+
+func TestErrorClassificationTimeout(t *testing.T) {
+	bin := fakeAgyScript(t, `sleep 2`)
+	server := testBridgeWithConfig(t, Config{Bin: bin, Timeout: 100 * time.Millisecond})
+	resp := postJSON(t, server.URL+"/v1/chat/completions", `{"model":"fake-model","messages":[{"role":"user","content":"hi"}]}`, "")
+	if resp.StatusCode != http.StatusGatewayTimeout {
+		t.Fatalf("status=%d", resp.StatusCode)
+	}
+	if got := resp.Header.Get("X-Agy-Error-Kind"); got != "timeout" {
+		t.Fatalf("kind=%q", got)
+	}
+}
+
+func TestErrorClassificationEligibility(t *testing.T) {
+	server := testBridge(t, fakeAgy(t, `{"event":"result","result":{"status":"ERROR","error":"Eligibility check failed: not available in your location"}}`), "")
+	resp := postJSON(t, server.URL+"/v1/chat/completions", `{"model":"fake-model","messages":[{"role":"user","content":"hi"}]}`, "")
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("status=%d", resp.StatusCode)
+	}
+	if got := resp.Header.Get("X-Agy-Error-Kind"); got != "eligibility" {
+		t.Fatalf("kind=%q", got)
+	}
+}
+
+func TestAuthXAPIKey(t *testing.T) {
+	server := testBridge(t, fakeAgy(t, fakeStream), "secret")
+	resp := postJSONWithHeaders(t, server.URL+"/v1/chat/completions", `{"model":"fake-model","messages":[{"role":"user","content":"hi"}]}`,
+		map[string]string{"X-Api-Key": "secret"})
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status=%d", resp.StatusCode)
+	}
+	resp = postJSONWithHeaders(t, server.URL+"/v1/chat/completions", `{"model":"fake-model","messages":[{"role":"user","content":"hi"}]}`,
+		map[string]string{"X-Api-Key": "wrong"})
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("wrong key status=%d", resp.StatusCode)
+	}
+}
+
+func TestInvalidRequests(t *testing.T) {
+	server := testBridge(t, fakeAgy(t, fakeStream), "")
+	resp := postJSON(t, server.URL+"/v1/chat/completions", `{`, "")
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("invalid json status=%d", resp.StatusCode)
+	}
+	resp = postJSON(t, server.URL+"/v1/chat/completions", `{"model":"fake-model","messages":[]}`, "")
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("empty messages status=%d", resp.StatusCode)
+	}
+	resp = postJSON(t, server.URL+"/v1/messages", `{"model":"fake-model","max_tokens":16,"messages":[]}`, "")
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("empty anthropic messages status=%d", resp.StatusCode)
+	}
+}
+
+func TestStaleConversationRetry(t *testing.T) {
+	argsFile := filepath.Join(t.TempDir(), "args.txt")
+	t.Setenv("FAKE_ARGS_FILE", argsFile)
+	bin := fakeAgyScript(t, `if [ -n "$FAKE_ARGS_FILE" ]; then printf '\n=== INVOCATION ===\n' >> "$FAKE_ARGS_FILE"; printf '%s\n' "$@" >> "$FAKE_ARGS_FILE"; fi
+case " $* " in
+  *" --conversation "*)
+    echo '{"event":"result","result":{"status":"ERROR","error":"conversation not found"}}'
+    exit 1
+    ;;
+esac
+cat <<'INNER'
+`+fakeStream+`
+INNER`)
+	server := testBridge(t, bin, "")
+	headers := map[string]string{"X-Session-Affinity": "stale-session"}
+
+	first := `{"model":"fake-model","messages":[{"role":"user","content":"first"}]}`
+	if resp := postJSONWithHeaders(t, server.URL+"/v1/chat/completions", first, headers); resp.StatusCode != http.StatusOK {
+		t.Fatalf("first status=%d", resp.StatusCode)
+	}
+	second := `{"model":"fake-model","messages":[{"role":"user","content":"first"},{"role":"assistant","content":"Hello world"},{"role":"user","content":"second"}]}`
+	resp := postJSONWithHeaders(t, server.URL+"/v1/chat/completions", second, headers)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("second status=%d", resp.StatusCode)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	if !strings.Contains(string(body), "Hello world") {
+		t.Fatalf("retry response=%s", body)
+	}
+	args, err := os.ReadFile(argsFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(args), "--conversation") {
+		t.Fatalf("first stale attempt should use conversation:\n%s", args)
+	}
+	if strings.Count(string(args), "=== INVOCATION ===") < 3 {
+		t.Fatalf("expected stale attempt + retry, got:\n%s", args)
+	}
+}
+
+func TestLongPromptUsesStdin(t *testing.T) {
+	argsFile := filepath.Join(t.TempDir(), "args.txt")
+	stdinFile := filepath.Join(t.TempDir(), "stdin.txt")
+	t.Setenv("FAKE_ARGS_FILE", argsFile)
+	t.Setenv("FAKE_STDIN_FILE", stdinFile)
+	bin := fakeAgyScript(t, `if [ -n "$FAKE_ARGS_FILE" ]; then printf '%s\n' "$@" > "$FAKE_ARGS_FILE"; fi
+if [ -n "$FAKE_STDIN_FILE" ]; then cat > "$FAKE_STDIN_FILE"; fi
+cat <<'INNER'
+`+fakeStream+`
+INNER`)
+	server := testBridge(t, bin, "")
+	long := strings.Repeat("x", 30000)
+	body := `{"model":"fake-model","messages":[{"role":"system","content":"` + long + `"},{"role":"user","content":"hi"}]}`
+	resp := postJSON(t, server.URL+"/v1/chat/completions", body, "")
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status=%d", resp.StatusCode)
+	}
+	args, _ := os.ReadFile(argsFile)
+	argLines := strings.Split(string(args), "\n")
+	hasP, hasInput := false, false
+	for _, line := range argLines {
+		if line == "-p" {
+			hasP = true
+		}
+		if line == "--input-format" {
+			hasInput = true
+		}
+	}
+	if hasP || !hasInput {
+		t.Fatalf("long prompt should use --input-format, not -p:\n%s", args)
+	}
+	stdin, _ := os.ReadFile(stdinFile)
+	if !strings.Contains(string(stdin), `"event":"user"`) || !strings.Contains(string(stdin), strings.Repeat("x", 100)) {
+		t.Fatalf("stdin payload missing prompt:\n%.200s", stdin)
 	}
 }
