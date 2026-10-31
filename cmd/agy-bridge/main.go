@@ -21,6 +21,7 @@ import (
 
 func main() {
 	var (
+		profile       = flag.String("profile", envString("AGY_BRIDGE_PROFILE", "model"), "bridge profile: model (transparent, no tools) or agent")
 		listen        = flag.String("listen", envString("AGY_BRIDGE_LISTEN", "127.0.0.1:8090"), "HTTP listen address")
 		agyBin        = flag.String("agy-bin", envString("AGY_BIN", "agy"), "path to the agy binary")
 		mode          = flag.String("mode", envString("AGY_BRIDGE_MODE", "plan"), "agy permission mode: plan, accept-edits or skip")
@@ -38,6 +39,9 @@ func main() {
 	)
 	flag.Parse()
 
+	if *profile != "model" && *profile != "agent" {
+		log.Fatalf("invalid -profile %q: want model or agent", *profile)
+	}
 	switch *mode {
 	case "plan", "accept-edits", "skip":
 	default:
@@ -47,6 +51,25 @@ func main() {
 	case "annotate", "passthrough", "none":
 	default:
 		log.Fatalf("invalid -tool-mode %q: want annotate, passthrough or none", *toolMode)
+	}
+	if *profile == "model" {
+		// 透明转发：下游编程 agent 拥有工具循环，bridge 只当无状态模型。
+		if *mode != "plan" {
+			log.Printf("profile=model forces -mode plan (ignoring %q)", *mode)
+		}
+		*mode = "plan"
+		if *toolMode != "none" {
+			log.Printf("profile=model forces -tool-mode none (ignoring %q)", *toolMode)
+		}
+		*toolMode = "none"
+		if *sessionFile != "" {
+			log.Printf("profile=model disables session bindings (ignoring -session-file)")
+		}
+		*sessionFile = ""
+		if *workDir != "" {
+			log.Printf("profile=model ignores -workdir and uses an isolated temp dir")
+		}
+		*workDir = ""
 	}
 	if *token == "" && !*allowInsecure && !isLoopbackListen(*listen) {
 		log.Fatalf("refusing to listen on %s without -token; bind 127.0.0.1 or pass -allow-insecure", *listen)
@@ -64,6 +87,7 @@ func main() {
 
 	modelList := splitModels(*models)
 	cfg := agybridge.Config{
+		Profile:      *profile,
 		Bin:          *agyBin,
 		WorkDir:      *workDir,
 		Mode:         *mode,
@@ -84,7 +108,7 @@ func main() {
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 
-	log.Printf("agy-bridge listening on %s (bin=%s mode=%s tool=%s workdir=%s models=%s)", *listen, *agyBin, *mode, *toolMode, *workDir, strings.Join(bridgeModels(cfg), ","))
+	log.Printf("agy-bridge listening on %s (profile=%s bin=%s mode=%s tool=%s workdir=%s models=%s)", *listen, *profile, *agyBin, *mode, *toolMode, *workDir, strings.Join(bridgeModels(cfg), ","))
 	runErr := make(chan error, 1)
 	go func() {
 		runErr <- server.ListenAndServe()

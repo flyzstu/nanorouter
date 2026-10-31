@@ -18,6 +18,12 @@ func (b *Bridge) handleOpenAI(w http.ResponseWriter, r *http.Request) {
 		writeAPIError(w, http.StatusBadRequest, "invalid JSON body: "+err.Error(), "invalid_request_error")
 		return
 	}
+	if b.transparent && (len(req.Tools) > 0 || req.ToolChoice != nil) {
+		writeAPIError(w, http.StatusBadRequest,
+			"agy-bridge model profile does not execute downstream tools; use a native model upstream or -profile agent",
+			"tools_not_supported")
+		return
+	}
 	prompt, err := formatOpenAIPrompt(req)
 	if err != nil {
 		writeAPIError(w, http.StatusBadRequest, err.Error(), "invalid_request_error")

@@ -13,6 +13,7 @@ import (
 
 // Config 是 sidecar 的运行时配置。
 type Config struct {
+	Profile      string
 	Bin          string
 	WorkDir      string
 	Mode         string
@@ -29,20 +30,38 @@ type Config struct {
 
 // Bridge 把 agy CLI 包装成 OpenAI / Anthropic 兼容的流式 HTTP 端点。
 type Bridge struct {
-	cfg      Config
-	runner   *Runner
-	sessions *SessionStore
+	cfg         Config
+	runner      *Runner
+	sessions    *SessionStore
+	transparent bool
 }
 
 func NewBridge(cfg Config) *Bridge {
+	profile := strings.TrimSpace(cfg.Profile)
+	if profile != "agent" {
+		profile = "model"
+	}
+	cfg.Profile = profile
+	transparent := profile == "model"
+	if transparent {
+		// 透明转发模式：下游 agent 拥有工具循环，bridge 只当无状态模型。
+		cfg.Mode = "plan"
+		cfg.ToolMode = "none"
+		cfg.SessionFile = ""
+	}
 	if cfg.Timeout <= 0 {
 		cfg.Timeout = 10 * time.Minute
 	}
 	if cfg.ToolMode == "" {
 		cfg.ToolMode = "annotate"
 	}
+	var sessions *SessionStore
+	if !transparent {
+		sessions = NewSessionStore(cfg.SessionFile, cfg.SessionTTL)
+	}
 	return &Bridge{
-		cfg: cfg,
+		cfg:         cfg,
+		transparent: transparent,
 		runner: &Runner{
 			Bin:     cfg.Bin,
 			WorkDir: cfg.WorkDir,
@@ -50,7 +69,7 @@ func NewBridge(cfg Config) *Bridge {
 			Effort:  cfg.Effort,
 			Timeout: cfg.Timeout,
 		},
-		sessions: NewSessionStore(cfg.SessionFile, cfg.SessionTTL),
+		sessions: sessions,
 	}
 }
 
@@ -136,6 +155,9 @@ func sessionKeyFromRequest(r *http.Request) string {
 }
 
 func (b *Bridge) runWithContinuity(ctx context.Context, r *http.Request, model, fullPrompt string, continuation func() (string, bool), onDelta func(string, string) error) (*streamCollector, error) {
+	if b.transparent {
+		return b.run(ctx, fullPrompt, model, "", onDelta)
+	}
 	sessionKey := sessionKeyFromRequest(r)
 	prompt := fullPrompt
 	conversationID := ""

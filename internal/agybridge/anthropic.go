@@ -12,6 +12,11 @@ func (b *Bridge) handleAnthropic(w http.ResponseWriter, r *http.Request) {
 		writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", "invalid JSON body: "+err.Error())
 		return
 	}
+	if b.transparent && (len(req.Tools) > 0 || req.ToolChoice != nil) {
+		writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error",
+			"agy-bridge model profile does not execute downstream tools; use a native model upstream or -profile agent")
+		return
+	}
 	prompt, err := formatAnthropicPrompt(req)
 	if err != nil {
 		writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", err.Error())

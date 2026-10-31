@@ -48,6 +48,9 @@ func testBridgeWithToolMode(t *testing.T, bin, token, toolMode string) *httptest
 
 func testBridgeWithConfig(t *testing.T, cfg Config) *httptest.Server {
 	t.Helper()
+	if cfg.Profile == "" {
+		cfg.Profile = "agent"
+	}
 	if cfg.WorkDir == "" {
 		cfg.WorkDir = t.TempDir()
 	}
@@ -581,5 +584,97 @@ INNER`)
 	stdin, _ := os.ReadFile(stdinFile)
 	if !strings.Contains(string(stdin), `"event":"user"`) || !strings.Contains(string(stdin), strings.Repeat("x", 100)) {
 		t.Fatalf("stdin payload missing prompt:\n%.200s", stdin)
+	}
+}
+
+func TestDefaultProfileIsModel(t *testing.T) {
+	bridge := NewBridge(Config{Bin: fakeAgy(t, fakeStream)})
+	if !bridge.transparent {
+		t.Fatal("default profile should be transparent model mode")
+	}
+	if bridge.cfg.Mode != "plan" || bridge.cfg.ToolMode != "none" {
+		t.Fatalf("model profile forces plan/none, got mode=%q tool=%q", bridge.cfg.Mode, bridge.cfg.ToolMode)
+	}
+}
+
+func TestModelProfileRejectsTools(t *testing.T) {
+	server := testBridgeWithConfig(t, Config{Bin: fakeAgy(t, fakeStream), Profile: "model"})
+
+	resp := postJSON(t, server.URL+"/v1/chat/completions", `{
+		"model":"fake-model",
+		"messages":[{"role":"user","content":"hi"}],
+		"tools":[{"type":"function","function":{"name":"lookup","parameters":{"type":"object"}}}]
+	}`, "")
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("openai tools status=%d", resp.StatusCode)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	if !strings.Contains(string(body), "tools_not_supported") {
+		t.Fatalf("openai body=%s", body)
+	}
+
+	resp = postJSON(t, server.URL+"/v1/chat/completions", `{
+		"model":"fake-model",
+		"messages":[{"role":"user","content":"hi"}],
+		"tool_choice":"auto"
+	}`, "")
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("tool_choice status=%d", resp.StatusCode)
+	}
+
+	resp = postJSON(t, server.URL+"/v1/messages", `{
+		"model":"fake-model",
+		"max_tokens":16,
+		"messages":[{"role":"user","content":"hi"}],
+		"tools":[{"name":"lookup","input_schema":{"type":"object"}}]
+	}`, "")
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("anthropic tools status=%d", resp.StatusCode)
+	}
+}
+
+func TestModelProfileIgnoresSession(t *testing.T) {
+	argsFile := filepath.Join(t.TempDir(), "args.txt")
+	t.Setenv("FAKE_ARGS_FILE", argsFile)
+	server := testBridgeWithConfig(t, Config{Bin: fakeAgy(t, fakeStream), Profile: "model"})
+	headers := map[string]string{"X-Session-Affinity": "s1"}
+
+	first := `{"model":"fake-model","messages":[{"role":"system","content":"be nice"},{"role":"user","content":"first"}]}`
+	if resp := postJSONWithHeaders(t, server.URL+"/v1/chat/completions", first, headers); resp.StatusCode != http.StatusOK {
+		t.Fatalf("first status=%d", resp.StatusCode)
+	}
+	second := `{"model":"fake-model","messages":[{"role":"system","content":"be nice"},{"role":"user","content":"first"},{"role":"assistant","content":"ok"},{"role":"user","content":"second"}]}`
+	if resp := postJSONWithHeaders(t, server.URL+"/v1/chat/completions", second, headers); resp.StatusCode != http.StatusOK {
+		t.Fatalf("second status=%d", resp.StatusCode)
+	}
+	args, _ := os.ReadFile(argsFile)
+	if strings.Contains(string(args), "--conversation") {
+		t.Fatalf("model profile must not use conversations:\n%s", args)
+	}
+	if !strings.Contains(string(args), "be nice") || !strings.Contains(string(args), "second") {
+		t.Fatalf("model profile should resend full transcript:\n%s", args)
+	}
+}
+
+func TestModelProfileForcesPlanAndNoToolOutput(t *testing.T) {
+	argsFile := filepath.Join(t.TempDir(), "args.txt")
+	t.Setenv("FAKE_ARGS_FILE", argsFile)
+	server := testBridgeWithConfig(t, Config{
+		Bin: fakeAgy(t, fakeToolStream), Profile: "model", Mode: "skip", ToolMode: "passthrough",
+	})
+	resp := postJSON(t, server.URL+"/v1/chat/completions", `{
+		"model":"fake-model","messages":[{"role":"user","content":"run"}],"stream":true
+	}`, "")
+	body, _ := io.ReadAll(resp.Body)
+	if strings.Contains(string(body), "tool_calls") {
+		t.Fatalf("model profile must not emit tool calls:\n%s", body)
+	}
+	args, _ := os.ReadFile(argsFile)
+	text := string(args)
+	if !strings.Contains(text, "--mode\nplan") && !strings.Contains(text, "--mode plan") {
+		t.Fatalf("expected --mode plan:\n%s", text)
+	}
+	if strings.Contains(text, "--dangerously-skip-permissions") {
+		t.Fatalf("model profile must not skip permissions:\n%s", text)
 	}
 }

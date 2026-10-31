@@ -48,6 +48,7 @@ type anthropicRequest struct {
 	MaxTokens   int                `json:"max_tokens"`
 	Temperature *float64           `json:"temperature"`
 	Tools       []any              `json:"tools"`
+	ToolChoice  any                `json:"tool_choice"`
 }
 
 type anthropicMessage struct {
