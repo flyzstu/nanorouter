@@ -37,6 +37,7 @@ func (b *Bridge) handleOpenAI(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	model := b.modelFor(req.Model)
+	b.logPrepared(r, "openai", model, req.Stream, len(req.Messages), len(req.Tools), promptTools)
 	if req.Stream {
 		b.streamOpenAI(w, r, req, prompt, model, promptTools)
 		return
@@ -59,6 +60,7 @@ func (b *Bridge) streamOpenAI(w http.ResponseWriter, r *http.Request, req openAI
 			return openAIContinuation(req)
 		}, nil)
 		if runErr != nil {
+			b.logRequestError(r, runErr)
 			writeOpenAIStreamError(sse, runErr)
 			return
 		}
@@ -72,6 +74,7 @@ func (b *Bridge) streamOpenAI(w http.ResponseWriter, r *http.Request, req openAI
 			_ = writeOpenAIChunk(sse, id, created, model, map[string]any{}, &stop)
 			writeOpenAIUsage(sse, id, created, model, collector.usage())
 			_ = sse.raw("data: [DONE]\n\n")
+			b.logResult(r, model, "tool_calls", collector.usage(), len(calls))
 			return
 		}
 		if text != "" {
@@ -81,6 +84,7 @@ func (b *Bridge) streamOpenAI(w http.ResponseWriter, r *http.Request, req openAI
 		_ = writeOpenAIChunk(sse, id, created, model, map[string]any{}, &stop)
 		writeOpenAIUsage(sse, id, created, model, collector.usage())
 		_ = sse.raw("data: [DONE]\n\n")
+		b.logResult(r, model, "stop", collector.usage(), 0)
 		return
 	}
 
@@ -100,6 +104,7 @@ func (b *Bridge) streamOpenAI(w http.ResponseWriter, r *http.Request, req openAI
 		return nil
 	})
 	if runErr != nil {
+		b.logRequestError(r, runErr)
 		writeOpenAIStreamError(sse, runErr)
 		return
 	}
@@ -116,6 +121,7 @@ func (b *Bridge) streamOpenAI(w http.ResponseWriter, r *http.Request, req openAI
 	_ = writeOpenAIChunk(sse, id, created, model, map[string]any{}, &stop)
 	writeOpenAIUsage(sse, id, created, model, collector.usage())
 	_ = sse.raw("data: [DONE]\n\n")
+	b.logResult(r, model, stop, collector.usage(), len(calls))
 }
 
 func (b *Bridge) completeOpenAI(w http.ResponseWriter, r *http.Request, req openAIRequest, prompt, model string, promptTools bool) {
@@ -123,11 +129,13 @@ func (b *Bridge) completeOpenAI(w http.ResponseWriter, r *http.Request, req open
 		return openAIContinuation(req)
 	}, nil)
 	if err != nil {
+		b.logRequestError(r, err)
 		writeClassifiedOpenAIError(w, err)
 		return
 	}
 	text := collector.textString()
 	if text == "" && collector.resultErr != "" {
+		b.logRequestError(r, errors.New(collector.resultErr))
 		writeAPIError(w, http.StatusBadGateway, collector.resultErr, "agy_error")
 		return
 	}
@@ -136,14 +144,17 @@ func (b *Bridge) completeOpenAI(w http.ResponseWriter, r *http.Request, req open
 		message["reasoning_content"] = thinking
 	}
 	finishReason := "stop"
+	toolCallCount := 0
 	if promptTools {
 		if calls, ok := parseToolCalls(text); ok {
 			finishReason = "tool_calls"
+			toolCallCount = len(calls)
 			message["content"] = ""
 			message["tool_calls"] = openAIToolCallObjects(calls)
 		}
 	} else if tools := collector.toolEvents(); len(tools) > 0 {
 		finishReason = "tool_calls"
+		toolCallCount = len(tools)
 		calls := make([]ToolCall, 0, len(tools))
 		for _, tool := range tools {
 			calls = append(calls, ToolCall{Name: tool.Name, Arguments: tool.Input})
@@ -162,6 +173,7 @@ func (b *Bridge) completeOpenAI(w http.ResponseWriter, r *http.Request, req open
 		}},
 		"usage": openAIUsage(collector.usage()),
 	})
+	b.logResult(r, model, finishReason, collector.usage(), toolCallCount)
 }
 
 func (b *Bridge) run(ctx context.Context, prompt, model, conversationID string, onDelta func(text, thinking string) error) (*streamCollector, error) {

@@ -7,7 +7,6 @@ import (
 	"context"
 	"errors"
 	"flag"
-	"log"
 	"net"
 	"net/http"
 	"os"
@@ -17,7 +16,22 @@ import (
 	"time"
 
 	"github.com/nanorouter/nanorouter/internal/agybridge"
+	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
 )
+
+var logger = newLogger()
+
+func newLogger() *zap.Logger {
+	encoderCfg := zap.NewProductionEncoderConfig()
+	encoderCfg.EncodeTime = zapcore.ISO8601TimeEncoder
+	encoderCfg.EncodeLevel = zapcore.CapitalLevelEncoder
+	encoderCfg.EncodeDuration = zapcore.StringDurationEncoder
+	return zap.New(
+		zapcore.NewCore(zapcore.NewConsoleEncoder(encoderCfg), zapcore.Lock(os.Stderr), zap.InfoLevel),
+		zap.AddCaller(),
+	)
+}
 
 func main() {
 	var (
@@ -40,55 +54,57 @@ func main() {
 	)
 	flag.Parse()
 
+	defer func() { _ = logger.Sync() }()
+
 	if *profile != "model" && *profile != "agent" {
-		log.Fatalf("invalid -profile %q: want model or agent", *profile)
+		logger.Fatal("invalid -profile", zap.String("profile", *profile), zap.String("want", "model or agent"))
 	}
 	switch *mode {
 	case "plan", "accept-edits", "skip":
 	default:
-		log.Fatalf("invalid -mode %q: want plan, accept-edits or skip", *mode)
+		logger.Fatal("invalid -mode", zap.String("mode", *mode), zap.String("want", "plan, accept-edits or skip"))
 	}
 	switch *toolMode {
 	case "annotate", "passthrough", "none":
 	default:
-		log.Fatalf("invalid -tool-mode %q: want annotate, passthrough or none", *toolMode)
+		logger.Fatal("invalid -tool-mode", zap.String("tool_mode", *toolMode), zap.String("want", "annotate, passthrough or none"))
 	}
 	switch *toolBridge {
 	case "prompt", "off":
 	default:
-		log.Fatalf("invalid -tool-bridge %q: want prompt or off", *toolBridge)
+		logger.Fatal("invalid -tool-bridge", zap.String("tool_bridge", *toolBridge), zap.String("want", "prompt or off"))
 	}
 	if *profile == "model" {
 		// 透明转发：下游编程 agent 拥有工具循环，bridge 只当无状态模型。
 		if *mode != "plan" {
-			log.Printf("profile=model forces -mode plan (ignoring %q)", *mode)
+			logger.Info("profile=model forces -mode plan", zap.String("ignored", *mode))
 		}
 		*mode = "plan"
 		if *toolMode != "none" {
-			log.Printf("profile=model forces -tool-mode none (ignoring %q)", *toolMode)
+			logger.Info("profile=model forces -tool-mode none", zap.String("ignored", *toolMode))
 		}
 		*toolMode = "none"
 		if *sessionFile != "" {
-			log.Printf("profile=model disables session bindings (ignoring -session-file)")
+			logger.Info("profile=model disables session bindings", zap.String("ignored", "-session-file"))
 		}
 		*sessionFile = ""
 		if *workDir != "" {
-			log.Printf("profile=model ignores -workdir and uses an isolated temp dir")
+			logger.Info("profile=model ignores -workdir", zap.String("ignored", *workDir))
 		}
 		*workDir = ""
 	}
 	if *token == "" && !*allowInsecure && !isLoopbackListen(*listen) {
-		log.Fatalf("refusing to listen on %s without -token; bind 127.0.0.1 or pass -allow-insecure", *listen)
+		logger.Fatal("refusing to listen without a token", zap.String("listen", *listen))
 	}
 	if *workDir == "" {
 		dir, err := os.MkdirTemp("", "agy-bridge-*")
 		if err != nil {
-			log.Fatalf("create temp workdir: %v", err)
+			logger.Fatal("create temp workdir failed", zap.Error(err))
 		}
 		defer func() { _ = os.RemoveAll(dir) }()
 		*workDir = dir
 	} else if info, err := os.Stat(*workDir); err != nil || !info.IsDir() {
-		log.Fatalf("workdir %q is not a directory", *workDir)
+		logger.Fatal("workdir is not a directory", zap.String("workdir", *workDir))
 	}
 
 	modelList := splitModels(*models)
@@ -107,6 +123,7 @@ func main() {
 		ToolBridge:   *toolBridge,
 		SessionFile:  *sessionFile,
 		SessionTTL:   *sessionTTL,
+		Logger:       logger,
 	}
 	bridge := agybridge.NewBridge(cfg)
 	server := &http.Server{
@@ -115,7 +132,16 @@ func main() {
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 
-	log.Printf("agy-bridge listening on %s (profile=%s bin=%s mode=%s tool=%s bridge=%s workdir=%s models=%s)", *listen, *profile, *agyBin, *mode, *toolMode, *toolBridge, *workDir, strings.Join(bridgeModels(cfg), ","))
+	logger.Info("agy-bridge listening",
+		zap.String("listen", *listen),
+		zap.String("profile", *profile),
+		zap.String("bin", *agyBin),
+		zap.String("mode", *mode),
+		zap.String("tool_mode", *toolMode),
+		zap.String("tool_bridge", *toolBridge),
+		zap.String("workdir", *workDir),
+		zap.Strings("models", bridgeModels(cfg)),
+	)
 	runErr := make(chan error, 1)
 	go func() {
 		runErr <- server.ListenAndServe()
@@ -126,13 +152,13 @@ func main() {
 	select {
 	case err := <-runErr:
 		if !errors.Is(err, http.ErrServerClosed) {
-			log.Fatalf("server stopped: %v", err)
+			logger.Fatal("server stopped", zap.Error(err))
 		}
 	case <-signals.Done():
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 		if err := server.Shutdown(ctx); err != nil {
-			log.Printf("shutdown: %v", err)
+			logger.Error("shutdown failed", zap.Error(err))
 		}
 	}
 }
@@ -172,7 +198,7 @@ func envDuration(name string, fallback time.Duration) time.Duration {
 	}
 	parsed, err := time.ParseDuration(value)
 	if err != nil {
-		log.Fatalf("invalid %s: %v", name, err)
+		logger.Fatal("invalid duration", zap.String("env", name), zap.Error(err))
 	}
 	return parsed
 }

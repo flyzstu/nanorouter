@@ -13,6 +13,7 @@ import (
 	"time"
 
 	json "github.com/goccy/go-json"
+	"go.uber.org/zap"
 )
 
 // ErrNoResult 表示 agy 正常退出但没有给出 result 信封。
@@ -38,6 +39,7 @@ type Runner struct {
 	Effort   string
 	Timeout  time.Duration
 	ExtraEnv []string
+	Logger   *zap.Logger
 }
 
 // RunRequest 是一次 agy 调用需要的输入。
@@ -48,7 +50,7 @@ type RunRequest struct {
 }
 
 // Run 启动 agy 并把解析出的事件逐个交给 onEvent。
-func (r *Runner) Run(ctx context.Context, req RunRequest, onEvent func(Event) error) error {
+func (r *Runner) Run(ctx context.Context, req RunRequest, onEvent func(Event) error) (err error) {
 	if strings.TrimSpace(r.Bin) == "" {
 		return errors.New("agy binary is not configured")
 	}
@@ -60,6 +62,19 @@ func (r *Runner) Run(ctx context.Context, req RunRequest, onEvent func(Event) er
 	if minutes < 1 {
 		minutes = 1
 	}
+	started := time.Now()
+	logger := r.Logger
+	if logger == nil {
+		logger = zap.NewNop()
+	}
+	logger.Info("agy_start",
+		zap.String("request_id", requestIDFrom(ctx)),
+		zap.String("model", req.Model),
+		zap.String("mode", r.Mode),
+		zap.Int("prompt_bytes", len(req.Prompt)),
+		zap.Bool("conversation", req.ConversationID != ""),
+		zap.Duration("timeout", timeout),
+	)
 	args := []string{
 		"--output-format", "stream-json",
 		"--print-timeout", fmt.Sprintf("%dm", minutes),
@@ -117,6 +132,34 @@ func (r *Runner) Run(ctx context.Context, req RunRequest, onEvent func(Event) er
 
 	parser := &StreamParser{}
 	var result *Event
+	defer func() {
+		exitCode := 0
+		if err != nil {
+			exitCode = -1
+			var exitErr *exec.ExitError
+			if errors.As(err, &exitErr) {
+				exitCode = exitErr.ExitCode()
+			}
+		}
+		fields := []zap.Field{
+			zap.String("request_id", requestIDFrom(ctx)),
+			zap.Duration("duration", time.Since(started)),
+			zap.Int("lines", parser.Lines),
+			zap.Int("garbage", parser.Garbage),
+			zap.Bool("auth_failure", parser.AuthFailure),
+			zap.Bool("has_result", result != nil),
+			zap.Int("exit_code", exitCode),
+			zap.Error(err),
+		}
+		if result != nil {
+			fields = append(fields, zap.Bool("result_ok", result.OK), zap.Int("response_bytes", len(result.Response)))
+		}
+		if err != nil {
+			logger.Warn("agy_finish", fields...)
+		} else {
+			logger.Info("agy_finish", fields...)
+		}
+	}()
 	scanErr := error(nil)
 	scanner := bufio.NewScanner(stdout)
 	scanner.Buffer(make([]byte, 0, 64<<10), maxStreamLineBytes)

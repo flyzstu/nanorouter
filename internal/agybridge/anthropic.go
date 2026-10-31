@@ -30,6 +30,7 @@ func (b *Bridge) handleAnthropic(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	model := b.modelFor(req.Model)
+	b.logPrepared(r, "anthropic", model, req.Stream, len(req.Messages), len(req.Tools), promptTools)
 	if req.Stream {
 		b.streamAnthropic(w, r, req, prompt, model, promptTools)
 		return
@@ -58,6 +59,7 @@ func (b *Bridge) streamAnthropic(w http.ResponseWriter, r *http.Request, req ant
 			return anthropicContinuation(req)
 		}, nil)
 		if runErr != nil {
+			b.logRequestError(r, runErr)
 			writeAnthropicStreamError(sse, runErr)
 			return
 		}
@@ -65,6 +67,7 @@ func (b *Bridge) streamAnthropic(w http.ResponseWriter, r *http.Request, req ant
 		if calls, ok := parseToolCalls(text); ok {
 			writeAnthropicToolUseBlocks(sse, calls, 0)
 			writeAnthropicStop(sse, "tool_use", collector.usage())
+			b.logResult(r, model, "tool_use", collector.usage(), len(calls))
 			return
 		}
 		_ = sse.event("content_block_start", map[string]any{
@@ -79,6 +82,7 @@ func (b *Bridge) streamAnthropic(w http.ResponseWriter, r *http.Request, req ant
 		}
 		_ = sse.event("content_block_stop", map[string]any{"type": "content_block_stop", "index": 0})
 		writeAnthropicStop(sse, "end_turn", collector.usage())
+		b.logResult(r, model, "end_turn", collector.usage(), 0)
 		return
 	}
 
@@ -98,10 +102,12 @@ func (b *Bridge) streamAnthropic(w http.ResponseWriter, r *http.Request, req ant
 		})
 	})
 	if runErr != nil {
+		b.logRequestError(r, runErr)
 		writeAnthropicStreamError(sse, runErr)
 		return
 	}
 	if collector.textString() == "" && collector.resultErr != "" {
+		b.logRequestError(r, errors.New(collector.resultErr))
 		_ = sse.event("error", map[string]any{
 			"type":  "error",
 			"error": map[string]any{"type": "api_error", "message": collector.resultErr},
@@ -120,6 +126,7 @@ func (b *Bridge) streamAnthropic(w http.ResponseWriter, r *http.Request, req ant
 		stopReason = "tool_use"
 	}
 	writeAnthropicStop(sse, stopReason, collector.usage())
+	b.logResult(r, model, stopReason, collector.usage(), len(calls))
 }
 
 func (b *Bridge) completeAnthropic(w http.ResponseWriter, r *http.Request, req anthropicRequest, prompt, model string, promptTools bool) {
@@ -127,19 +134,23 @@ func (b *Bridge) completeAnthropic(w http.ResponseWriter, r *http.Request, req a
 		return anthropicContinuation(req)
 	}, nil)
 	if err != nil {
+		b.logRequestError(r, err)
 		writeClassifiedAnthropicError(w, err)
 		return
 	}
 	text := collector.textString()
 	if text == "" && collector.resultErr != "" {
+		b.logRequestError(r, errors.New(collector.resultErr))
 		writeAnthropicError(w, http.StatusBadGateway, "api_error", collector.resultErr)
 		return
 	}
 	content := []any{}
 	stopReason := "end_turn"
+	toolCallCount := 0
 	if promptTools {
 		if calls, ok := parseToolCalls(text); ok {
 			stopReason = "tool_use"
+			toolCallCount = len(calls)
 			content = append(content, anthropicToolUseObjects(calls)...)
 		} else {
 			content = append(content, map[string]any{"type": "text", "text": text})
@@ -148,6 +159,7 @@ func (b *Bridge) completeAnthropic(w http.ResponseWriter, r *http.Request, req a
 		content = append(content, map[string]any{"type": "text", "text": text})
 		if tools := collector.toolEvents(); len(tools) > 0 {
 			stopReason = "tool_use"
+			toolCallCount = len(tools)
 			calls := make([]ToolCall, 0, len(tools))
 			for _, tool := range tools {
 				calls = append(calls, ToolCall{Name: tool.Name, Arguments: tool.Input})
@@ -169,6 +181,7 @@ func (b *Bridge) completeAnthropic(w http.ResponseWriter, r *http.Request, req a
 			"output_tokens": usage.OutputTokens,
 		},
 	})
+	b.logResult(r, model, stopReason, usage, toolCallCount)
 }
 
 func writeAnthropicToolUseBlocks(sse *sseWriter, calls []ToolCall, startIndex int) {

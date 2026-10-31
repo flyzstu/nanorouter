@@ -74,6 +74,26 @@ model profile 的 tools 默认走 prompt 协议（`-tool-bridge prompt`）；完
 | `-session-ttl` | `AGY_BRIDGE_SESSION_TTL` | `24h` | 仅 agent；会话绑定有效期 |
 | `-allow-insecure` | `AGY_BRIDGE_ALLOW_INSECURE` | `false` | 允许非回环监听且无 token |
 
+## 日志
+
+bridge 输出结构化文本日志到 stderr，每个请求带同一个 `request_id`（同时写入响应头 `X-Request-ID`），方便把 HTTP 请求和 agy 子进程对应起来：
+
+```text
+INFO request_prepared {"request_id":"req_...","protocol":"openai","model":"...","stream":true,"messages":3,"tools":5,"prompt_tools":true,"session":false,"request_bytes":1234}
+INFO agy_start        {"request_id":"req_...","model":"...","mode":"plan","prompt_bytes":4567,"conversation":false,"timeout":"5m0s"}
+INFO agy_finish       {"request_id":"req_...","duration":"11.08s","lines":5,"garbage":0,"auth_failure":false,"has_result":true,"exit_code":0,"result_ok":true,"response_bytes":9}
+INFO request_result   {"request_id":"req_...","model":"...","outcome":"tool_calls","tool_calls":1,"prompt_tokens":12948,"completion_tokens":5,"reasoning_tokens":0,"total_tokens":12953}
+INFO request_finished {"request_id":"req_...","method":"POST","path":"/v1/chat/completions","status":200,"response_bytes":300,"duration":"11.08s","remote":"127.0.0.1:8338"}
+```
+
+- `request_prepared`：请求协议、模型、流式与否、消息数、工具数、是否走 prompt 工具协议、是否带会话、请求体字节数。
+- `agy_start` / `agy_finish`：agy 子进程的模型、mode、prompt 字节数、耗时、NDJSON 行数、无法解析的行数、认证失败、退出码、result 是否成功和响应字节数。
+- `request_result`：最终 outcome（`stop` / `tool_calls` / `tool_use` / `end_turn`）、工具调用数、usage。
+- `request_finished`：HTTP 状态、响应字节数、总耗时、客户端地址。
+- 出错时额外输出 `request_error`，带 `error_kind` / `error_code` / 单行错误信息。
+
+日志不会记录 prompt、模型回复、工具参数、工具输出、Authorization 或 API key；只记录长度、数量和状态。`/healthz` 不记请求日志，避免探活刷屏。
+
 ## nanorouter 接入
 
 ### 透明转发（推荐给编程 agent 的纯文本场景）

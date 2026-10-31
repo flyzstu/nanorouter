@@ -10,6 +10,9 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"go.uber.org/zap"
+	"go.uber.org/zap/zaptest/observer"
 )
 
 const fakeStream = `{"event":"init","conversation_id":"c1","model":"fake-model"}
@@ -750,5 +753,42 @@ func TestModelProfilePromptToolsNormalText(t *testing.T) {
 	}
 	if strings.Contains(text, "tool_calls") {
 		t.Fatalf("unexpected tool call:\n%s", text)
+	}
+}
+
+func TestRequestLevelLogs(t *testing.T) {
+	core, logs := observer.New(zap.InfoLevel)
+	bridge := NewBridge(Config{
+		Bin:          fakeAgy(t, fakeStream),
+		Profile:      "model",
+		WorkDir:      t.TempDir(),
+		Models:       []string{"fake-model"},
+		DefaultModel: "fake-model",
+		Mode:         "plan",
+		ToolMode:     "none",
+		ToolBridge:   "prompt",
+		Timeout:      10 * time.Second,
+		Logger:       zap.New(core),
+	})
+	server := httptest.NewServer(bridge.Handler())
+	t.Cleanup(server.Close)
+
+	resp := postJSON(t, server.URL+"/v1/chat/completions", `{"model":"fake-model","messages":[{"role":"user","content":"secret prompt"}]}`, "")
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status=%d", resp.StatusCode)
+	}
+	seen := map[string]bool{}
+	for _, entry := range logs.All() {
+		seen[entry.Message] = true
+		for _, field := range entry.Context {
+			if strings.Contains(field.String, "secret prompt") {
+				t.Fatalf("log leaked prompt content in %s: %s", entry.Message, field.String)
+			}
+		}
+	}
+	for _, message := range []string{"request_prepared", "agy_start", "agy_finish", "request_result", "request_finished"} {
+		if !seen[message] {
+			t.Fatalf("missing log %q; got %v", message, logs.All())
+		}
 	}
 }
