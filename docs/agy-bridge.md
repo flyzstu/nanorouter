@@ -57,6 +57,7 @@ model profile 的 tools 默认走 prompt 协议（`-tool-bridge prompt`）；完
 
 | Flag | 环境变量 | 默认值 | 说明 |
 | --- | --- | --- | --- |
+| `-version` | 无 | `false` | 打印版本号并退出 |
 | `-profile` | `AGY_BRIDGE_PROFILE` | `model` | `model`（透明转发，无 tools）或 `agent`（agy 自己执行工具） |
 | `-listen` | `AGY_BRIDGE_LISTEN` | `127.0.0.1:8090` | HTTP 监听地址 |
 | `-agy-bin` | `AGY_BIN` | `agy` | agy 可执行文件 |

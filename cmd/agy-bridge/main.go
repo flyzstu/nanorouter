@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"flag"
+	"fmt"
 	"net"
 	"net/http"
 	"os"
@@ -20,7 +21,10 @@ import (
 	"go.uber.org/zap/zapcore"
 )
 
-var logger = newLogger()
+var (
+	version = "dev"
+	logger  = newLogger()
+)
 
 func newLogger() *zap.Logger {
 	encoderCfg := zap.NewProductionEncoderConfig()
@@ -35,6 +39,7 @@ func newLogger() *zap.Logger {
 
 func main() {
 	var (
+		showVersion   = flag.Bool("version", false, "print version and exit")
 		profile       = flag.String("profile", envString("AGY_BRIDGE_PROFILE", "model"), "bridge profile: model (transparent, no tools) or agent")
 		listen        = flag.String("listen", envString("AGY_BRIDGE_LISTEN", "127.0.0.1:8090"), "HTTP listen address")
 		agyBin        = flag.String("agy-bin", envString("AGY_BIN", "agy"), "path to the agy binary")
@@ -53,6 +58,11 @@ func main() {
 		allowInsecure = flag.Bool("allow-insecure", envBool("AGY_BRIDGE_ALLOW_INSECURE", false), "allow non-loopback listen without a token")
 	)
 	flag.Parse()
+
+	if *showVersion {
+		fmt.Printf("agy-bridge version %s\n", version)
+		return
+	}
 
 	defer func() { _ = logger.Sync() }()
 
