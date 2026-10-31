@@ -598,7 +598,7 @@ func TestDefaultProfileIsModel(t *testing.T) {
 }
 
 func TestModelProfileRejectsTools(t *testing.T) {
-	server := testBridgeWithConfig(t, Config{Bin: fakeAgy(t, fakeStream), Profile: "model"})
+	server := testBridgeWithConfig(t, Config{Bin: fakeAgy(t, fakeStream), Profile: "model", ToolBridge: "off"})
 
 	resp := postJSON(t, server.URL+"/v1/chat/completions", `{
 		"model":"fake-model",
@@ -676,5 +676,79 @@ func TestModelProfileForcesPlanAndNoToolOutput(t *testing.T) {
 	}
 	if strings.Contains(text, "--dangerously-skip-permissions") {
 		t.Fatalf("model profile must not skip permissions:\n%s", text)
+	}
+}
+
+const fakeToolCall = `{"event":"init","conversation_id":"c1","model":"fake-model"}
+{"event":"step_update","idx":1,"step_type":"text","text":"{\"tool_call\":{\"name\":\"lookup\",\"arguments\":{\"id\":1}}}"}
+{"event":"result","result":{"conversation_id":"c1","status":"DONE","response":"{\"tool_call\":{\"name\":\"lookup\",\"arguments\":{\"id\":1}}}","usage":{"input_tokens":5,"output_tokens":2}}}`
+
+func TestModelProfilePromptToolCallOpenAI(t *testing.T) {
+	server := testBridgeWithConfig(t, Config{Bin: fakeAgy(t, fakeToolCall), Profile: "model", ToolBridge: "prompt"})
+	body := `{"model":"fake-model","messages":[{"role":"user","content":"lookup 1"}],"tools":[{"type":"function","function":{"name":"lookup","description":"look up","parameters":{"type":"object","properties":{"id":{"type":"integer"}}}}}]}`
+	resp := postJSON(t, server.URL+"/v1/chat/completions", body, "")
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status=%d", resp.StatusCode)
+	}
+	raw, _ := io.ReadAll(resp.Body)
+	text := string(raw)
+	for _, want := range []string{`"tool_calls"`, `"name":"lookup"`, `"finish_reason":"tool_calls"`, `"id"`} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("response missing %q:\n%s", want, text)
+		}
+	}
+	if strings.Contains(text, `"content":"{\"tool_call\"`) {
+		t.Fatalf("tool call JSON leaked as content:\n%s", text)
+	}
+
+	resp = postJSON(t, server.URL+"/v1/chat/completions", body[:len(body)-1]+`,"stream":true}`, "")
+	raw, _ = io.ReadAll(resp.Body)
+	stream := string(raw)
+	for _, want := range []string{`"tool_calls"`, `"finish_reason":"tool_calls"`, `data: [DONE]`} {
+		if !strings.Contains(stream, want) {
+			t.Fatalf("stream missing %q:\n%s", want, stream)
+		}
+	}
+}
+
+func TestModelProfilePromptToolCallAnthropic(t *testing.T) {
+	server := testBridgeWithConfig(t, Config{Bin: fakeAgy(t, fakeToolCall), Profile: "model", ToolBridge: "prompt"})
+	body := `{"model":"fake-model","max_tokens":16,"messages":[{"role":"user","content":"lookup 1"}],"tools":[{"name":"lookup","description":"look up","input_schema":{"type":"object","properties":{"id":{"type":"integer"}}}}]}`
+	resp := postJSON(t, server.URL+"/v1/messages", body, "")
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status=%d", resp.StatusCode)
+	}
+	raw, _ := io.ReadAll(resp.Body)
+	text := string(raw)
+	for _, want := range []string{`"type":"tool_use"`, `"name":"lookup"`, `"stop_reason":"tool_use"`} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("response missing %q:\n%s", want, text)
+		}
+	}
+
+	resp = postJSON(t, server.URL+"/v1/messages", body[:len(body)-1]+`,"stream":true}`, "")
+	raw, _ = io.ReadAll(resp.Body)
+	stream := string(raw)
+	for _, want := range []string{`"type":"tool_use"`, `"input_json_delta"`, `"stop_reason":"tool_use"`} {
+		if !strings.Contains(stream, want) {
+			t.Fatalf("stream missing %q:\n%s", want, stream)
+		}
+	}
+}
+
+func TestModelProfilePromptToolsNormalText(t *testing.T) {
+	server := testBridgeWithConfig(t, Config{Bin: fakeAgy(t, fakeStream), Profile: "model", ToolBridge: "prompt"})
+	resp := postJSON(t, server.URL+"/v1/chat/completions", `{
+		"model":"fake-model",
+		"messages":[{"role":"user","content":"hi"}],
+		"tools":[{"type":"function","function":{"name":"lookup","parameters":{"type":"object"}}}]
+	}`, "")
+	raw, _ := io.ReadAll(resp.Body)
+	text := string(raw)
+	if !strings.Contains(text, `"content":"Hello world"`) || !strings.Contains(text, `"finish_reason":"stop"`) {
+		t.Fatalf("normal text response=%s", text)
+	}
+	if strings.Contains(text, "tool_calls") {
+		t.Fatalf("unexpected tool call:\n%s", text)
 	}
 }

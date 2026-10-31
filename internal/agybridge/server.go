@@ -24,6 +24,7 @@ type Config struct {
 	DefaultModel string
 	EmitThinking bool
 	ToolMode     string
+	ToolBridge   string
 	SessionFile  string
 	SessionTTL   time.Duration
 }
@@ -48,6 +49,11 @@ func NewBridge(cfg Config) *Bridge {
 		cfg.Mode = "plan"
 		cfg.ToolMode = "none"
 		cfg.SessionFile = ""
+		if cfg.ToolBridge != "off" {
+			cfg.ToolBridge = "prompt"
+		}
+	} else {
+		cfg.ToolBridge = "off"
 	}
 	if cfg.Timeout <= 0 {
 		cfg.Timeout = 10 * time.Minute

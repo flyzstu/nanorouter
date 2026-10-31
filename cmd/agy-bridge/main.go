@@ -32,7 +32,8 @@ func main() {
 		models        = flag.String("models", envString("AGY_BRIDGE_MODELS", ""), "comma-separated model IDs exposed by /v1/models")
 		defaultModel  = flag.String("default-model", envString("AGY_BRIDGE_DEFAULT_MODEL", ""), "model used when the request omits model")
 		emitThinking  = flag.Bool("emit-thinking", envBool("AGY_BRIDGE_EMIT_THINKING", true), "stream agy thinking as reasoning_content (OpenAI only)")
-		toolMode      = flag.String("tool-mode", envString("AGY_BRIDGE_TOOL_MODE", "annotate"), "tool activity mapping: annotate, passthrough or none")
+		toolMode      = flag.String("tool-mode", envString("AGY_BRIDGE_TOOL_MODE", "annotate"), "agent tool activity mapping: annotate, passthrough or none")
+		toolBridge    = flag.String("tool-bridge", envString("AGY_BRIDGE_TOOL_BRIDGE", "prompt"), "model profile tool handling: prompt (inject schemas + parse tool_call JSON) or off")
 		sessionFile   = flag.String("session-file", envString("AGY_BRIDGE_SESSION_FILE", ""), "optional JSON file persisting session -> agy conversation bindings")
 		sessionTTL    = flag.Duration("session-ttl", envDuration("AGY_BRIDGE_SESSION_TTL", 24*time.Hour), "session binding TTL")
 		allowInsecure = flag.Bool("allow-insecure", envBool("AGY_BRIDGE_ALLOW_INSECURE", false), "allow non-loopback listen without a token")
@@ -51,6 +52,11 @@ func main() {
 	case "annotate", "passthrough", "none":
 	default:
 		log.Fatalf("invalid -tool-mode %q: want annotate, passthrough or none", *toolMode)
+	}
+	switch *toolBridge {
+	case "prompt", "off":
+	default:
+		log.Fatalf("invalid -tool-bridge %q: want prompt or off", *toolBridge)
 	}
 	if *profile == "model" {
 		// 透明转发：下游编程 agent 拥有工具循环，bridge 只当无状态模型。
@@ -98,6 +104,7 @@ func main() {
 		DefaultModel: *defaultModel,
 		EmitThinking: *emitThinking,
 		ToolMode:     *toolMode,
+		ToolBridge:   *toolBridge,
 		SessionFile:  *sessionFile,
 		SessionTTL:   *sessionTTL,
 	}
@@ -108,7 +115,7 @@ func main() {
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 
-	log.Printf("agy-bridge listening on %s (profile=%s bin=%s mode=%s tool=%s workdir=%s models=%s)", *listen, *profile, *agyBin, *mode, *toolMode, *workDir, strings.Join(bridgeModels(cfg), ","))
+	log.Printf("agy-bridge listening on %s (profile=%s bin=%s mode=%s tool=%s bridge=%s workdir=%s models=%s)", *listen, *profile, *agyBin, *mode, *toolMode, *toolBridge, *workDir, strings.Join(bridgeModels(cfg), ","))
 	runErr := make(chan error, 1)
 	go func() {
 		runErr <- server.ListenAndServe()

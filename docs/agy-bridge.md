@@ -10,7 +10,7 @@
 
 bridge 有两种 profile：
 
-- **`model`（默认，透明转发）**：下游编程 agent 拥有工具循环，bridge 只当无状态模型。强制 `plan`、不执行工具、不使用会话绑定；请求带 `tools` / `tool_choice` 直接 400。
+- **`model`（默认，透明转发）**：下游编程 agent 拥有工具循环，bridge 只当无状态模型。强制 `plan`、不执行工具、不使用会话绑定。请求带 `tools` 时，默认用 prompt 工具协议把工具 schema 注入 prompt，并把 agy 输出的 `tool_call` JSON 转成标准 `tool_calls`；`-tool-bridge off` 则直接 400。
 - **`agent`**：让 agy 自己当 agent，保留会话连续性、工具活动映射和项目 workdir。
 
 ## 前置条件
@@ -29,6 +29,7 @@ go build -o bin/agy-bridge ./cmd/agy-bridge
   -profile model \
   -listen 127.0.0.1:8090 \
   -agy-bin agy \
+  -tool-bridge prompt \
   -models gemini-3.8-flash,claude-sonnet-4-6 \
   -default-model gemini-3.8-flash \
   -token "$AGY_BRIDGE_TOKEN"
@@ -50,6 +51,8 @@ go build -o bin/agy-bridge ./cmd/agy-bridge
 
 `-profile model` 会强制 `-mode plan`、`-tool-mode none`、忽略 `-session-file` 和 `-workdir`（使用隔离临时目录）。`-profile agent` 才使用这些参数。
 
+model profile 的 tools 默认走 prompt 协议（`-tool-bridge prompt`）；完全不想暴露 tools 时用 `-tool-bridge off`。
+
 ## 配置
 
 | Flag | 环境变量 | 默认值 | 说明 |
@@ -66,6 +69,7 @@ go build -o bin/agy-bridge ./cmd/agy-bridge
 | `-default-model` | `AGY_BRIDGE_DEFAULT_MODEL` | 空 | 请求未带 model 时使用 |
 | `-emit-thinking` | `AGY_BRIDGE_EMIT_THINKING` | `true` | OpenAI 流里输出 `reasoning_content` |
 | `-tool-mode` | `AGY_BRIDGE_TOOL_MODE` | `annotate` | 仅 agent：`annotate` / `passthrough` / `none`；model 强制 `none` |
+| `-tool-bridge` | `AGY_BRIDGE_TOOL_BRIDGE` | `prompt` | 仅 model：`prompt`（注入 schema、解析 tool_call JSON）或 `off`（带 tools 直接 400） |
 | `-session-file` | `AGY_BRIDGE_SESSION_FILE` | 空 | 仅 agent；model 不使用会话绑定 |
 | `-session-ttl` | `AGY_BRIDGE_SESSION_TTL` | `24h` | 仅 agent；会话绑定有效期 |
 | `-allow-insecure` | `AGY_BRIDGE_ALLOW_INSECURE` | `false` | 允许非回环监听且无 token |
@@ -86,7 +90,9 @@ routes:
         attempt_timeout: 10m
 ```
 
-这个 profile 下，请求带 `tools` / `tool_choice` 会返回 400 `tools_not_supported`。所以编程 agent 的带工具请求不要路由到这里；要么走原生模型上游，要么使用 `-profile agent` 并接受 agy 自己执行工具。
+这个 profile 下，带 `tools` 的请求会走 prompt 工具协议：bridge 把工具 schema 注入 prompt，agy 需要输出严格的 `{"tool_call":...}` JSON，bridge 再转成标准 `tool_calls`。下一轮客户端把工具结果放回 messages 即可；bridge 无状态重拼完整 transcript。
+
+如果设置 `-tool-bridge off`，带 `tools` / `tool_choice` 会返回 400 `tools_not_supported`。
 
 `/v1/responses` 需要给候选加 `responses_via_chat_completions: true`，由 nanorouter 转成 Chat Completions；bridge 不实现原生 `/v1/responses`。
 
@@ -124,6 +130,32 @@ routes:
 
 注意 OpenAI 候选的 `base_url` 带 `/v1`，Anthropic 候选不带，路径由 `anthropic_messages_path` 指定。
 
+## prompt 工具协议（model profile）
+
+请求带 tools 时，bridge 会：
+
+1. 把工具名、描述、参数 schema 追加到 prompt；
+2. 要求 agy 只输出：
+   ```json
+   {"tool_call":{"name":"lookup","arguments":{"id":1}}}
+   ```
+   或多个工具：
+   ```json
+   {"tool_calls":[{"name":"lookup","arguments":{"id":1}}]}
+   ```
+3. 解析整段输出，转成 OpenAI `tool_calls` / Anthropic `tool_use`；
+4. 客户端执行后，把 tool result 作为下一轮 messages 发回来；bridge 重新拼完整 prompt，继续下一轮。
+
+这是 **prompt 级工具协议**，不是原生 function calling。优点是不需要 MCP、无状态、客户端工具循环不变；代价是依赖模型严格遵守 JSON，agy 自己的工具仍可能干扰。所以 model profile 要配合 `plan` 和空 workdir；如果模型不遵守，需要升级到 MCP 工具桥。
+
+真实链路已验证：
+
+- `/v1/chat/completions` + tools → `tool_calls`
+- `/v1/chat/completions` 流式 + tools → `tool_calls` + `finish_reason: tool_calls`
+- `/v1/responses` + tools → `function_call`
+- 回传 `function_call_output` 后 → 正常文本回答
+- 客户端回传 tool result 后，bridge 无状态重拼完整 transcript，继续下一轮
+
 ## 会话连续性（仅 agent profile）
 
 bridge 读取下游请求的 `X-Session-Affinity`（回退 `X-Session-Id`），把同一个会话键 + 模型绑定到 agy 的 `conversation_id`：
@@ -139,6 +171,7 @@ nanorouter 会原样转发 `X-Session-Affinity` / `X-Session-Id`，客户端只�
 ## 流式行为
 
 - OpenAI：`chat.completion.chunk`，文本走 `delta.content`，思考走 `delta.reasoning_content`；结束时发 `finish_reason: "stop"` 和 usage（有 token 数据时），最后 `data: [DONE]`。
+- 带 `tools` 的请求会先缓冲 agy 的完整输出，判断是普通文本还是 `tool_call` JSON，再决定输出 content 还是 tool_calls；不带 tools 的请求仍然逐段流式。
 - Anthropic：`message_start` → `content_block_start` → `content_block_delta(text_delta)` → `content_block_stop` → `message_delta` → `message_stop`。
 - usage：优先使用 step 的单轮用量；result 信封只补缺失字段，避免续聊时把累计值当成本轮。Anthropic 的 `message_start.input_tokens` 先发 0，最终 `message_delta` 带 `output_tokens`。
 - 工具：`-tool-mode=annotate`（默认）把完成的工具步骤写进 reasoning；`passthrough` 映射成 OpenAI `tool_calls` / Anthropic `tool_use`，并以 `tool_calls` / `tool_use` 结束；`none` 完全忽略工具步骤。
@@ -152,7 +185,7 @@ agy 是一个会自己执行工具的 agent。`passthrough` 模式把 agy **已�
 
 ## 已知边界
 
-- **model profile 不支持 tools**：带 `tools` / `tool_choice` 的请求返回 400；需要工具循环请用原生模型上游，或切到 agent profile 让 agy 自己执行工具。
+- **model profile 的 tools 是 prompt 协议**：依赖 agy 输出严格 JSON，不是原生 function calling；`-tool-bridge off` 才会直接 400。模型不遵守时需要 MCP 工具桥。
 - **图片不落盘**：消息里的图片统一记为 `[image omitted]`。
 - **无 Anthropic thinking block**：Anthropic 的 thinking block 需要签名，agy 不提供；bridge 默认只在 OpenAI 侧输出 `reasoning_content`。
 - **会话仅在 agent profile 生效**：没有 `X-Session-Affinity` / `X-Session-Id` 时无法绑定 agy conversation；客户端换了模型也会按“会话键 + 模型”重新绑定。model profile 始终无状态。

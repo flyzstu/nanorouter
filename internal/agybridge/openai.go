@@ -18,9 +18,10 @@ func (b *Bridge) handleOpenAI(w http.ResponseWriter, r *http.Request) {
 		writeAPIError(w, http.StatusBadRequest, "invalid JSON body: "+err.Error(), "invalid_request_error")
 		return
 	}
-	if b.transparent && (len(req.Tools) > 0 || req.ToolChoice != nil) {
+	promptTools := b.transparent && b.cfg.ToolBridge == "prompt" && len(req.Tools) > 0
+	if b.transparent && (len(req.Tools) > 0 || req.ToolChoice != nil) && !promptTools {
 		writeAPIError(w, http.StatusBadRequest,
-			"agy-bridge model profile does not execute downstream tools; use a native model upstream or -profile agent",
+			"agy-bridge model profile does not execute downstream tools; use a native model upstream, -tool-bridge prompt, or -profile agent",
 			"tools_not_supported")
 		return
 	}
@@ -29,15 +30,21 @@ func (b *Bridge) handleOpenAI(w http.ResponseWriter, r *http.Request) {
 		writeAPIError(w, http.StatusBadRequest, err.Error(), "invalid_request_error")
 		return
 	}
+	if promptTools {
+		if prompt, err = appendToolProtocol(prompt, req.Tools, "openai"); err != nil {
+			writeAPIError(w, http.StatusBadRequest, err.Error(), "invalid_request_error")
+			return
+		}
+	}
 	model := b.modelFor(req.Model)
 	if req.Stream {
-		b.streamOpenAI(w, r, req, prompt, model)
+		b.streamOpenAI(w, r, req, prompt, model, promptTools)
 		return
 	}
-	b.completeOpenAI(w, r, req, prompt, model)
+	b.completeOpenAI(w, r, req, prompt, model, promptTools)
 }
 
-func (b *Bridge) streamOpenAI(w http.ResponseWriter, r *http.Request, req openAIRequest, prompt, model string) {
+func (b *Bridge) streamOpenAI(w http.ResponseWriter, r *http.Request, req openAIRequest, prompt, model string, promptTools bool) {
 	sse, err := newSSEWriter(w)
 	if err != nil {
 		writeAPIError(w, http.StatusInternalServerError, err.Error(), "internal_error")
@@ -46,6 +53,36 @@ func (b *Bridge) streamOpenAI(w http.ResponseWriter, r *http.Request, req openAI
 	id := "chatcmpl-" + randomID()
 	created := time.Now().Unix()
 	_ = writeOpenAIChunk(sse, id, created, model, map[string]any{"role": "assistant"}, nil)
+
+	if promptTools {
+		collector, runErr := b.runWithContinuity(r.Context(), r, model, prompt, func() (string, bool) {
+			return openAIContinuation(req)
+		}, nil)
+		if runErr != nil {
+			writeOpenAIStreamError(sse, runErr)
+			return
+		}
+		if thinking := collector.thinkingString(); thinking != "" && b.cfg.EmitThinking {
+			_ = writeOpenAIChunk(sse, id, created, model, map[string]any{"reasoning_content": thinking}, nil)
+		}
+		text := collector.textString()
+		if calls, ok := parseToolCalls(text); ok {
+			writeOpenAIToolCallChunks(sse, id, created, model, calls)
+			stop := "tool_calls"
+			_ = writeOpenAIChunk(sse, id, created, model, map[string]any{}, &stop)
+			writeOpenAIUsage(sse, id, created, model, collector.usage())
+			_ = sse.raw("data: [DONE]\n\n")
+			return
+		}
+		if text != "" {
+			_ = writeOpenAIChunk(sse, id, created, model, map[string]any{"content": text}, nil)
+		}
+		stop := "stop"
+		_ = writeOpenAIChunk(sse, id, created, model, map[string]any{}, &stop)
+		writeOpenAIUsage(sse, id, created, model, collector.usage())
+		_ = sse.raw("data: [DONE]\n\n")
+		return
+	}
 
 	collector, runErr := b.runWithContinuity(r.Context(), r, model, prompt, func() (string, bool) {
 		return openAIContinuation(req)
@@ -63,52 +100,25 @@ func (b *Bridge) streamOpenAI(w http.ResponseWriter, r *http.Request, req openAI
 		return nil
 	})
 	if runErr != nil {
-		if errors.Is(runErr, context.Canceled) || errors.Is(runErr, context.DeadlineExceeded) {
-			return
-		}
-		info := classifyError(runErr)
-		_ = sse.data(map[string]any{"error": map[string]any{
-			"message": info.Message,
-			"type":    "upstream_error",
-			"code":    info.Code,
-		}})
-		_ = sse.raw("data: [DONE]\n\n")
+		writeOpenAIStreamError(sse, runErr)
 		return
 	}
 	tools := collector.toolEvents()
-	for i, tool := range tools {
-		_ = sse.data(map[string]any{
-			"id": id, "object": "chat.completion.chunk", "created": created, "model": model,
-			"choices": []any{map[string]any{
-				"index": 0,
-				"delta": map[string]any{"tool_calls": []any{map[string]any{
-					"index": i, "id": "call_" + randomID(), "type": "function",
-					"function": map[string]any{"name": tool.Name, "arguments": toolArgsJSON(tool.Input)},
-				}}},
-				"finish_reason": nil,
-			}},
-		})
+	calls := make([]ToolCall, 0, len(tools))
+	for _, tool := range tools {
+		calls = append(calls, ToolCall{Name: tool.Name, Arguments: tool.Input})
 	}
+	writeOpenAIToolCallChunks(sse, id, created, model, calls)
 	stop := "stop"
-	if len(tools) > 0 {
+	if len(calls) > 0 {
 		stop = "tool_calls"
 	}
 	_ = writeOpenAIChunk(sse, id, created, model, map[string]any{}, &stop)
-	usage := collector.usage()
-	if (req.StreamOptions != nil && req.StreamOptions.IncludeUsage) || usage.InputTokens+usage.OutputTokens+usage.TotalTokens > 0 {
-		_ = sse.data(map[string]any{
-			"id":      id,
-			"object":  "chat.completion.chunk",
-			"created": created,
-			"model":   model,
-			"choices": []any{},
-			"usage":   openAIUsage(usage),
-		})
-	}
+	writeOpenAIUsage(sse, id, created, model, collector.usage())
 	_ = sse.raw("data: [DONE]\n\n")
 }
 
-func (b *Bridge) completeOpenAI(w http.ResponseWriter, r *http.Request, req openAIRequest, prompt, model string) {
+func (b *Bridge) completeOpenAI(w http.ResponseWriter, r *http.Request, req openAIRequest, prompt, model string, promptTools bool) {
 	collector, err := b.runWithContinuity(r.Context(), r, model, prompt, func() (string, bool) {
 		return openAIContinuation(req)
 	}, nil)
@@ -126,16 +136,19 @@ func (b *Bridge) completeOpenAI(w http.ResponseWriter, r *http.Request, req open
 		message["reasoning_content"] = thinking
 	}
 	finishReason := "stop"
-	if tools := collector.toolEvents(); len(tools) > 0 {
-		finishReason = "tool_calls"
-		calls := make([]any, 0, len(tools))
-		for _, tool := range tools {
-			calls = append(calls, map[string]any{
-				"id": "call_" + randomID(), "type": "function",
-				"function": map[string]any{"name": tool.Name, "arguments": toolArgsJSON(tool.Input)},
-			})
+	if promptTools {
+		if calls, ok := parseToolCalls(text); ok {
+			finishReason = "tool_calls"
+			message["content"] = ""
+			message["tool_calls"] = openAIToolCallObjects(calls)
 		}
-		message["tool_calls"] = calls
+	} else if tools := collector.toolEvents(); len(tools) > 0 {
+		finishReason = "tool_calls"
+		calls := make([]ToolCall, 0, len(tools))
+		for _, tool := range tools {
+			calls = append(calls, ToolCall{Name: tool.Name, Arguments: tool.Input})
+		}
+		message["tool_calls"] = openAIToolCallObjects(calls)
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"id":      "chatcmpl-" + randomID(),
@@ -175,6 +188,66 @@ func writeOpenAIChunk(sse *sseWriter, id string, created int64, model string, de
 			"finish_reason": finishReason,
 		}},
 	})
+}
+
+func writeOpenAIToolCallChunks(sse *sseWriter, id string, created int64, model string, calls []ToolCall) {
+	for i, call := range calls {
+		if call.ID == "" {
+			call.ID = "call_" + randomID()
+		}
+		_ = sse.data(map[string]any{
+			"id": id, "object": "chat.completion.chunk", "created": created, "model": model,
+			"choices": []any{map[string]any{
+				"index": 0,
+				"delta": map[string]any{"tool_calls": []any{map[string]any{
+					"index": i, "id": call.ID, "type": "function",
+					"function": map[string]any{"name": call.Name, "arguments": toolArgsJSON(call.Arguments)},
+				}}},
+				"finish_reason": nil,
+			}},
+		})
+	}
+}
+
+func openAIToolCallObjects(calls []ToolCall) []any {
+	out := make([]any, 0, len(calls))
+	for _, call := range calls {
+		if call.ID == "" {
+			call.ID = "call_" + randomID()
+		}
+		out = append(out, map[string]any{
+			"id": call.ID, "type": "function",
+			"function": map[string]any{"name": call.Name, "arguments": toolArgsJSON(call.Arguments)},
+		})
+	}
+	return out
+}
+
+func writeOpenAIUsage(sse *sseWriter, id string, created int64, model string, usage Usage) {
+	if usage.InputTokens+usage.OutputTokens+usage.TotalTokens <= 0 {
+		return
+	}
+	_ = sse.data(map[string]any{
+		"id":      id,
+		"object":  "chat.completion.chunk",
+		"created": created,
+		"model":   model,
+		"choices": []any{},
+		"usage":   openAIUsage(usage),
+	})
+}
+
+func writeOpenAIStreamError(sse *sseWriter, err error) {
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return
+	}
+	info := classifyError(err)
+	_ = sse.data(map[string]any{"error": map[string]any{
+		"message": info.Message,
+		"type":    "upstream_error",
+		"code":    info.Code,
+	}})
+	_ = sse.raw("data: [DONE]\n\n")
 }
 
 func openAIUsage(u Usage) map[string]any {
