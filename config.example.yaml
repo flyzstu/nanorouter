@@ -29,6 +29,8 @@ auth_env: NANOROUTER_API_KEY
 # 请求携带非空该头时，浏览器面（/stats、/v1/stats/summary、/v1/zcode/usage、
 # /v1/zcode/reset/status、/v1/api-keys）免 key 直接访问，不再弹 Basic 登录框。
 # 生成端点、核销（/v1/zcode/reset/use）与 /metrics 不在放行面内，照常要求 key。
+# 携带 Authorization/x-api-key 的请求不享受此豁免（防伪造身份头借「带认证头
+# 绕过反代」的规则直达网关；合法 key 照常生效）。
 # 仅限可信反代后开启：头名必须由反代覆盖写入（authResponseHeaders），否则
 # 客户端可伪造该头直连网关端口绕过 SSO。默认空（关闭）。
 # proxy_auth:

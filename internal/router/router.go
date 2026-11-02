@@ -403,8 +403,11 @@ func (r *Router) auth(next http.Handler) http.Handler {
 		}
 		// proxy_auth.header 命中：边缘反代已认证的 SSO 用户，放行浏览器
 		// 面其余路径（统计三路径之外的 reset 查询与 Key 管理页）。生成与
-		// 核销端点不在放行面内。
-		if r.cfg.ProxyAuth.Header != "" && isBrowserPath(path) {
+		// 核销端点不在放行面内。携带 Authorization/x-api-key 的请求不受此
+		// 豁免：若反代存在「带认证头即绕过 SSO」的路径规则，伪造的身份头
+		// 会随这类请求直达网关，此时一律按普通 key 认证，不信任身份头。
+		if r.cfg.ProxyAuth.Header != "" && isBrowserPath(path) &&
+			q.Header.Get("Authorization") == "" && q.Header.Get("X-Api-Key") == "" {
 			if q.Header.Get(r.cfg.ProxyAuth.Header) != "" {
 				q = q.WithContext(context.WithValue(q.Context(), authRoleContextKey{}, authRoleEdge))
 				next.ServeHTTP(w, q)

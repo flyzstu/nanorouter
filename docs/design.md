@@ -279,7 +279,10 @@ forwardAuth 的 `Remote-User`），请求携带非空该头时，浏览器面（
 `authRoleEdge` 角色进入 handler，权限低于业务 Key：只读浏览器面，无生成能力，
 Key 管理端点在 handler 内仍要求根 Key（`requireAPIKeyAdmin`）。部署前提与
 `trust_forwarded_for` 相同且更严：头必须由反代覆盖写入（authResponseHeaders），
-客户端注入的同名头会被可信反代覆盖；网关端口可直接触达的部署绝不能开启。
+客户端注入的同名头会被可信反代覆盖；网关端口可直接触达的部署绝不能开启。豁免另有
+一道纵深约束：请求携带 `Authorization` 或 `X-Api-Key` 时不信任身份头——若反代存在
+「携带认证头即绕过 SSO」的路径规则，伪造的身份头会随这类请求直达网关，此时一律按
+普通 key 认证；合法 key 与身份头并存时 key 照常生效，行为不变。
 
 ZCode 用量看板（`GET /v1/zcode/usage`，渲染在统计页下半区）是唯一主动外呼厂商
 biz 主机的辅助路径：网关按 glm-usage 移植的八个只读端点（四个用量监控：配额、

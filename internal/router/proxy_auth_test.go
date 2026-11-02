@@ -62,6 +62,33 @@ func TestProxyAuthHeaderExemptsBrowserSurface(t *testing.T) {
 	if rec.Code != http.StatusUnauthorized || rec.Header().Get("WWW-Authenticate") == "" {
 		t.Fatalf("wrong header name: status = %d, challenge = %q", rec.Code, rec.Header().Get("WWW-Authenticate"))
 	}
+	// 伪造身份头 + 认证头组合不被信任：反代「带认证头即绕过 SSO」的路径
+	// 规则会让这类请求直达网关，必须按普通 key 认证，身份头视同无效。
+	q = httptest.NewRequest(http.MethodGet, "/v1/zcode/reset/status", nil)
+	q.Header.Set("Remote-User", "alice")
+	q.Header.Set("Authorization", "Bearer junk")
+	rec = httptest.NewRecorder()
+	handler.ServeHTTP(rec, q)
+	if rec.Code != http.StatusUnauthorized || rec.Header().Get("WWW-Authenticate") == "" {
+		t.Fatalf("forged header with auth header: status = %d, challenge = %q", rec.Code, rec.Header().Get("WWW-Authenticate"))
+	}
+	q = httptest.NewRequest(http.MethodGet, "/v1/api-keys", nil)
+	q.Header.Set("Remote-User", "alice")
+	q.Header.Set("X-Api-Key", "junk")
+	rec = httptest.NewRecorder()
+	handler.ServeHTTP(rec, q)
+	if rec.Code != http.StatusUnauthorized || rec.Header().Get("WWW-Authenticate") == "" {
+		t.Fatalf("forged header with x-api-key: status = %d, challenge = %q", rec.Code, rec.Header().Get("WWW-Authenticate"))
+	}
+	// 合法 key + 身份头并存：key 正常生效（守卫不拦合法凭据）。
+	q = httptest.NewRequest(http.MethodGet, "/v1/zcode/reset/status", nil)
+	q.Header.Set("Remote-User", "alice")
+	q.Header.Set("Authorization", "Bearer secret-key")
+	rec = httptest.NewRecorder()
+	handler.ServeHTTP(rec, q)
+	if rec.Code == http.StatusUnauthorized {
+		t.Fatalf("valid key with edge header should pass: %d", rec.Code)
+	}
 }
 
 func TestProxyAuthHeaderNeverExemptsSensitiveSurface(t *testing.T) {
