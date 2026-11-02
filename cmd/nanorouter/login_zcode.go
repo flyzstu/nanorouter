@@ -16,19 +16,6 @@ import (
 	"github.com/nanorouter/nanorouter/internal/router"
 )
 
-// newLoginCommand 组装 login 命令组：按供应商拆分子命令，后续新增
-// login openai 等直接往这里挂。
-func newLoginCommand() *cobra.Command {
-	login := &cobra.Command{
-		Use:   "login",
-		Short: "Log in to a provider and store its credential",
-		Long: `Run a provider-specific device authorization flow and store the exchanged
-credential under ~/.nanorouter/ for gateway candidates to read back.`,
-	}
-	login.AddCommand(newLoginZcodeCommand())
-	return login
-}
-
 // newLoginZcodeCommand 组装 login zcode 子命令，旗标与旧 flag 版本一致。
 func newLoginZcodeCommand() *cobra.Command {
 	var (

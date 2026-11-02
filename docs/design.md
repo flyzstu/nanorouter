@@ -271,6 +271,15 @@ Basic（仅 `/stats`、`/v1/stats/summary`、`/v1/zcode/usage`、`/v1/zcode/rese
 部署准备；豁免面不含任何生成端点，`/v1/zcode/usage` 的账户级数据公开与匿名外呼
 是开启者显式接受的取舍。重置卡面由独立开关 `zcode_reset.public` 控制，不随
 `stats_public` 一起放开：统计面公开不等于允许匿名花卡。
+`proxy_auth.header` 是另一条独立豁免：网关信任边缘反代注入的身份头（如 Authelia
+forwardAuth 的 `Remote-User`），请求携带非空该头时，浏览器面（统计三路径、重置卡
+查询与 `/v1/api-keys`）跳过网关鉴权——SSO 用户免 key 直接看页面，不再弹 Basic 框。
+放行面（`isBrowserPath`）与 Basic 回退白名单一致，两者都只为同一个统计页服务；
+生成端点、核销 POST、`/metrics` 与 Key 管理写操作不在其中。命中头后请求以
+`authRoleEdge` 角色进入 handler，权限低于业务 Key：只读浏览器面，无生成能力，
+Key 管理端点在 handler 内仍要求根 Key（`requireAPIKeyAdmin`）。部署前提与
+`trust_forwarded_for` 相同且更严：头必须由反代覆盖写入（authResponseHeaders），
+客户端注入的同名头会被可信反代覆盖；网关端口可直接触达的部署绝不能开启。
 
 ZCode 用量看板（`GET /v1/zcode/usage`，渲染在统计页下半区）是唯一主动外呼厂商
 biz 主机的辅助路径：网关按 glm-usage 移植的八个只读端点（四个用量监控：配额、
@@ -305,8 +314,8 @@ API Key 管理是第三条独立的账号路径。`api_keys.enabled: true` 后�
 失效。业务 Key 有固定 scope：只放行生成端点（含 `/v1/models` 与 zhipu 前缀），统计、
 用量、重置卡、metrics 和管理端点一律 403；根 `auth_env` Key 仍是可选的 break-glass
 全权限凭据。管理端点默认只认根 Key；`manage_public: true` 时跳过网关鉴权，交给反代
-SSO。`stats_public`、`zcode_reset.public`、`api_keys.manage_public` 三个豁免互不
-牵连。三者都假设“网关只被反代访问”：部署时应把 nanorouter 放在只和反代共享的独立
+SSO。`stats_public`、`zcode_reset.public`、`api_keys.manage_public`、`proxy_auth.header`
+四个豁免互不牵连。四者都假设“网关只被反代访问”：部署时应把 nanorouter 放在只和反代共享的独立
 Docker 网络，反代与 SSO 各自使用独立网络，避免同网容器绕过反代直连 8089。Key 表
 `api_keys(id, name, key_hash, key_prefix, created_at, revoked_at)` 只新增、不改旧表；
 吊销写 `revoked_at` 保留审计，完整 Key 只在创建响应出现一次。

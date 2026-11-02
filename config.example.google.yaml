@@ -1,0 +1,43 @@
+# Google Antigravity 路由示例配置
+# 
+# 使用方法：
+# 1. 先运行 `nanorouter login google --no-browser` 完成授权
+# 2. 复制此文件为 config.yaml 或合并到现有配置
+# 3. 启动 nanorouter 即可使用 Google Antigravity 模型
+
+routes:
+  google-antigravity:
+    strategy: weighted_round_robin
+    candidates:
+      - id: antigravity-gemini-2.0-flash
+        base_url: https://daily-cloudcode-pa.googleapis.com
+        google_antigravity: true
+        google_token_file: true
+        model: gemini-2.0-flash-exp
+        expose_as: google-gemini-flash
+        enabled: true
+        attempt_timeout: 60s
+        
+      - id: antigravity-gemini-1.5-pro
+        base_url: https://daily-cloudcode-pa.googleapis.com
+        google_antigravity: true
+        google_token_file: true
+        model: gemini-1.5-pro
+        expose_as: google-gemini-pro
+        enabled: true
+        attempt_timeout: 90s
+
+# 可选：与其他路由合并使用
+# free-fast:
+#   candidates:
+#     - id: google-gemini-flash
+#       base_url: https://daily-cloudcode-pa.googleapis.com
+#       google_antigravity: true
+#       google_token_file: true
+#       model: gemini-2.0-flash-exp
+#       weight: 2
+#     - id: other-provider
+#       base_url: https://api.example.com/v1
+#       api_key_env: OTHER_API_KEY
+#       model: gpt-4
+#       weight: 1

@@ -25,6 +25,14 @@ auth_env: NANOROUTER_API_KEY
 # 开启；直连部署保持关闭（默认 false，记录 TCP 对端地址），否则调用方可
 # 伪造来源。
 # trust_forwarded_for: true
+# 信任边缘反代注入的身份头：SSO（如 Traefik + Authelia forwardAuth）放行的
+# 请求携带非空该头时，浏览器面（/stats、/v1/stats/summary、/v1/zcode/usage、
+# /v1/zcode/reset/status、/v1/api-keys）免 key 直接访问，不再弹 Basic 登录框。
+# 生成端点、核销（/v1/zcode/reset/use）与 /metrics 不在放行面内，照常要求 key。
+# 仅限可信反代后开启：头名必须由反代覆盖写入（authResponseHeaders），否则
+# 客户端可伪造该头直连网关端口绕过 SSO。默认空（关闭）。
+# proxy_auth:
+#   header: Remote-User
 # ZCode 额度重置卡：查询（GET /v1/zcode/reset/status）恒可用；核销
 # （POST /v1/zcode/reset/use）默认关闭。核销会不可逆地消耗一张卡，网关又是
 # 无人值守服务，请确认实例只有可信调用方后再打开。请求主链路不会自动核销。

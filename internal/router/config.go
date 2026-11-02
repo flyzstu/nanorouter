@@ -2,6 +2,7 @@ package router
 
 import (
 	"fmt"
+	"net/http"
 	"os"
 	"strings"
 	"time"
@@ -25,6 +26,7 @@ type Config struct {
 	// TrustForwardedFor 开启后统计里的调用方 IP 取 X-Forwarded-For 首值。
 	// 仅在网关前面有可信反代时开启；直连部署开启会让调用方伪造来源。
 	TrustForwardedFor bool               `yaml:"trust_forwarded_for"`
+	ProxyAuth         ProxyAuthConfig    `yaml:"proxy_auth"`
 	ZcodeReset        ZcodeResetConfig   `yaml:"zcode_reset"`
 	APIKeys           APIKeysConfig      `yaml:"api_keys"`
 	RequestTimeout    time.Duration      `yaml:"request_timeout"`
@@ -67,6 +69,25 @@ func (c *BackpressureConfig) normalize() error {
 
 type ProfilingConfig struct {
 	Enabled bool `yaml:"enabled"`
+}
+
+// ProxyAuthConfig 让网关信任边缘反代（Traefik + Authelia 等）注入的身份头：
+// 请求携带非空该头时，浏览器面（统计、用量、重置卡查询、Key 管理页）跳过
+// 网关鉴权——SSO 用户免 key 直接看页面，不再弹 Basic 框。仅限可信反代后
+// 开启，头名必须由反代覆盖写入（authResponseHeaders），禁止客户端可注入的
+// 头。与 stats_public / zcode_reset.public / api_keys.manage_public 三个豁免
+// 互不牵连：本开关只信任边缘身份头，生成与核销端点不在放行面内。
+type ProxyAuthConfig struct {
+	Header string `yaml:"header"`
+}
+
+func (c *ProxyAuthConfig) normalize() error {
+	c.Header = strings.TrimSpace(c.Header)
+	if c.Header == "" {
+		return nil
+	}
+	c.Header = http.CanonicalHeaderKey(c.Header)
+	return nil
 }
 
 // ZcodeResetConfig 控制 ZCode 额度重置卡端点。
@@ -452,6 +473,13 @@ type Candidate struct {
 	// 客户端的 ~/.zcode_coding_plan_token.json（只读）。凭据文件的分组
 	// 键取 zcode_channel。
 	ZcodeTokenFile bool `yaml:"zcode_token_file"`
+	// GoogleAntigravity 声明上游是 Google Antigravity（Cloud Code Assist API）。
+	// 此类候选使用 OAuth token 访问 Google API，需要配合 google_token_file 使用。
+	GoogleAntigravity bool `yaml:"google_antigravity"`
+	// GoogleTokenFile 允许从凭据文件读取 Google OAuth token：
+	// 默认 ~/.nanorouter/google_token.json（login google 写入）。
+	// 仅对 GoogleAntigravity 候选有意义。
+	GoogleTokenFile bool `yaml:"google_token_file"`
 	// Probe 显式控制该候选是否在熔断后开启后台异步探活；未配置时继承全局 health_check.enabled。
 	Probe *bool `yaml:"probe"`
 	// Headers 允许针对上游候选配置额外的自定义 HTTP 头（可覆盖默认头）。
@@ -513,6 +541,9 @@ func (u Candidate) validate(global RetryConfig) error {
 	if (u.SimulateZcode || u.ZcodeTokenFile || u.ZcodeChannel != "" || u.AnthropicMessagesPath != "") && !u.Anthropic {
 		return fmt.Errorf("anthropic must be enabled for anthropic_messages_path / simulate_zcode / zcode_channel / zcode_token_file")
 	}
+	if u.GoogleTokenFile && !u.GoogleAntigravity {
+		return fmt.Errorf("google_token_file requires google_antigravity to be enabled")
+	}
 	if u.Anthropic {
 		if u.Responses {
 			return fmt.Errorf("anthropic candidates serve Messages natively; responses: true does not apply")
@@ -561,6 +592,9 @@ func LoadConfig(path string) (Config, error) {
 		return c, err
 	}
 	if err := c.HealthCheck.normalize(); err != nil {
+		return c, err
+	}
+	if err := c.ProxyAuth.normalize(); err != nil {
 		return c, err
 	}
 	if len(c.Routes) == 0 {

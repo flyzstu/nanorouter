@@ -45,6 +45,19 @@ func newRootCommand() *cobra.Command {
 	return root
 }
 
+// newLoginCommand 组装 login 命令组。
+func newLoginCommand() *cobra.Command {
+	login := &cobra.Command{
+		Use:   "login",
+		Short: "Log in to a provider and store its credential",
+		Long: `Run a provider-specific authorization flow and store the exchanged
+credential under ~/.nanorouter/ for gateway candidates to read back.`,
+	}
+	login.AddCommand(newLoginZcodeCommand())
+	login.AddCommand(newLoginGoogleCommand())
+	return login
+}
+
 func main() {
 	if err := newRootCommand().Execute(); err != nil {
 		os.Exit(1)

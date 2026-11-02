@@ -291,6 +291,10 @@ const (
 	authRoleNone authRole = iota
 	authRoleRoot
 	authRoleManaged
+	// authRoleEdge 表示边缘反代已认证（proxy_auth.header 命中）。它只
+	// 放行浏览器面（isBrowserPath），权限低于业务 Key：生成、核销、metrics
+	// 与 API Key 管理写操作均不适用。
+	authRoleEdge
 )
 
 type authRoleContextKey struct{}
@@ -303,6 +307,19 @@ func authRoleFromContext(ctx context.Context) authRole {
 // isAPIKeyAdminPath 匹配 API Key 管理端点（列表/创建/吊销）。
 func isAPIKeyAdminPath(path string) bool {
 	return path == "/v1/api-keys" || strings.HasPrefix(path, "/v1/api-keys/")
+}
+
+// isBrowserPath 是统计页会触达的浏览器面路径：SSO 用户经由边缘身份头放行
+// 的范围。与 Basic 回退白名单一致（两者都只为同一个页面服务），生成端点
+// 与核销 POST 始终不在其中。
+func isBrowserPath(path string) bool {
+	if path == "/stats" || path == "/v1/stats/summary" || path == "/v1/zcode/usage" {
+		return true
+	}
+	if path == "/v1/zcode/reset/status" {
+		return true
+	}
+	return isAPIKeyAdminPath(path)
 }
 
 // isGenerationPath 是业务 Key 的唯一放行面。models 是客户端常用的只读
@@ -383,6 +400,16 @@ func (r *Router) auth(next http.Handler) http.Handler {
 		if r.cfg.StatsPublic && statsAuthPaths[path] {
 			next.ServeHTTP(w, q)
 			return
+		}
+		// proxy_auth.header 命中：边缘反代已认证的 SSO 用户，放行浏览器
+		// 面其余路径（统计三路径之外的 reset 查询与 Key 管理页）。生成与
+		// 核销端点不在放行面内。
+		if r.cfg.ProxyAuth.Header != "" && isBrowserPath(path) {
+			if q.Header.Get(r.cfg.ProxyAuth.Header) != "" {
+				q = q.WithContext(context.WithValue(q.Context(), authRoleContextKey{}, authRoleEdge))
+				next.ServeHTTP(w, q)
+				return
+			}
 		}
 		if r.cfg.ZcodeReset.Public && resetAuthPaths[path] {
 			next.ServeHTTP(w, q)
@@ -785,7 +812,7 @@ func (r *Router) proxy(endpoint string, defaultRoutes ...string) http.HandlerFun
 			}
 			attemptCtx, cancelAttempt := candidateAttemptContext(ctx, u.AttemptTimeout)
 			upstreamAttempts++
-			resp, err := r.do(attemptCtx, u, upstreamEndpoint, encoded, p, q, credential)
+			resp, err := r.do(attemptCtx, u, upstreamEndpoint, streamed, encoded, p, q, credential)
 			ttfbDuration := time.Since(start)
 			latency := int(ttfbDuration.Milliseconds())
 			r.ttfb.WithLabelValues(routeName, u.ID, endpoint).Observe(ttfbDuration.Seconds())
@@ -893,6 +920,15 @@ func (r *Router) prepareAttempt(ctx context.Context, payload map[string]any, u C
 		}
 		prepared.payload, prepared.upstreamEndpoint = adapted, "messages"
 	}
+	// Google Antigravity 需要将 OpenAI 格式转换为 Gemini 格式
+	if u.GoogleAntigravity {
+		geminiReq, err := convertOpenAIToGemini(prepared.payload)
+		if err != nil {
+			return &proxyRequestError{code: "unsupported_openai_feature", message: err.Error()}
+		}
+		prepared.payload = geminiReq
+		prepared.upstreamEndpoint = "gemini" // 自定义端点标识
+	}
 	// 解析一次凭据仅供日志脱敏：上游可能把 Authorization 回显进错误
 	// 消息，key 不能随该字段进日志。真正的取用发生在 do() 内部。
 	prepared.credential = r.resolveCandidateAPIKey(ctx, u)
@@ -939,6 +975,8 @@ func (r *Router) handleStreamingResponse(w http.ResponseWriter, resp *http.Respo
 		usage, streamErr = r.streamMessagesAsChat(w, resp, true, a.routeName)
 	case a.u.Anthropic && a.endpoint == "chat_completions" && a.upstreamEndpoint == "messages":
 		usage, streamErr = r.streamMessagesAsChat(w, resp, false, a.routeName)
+	case a.u.GoogleAntigravity && a.upstreamEndpoint == "gemini":
+		usage, streamErr = r.streamGeminiAsChat(w, resp, a.routeName)
 	case a.adaptedResponses:
 		usage, streamErr = r.streamChatAsResponses(w, resp, a.routeName)
 	default:
@@ -1146,6 +1184,17 @@ func (r *Router) handleNonStreamingResponse(w http.ResponseWriter, resp *http.Re
 		if err != nil {
 			a.release()
 			writeAPIErrorDialect(w, http.StatusBadGateway, "cannot adapt upstream messages response: "+err.Error(), "upstream_error", a.endpoint)
+			r.record(a.requestID, a.routeName, a.u, a.endpoint, resp.StatusCode, a.latency, false, a.attempt, Usage{Source: "unavailable"}, "upstream", a.meta)
+			r.logRequestFailed(a.requestID, a.endpoint, a.routeName, false, http.StatusBadGateway, a.attempt+1, time.Since(a.startedAt), "response_adaptation_failed")
+			return false
+		}
+		w.Header().Set("Content-Type", "application/json")
+	} else if a.u.GoogleAntigravity {
+		// 将 Gemini 响应转换为 OpenAI 格式
+		b, err = convertGeminiToOpenAI(b, a.routeName)
+		if err != nil {
+			a.release()
+			writeAPIErrorDialect(w, http.StatusBadGateway, "cannot adapt upstream gemini response: "+err.Error(), "upstream_error", a.endpoint)
 			r.record(a.requestID, a.routeName, a.u, a.endpoint, resp.StatusCode, a.latency, false, a.attempt, Usage{Source: "unavailable"}, "upstream", a.meta)
 			r.logRequestFailed(a.requestID, a.endpoint, a.routeName, false, http.StatusBadGateway, a.attempt+1, time.Since(a.startedAt), "response_adaptation_failed")
 			return false
@@ -1363,7 +1412,7 @@ func successLogFields(requestID, route string, u Candidate, endpoint string, att
 		zap.String("usage_source", usage.Source),
 	)
 }
-func (r *Router) do(ctx context.Context, u Candidate, endpoint string, body []byte, payload map[string]any, incomingReq *http.Request, credential string) (*http.Response, error) {
+func (r *Router) do(ctx context.Context, u Candidate, endpoint string, streamed bool, body []byte, payload map[string]any, incomingReq *http.Request, credential string) (*http.Response, error) {
 	base := strings.TrimRight(u.BaseURL, "/")
 	// llama-server 的监听地址通常不带 /v1；保持其他 OpenAI 兼容上游的 base_url 语义不变。
 	if u.LlamaServer && !strings.HasSuffix(strings.ToLower(base), "/v1") {
@@ -1377,6 +1426,31 @@ func (r *Router) do(ctx context.Context, u Candidate, endpoint string, body []by
 	// 翻译后），路径按 显式覆盖 > 渠道网关路径 > v1/messages 解析。
 	if u.Anthropic && endpoint == "messages" {
 		path = zcodeMessagesPath(u)
+	}
+	// Google Antigravity（Cloud Code Assist）不是标准 Gemini API：model 不进
+	// URL，路径按流式/非流式选 v1internal:*，请求体外还要包一层
+	// {project, model, request} 信封（对齐 oh-my-pi，不发 requestType）。
+	if u.GoogleAntigravity && endpoint == "gemini" {
+		if streamed {
+			path = "v1internal:streamGenerateContent?alt=sse"
+		} else {
+			path = "v1internal:generateContent"
+		}
+		projectID, err := r.getGoogleProjectID()
+		if err != nil {
+			return nil, fmt.Errorf("google antigravity project id: %w", err)
+		}
+		if projectID == "" {
+			return nil, errors.New("google antigravity: project_id missing in google_token.json")
+		}
+		body, err = json.Marshal(map[string]any{
+			"project": projectID,
+			"model":   u.Model,
+			"request": payload,
+		})
+		if err != nil {
+			return nil, err
+		}
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, base+"/"+path, bytes.NewReader(body))
 	if err != nil {
@@ -1423,6 +1497,20 @@ func (r *Router) do(ctx context.Context, u Candidate, endpoint string, body []by
 			req.Header.Set("x-session-affinity", ids.session)
 			req.Header.Set("x-zcode-trace-id", ids.trace)
 		}
+	} else if u.GoogleAntigravity {
+		// Google Antigravity 使用 OAuth token 认证
+		accessToken, err := r.getGoogleAccessToken(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("get google access token: %w", err)
+		}
+		req.Header.Set("Authorization", "Bearer "+accessToken)
+
+		// 设置 Antigravity 特定的请求头（模拟官方客户端）
+		req.Header.Set("User-Agent", "antigravity/hub/2.26.0 (aidev_client; os_type=linux; arch=amd64)")
+		// 不要手动设置 Accept-Encoding: gzip——显式设置会关闭 net/http 的
+		// 透明解压，resp.Body 变成原始 gzip 字节，后续 JSON/SSE 解析全挂。
+		// project_id 已随 {project, model, request} 信封放在请求体里，
+		// 不再追加 ?project= 查询参数。
 	} else if key := resolveAPIKey(u.APIKeyEnv); key != "" {
 		req.Header.Set("Authorization", "Bearer "+key)
 	}
