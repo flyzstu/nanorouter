@@ -770,3 +770,47 @@ func TestZcodeMetadataAbsentWithoutDeviceState(t *testing.T) {
 		t.Fatal("无设备身份时不应注入 metadata")
 	}
 }
+
+// TestZcodeDeviceMidHeaderFollowsOfficialConditionality X-Device-Mid 与
+// metadata.user_id 同源：官方 buildZCodeSourceHeadersFromContext 只在
+// deviceMid 存在时附加该头，这里同样按条件展开。
+func TestZcodeDeviceMidHeaderFollowsOfficialConditionality(t *testing.T) {
+	newCase := func(t *testing.T) (*Router, *chan string) {
+		t.Helper()
+		got := make(chan string, 1)
+		upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+			got <- req.Header.Get("X-Device-Mid")
+			_, _ = w.Write([]byte(`{"id":"m","type":"message","role":"assistant","content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}`))
+		}))
+		t.Cleanup(upstream.Close)
+		r, _ := newZcodeTestRouter(t, Candidate{
+			ID: "z", BaseURL: upstream.URL, Model: "glm-5.3",
+			Anthropic: true, SimulateZcode: true, ZcodeChannel: ZcodeChannelBigmodel, APIKeyEnv: "TEST_ZCODE_DEVICE_KEY",
+		})
+		t.Setenv("TEST_ZCODE_DEVICE_KEY", "11.secret")
+		return r, &got
+	}
+
+	t.Run("present", func(t *testing.T) {
+		t.Setenv("HOME", t.TempDir())
+		writeZcodeDeviceState(t, `{"deviceMid":"device-hdr-1"}`)
+		r, got := newCase(t)
+		if rec := postJSON(t, r, "/v1/messages", `{"model":"zcode","max_tokens":8,"messages":[{"role":"user","content":"hi"}]}`); rec.Code != 200 {
+			t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+		}
+		if mid := <-*got; mid != "device-hdr-1" {
+			t.Fatalf("x-device-mid=%q", mid)
+		}
+	})
+
+	t.Run("absent", func(t *testing.T) {
+		t.Setenv("HOME", t.TempDir())
+		r, got := newCase(t)
+		if rec := postJSON(t, r, "/v1/messages", `{"model":"zcode","max_tokens":8,"messages":[{"role":"user","content":"hi"}]}`); rec.Code != 200 {
+			t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+		}
+		if mid := <-*got; mid != "" {
+			t.Fatalf("无设备身份时不应发 X-Device-Mid,得到 %q", mid)
+		}
+	})
+}

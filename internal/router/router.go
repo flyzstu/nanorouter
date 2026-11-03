@@ -1493,6 +1493,11 @@ func (r *Router) do(ctx context.Context, u Candidate, endpoint string, streamed 
 			for name, value := range zcodeClientIdentityHeaders() {
 				req.Header.Set(name, value)
 			}
+			// 设备身份头与官方一致按条件展开：machine 上没有 ZCode 客户端
+			// 写过设备身份时不发，而不是伪造。
+			for name, value := range zcodeDeviceHeaders(r.zcodeDeviceMid(ctx)) {
+				req.Header.Set(name, value)
+			}
 			// CLI 的归因 id：会话 id 从对话派生（同会话稳定），请求/
 			// 追踪 id 每次全新；x-session-affinity 同步会话 id。
 			req.Header.Set("x-request-id", ids.request)

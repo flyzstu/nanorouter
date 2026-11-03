@@ -26,7 +26,7 @@ import (
 // ZCode 平台常量（上游合同，勿改名）。
 const (
 	ZcodeDefaultOrigin    = "https://zcode.z.ai"
-	ZcodeClientVersion    = "3.14.0"
+	ZcodeClientVersion    = "3.17.1"
 	ZcodeAnthropicVersion = "2023-06-01"
 
 	ZcodeChannelBigmodel = "bigmodel"
@@ -137,10 +137,12 @@ func deriveZcodeRequestIDs(messages []any) zcodeRequestIDs {
 /* CLI 身份头集                                                                */
 /* -------------------------------------------------------------------------- */
 
-// zcodeClientIdentityHeaders 复刻参考客户端 _get_base_headers() 的
-// 身份与平台指纹头。语言与时区在 CLI 中是硬编码而非派生的，这里同样
+// zcodeClientIdentityHeaders 复刻官方 zcode-source-headers.ts 的身份与
+// 平台指纹头。语言与时区在 CLI 中是硬编码而非派生的，这里同样
 // 硬编码：该头集的目的是复现桌面客户端指纹，派生值反而会失配。
-// 平台名、OS 类别与 OS 版本在参考实现里是运行时派生的，这里同样派生。
+// 平台名、OS 类别与 OS 版本在官方实现里是运行时派生的，这里同样派生。
+// X-Device-Mid 由调用方按请求注入（见 zcodeDeviceHeaders），不属于
+// 静态头集——官方同样只在设备身份存在时才发。
 func zcodeClientIdentityHeaders() map[string]string {
 	osName := zcodePlatformName()
 	headers := map[string]string{
@@ -158,6 +160,16 @@ func zcodeClientIdentityHeaders() map[string]string {
 		"anthropic-version":    ZcodeAnthropicVersion,
 	}
 	return headers
+}
+
+// zcodeDeviceHeaders 返回设备身份头（X-Device-Mid）。官方只在 deviceMid
+// 存在时附加该头（buildZCodeSourceHeadersFromContext 的条件展开），请求
+// 路径本身不依赖它——缺失时不发，与官方一致，不伪造身份。
+func zcodeDeviceHeaders(deviceMid string) map[string]string {
+	if deviceMid == "" {
+		return nil
+	}
+	return map[string]string{"X-Device-Mid": deviceMid}
 }
 
 func zcodePlatformName() string {

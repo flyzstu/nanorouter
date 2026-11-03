@@ -460,7 +460,7 @@ type Candidate struct {
 	// simulate_zcode 且未配置本字段时，路径按 zcode_channel 取网关路径。
 	AnthropicMessagesPath string `yaml:"anthropic_messages_path"`
 	// SimulateZcode 开启对 ZCode 桌面客户端行为的全面仿真：
-	// 1. 发送 User-Agent: ZCode/3.14.0 与完整 CLI 身份/平台指纹头
+	// 1. 发送 User-Agent: ZCode/3.17.1 与完整 CLI 身份/平台指纹头
 	// 2. anthropic-version: 2023-06-01 与 x-api-key + Authorization 双凭据头
 	// 3. 会话 id 从对话首个 user turn 稳定派生，请求/追踪 id 每请求全新
 	// 仅对 Anthropic 候选有意义。

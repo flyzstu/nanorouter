@@ -3,14 +3,15 @@ package router
 // ZCode 设备身份（deviceMid）的读取与注入。
 //
 // 官方 CLI 对每个 anthropic 供应商都会把设备身份写进请求体的
-// metadata.user_id（ZCode 的 anthropic-request-metadata.ts），而
-// X-Device-Mid 头只用于 billing/balance 与 feedback 端点——服务端不靠
-// 它给模型调用鉴权。本文件只复刻前者的请求体形状。
+// metadata.user_id（ZCode 的 anthropic-request-metadata.ts），模型请求头
+// X-Device-Mid 与其同源（zcode-source-headers.ts 条件展开）；该头另外
+// 服务 billing/balance 与 feedback 端点（billing 必填）。设备身份不参与
+// 模型调用鉴权，仅身份归因。
 //
 // deviceMid 的生命周期归 ZCode 客户端：官方 CLI 与桌面端在
 // ~/.zcode/v2/telemetry-state.json 里共用同一个字段。这里只读不生成，
 // 与官方 sourceHeaders.ts 的 readExistingDeviceMid 同语义——机器上没跑过
-// ZCode 时就没有设备身份，此时不注入该字段，而不是伪造一个 UUID。
+// ZCode 时就没有设备身份，此时头与 metadata 均不注入，而不是伪造 UUID。
 
 import (
 	"context"
