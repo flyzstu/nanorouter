@@ -4,6 +4,7 @@ bin/
 
 # Local configuration and runtime data
 config.yaml
+config.smoke.yaml
 nanorouter.db
 nanorouter.db-*
 
@@ -18,9 +19,12 @@ __pycache__/
 
 # Local tool state
 .commandcode/
+.atomcode/
+.ori/
 
 # Deployment secrets and runtime data
 deploy/**/acme/out/
+deploy/**/acme/compose.yml
 deploy/**/certs/**
 !deploy/**/certs/.gitignore
 deploy/**/data/
