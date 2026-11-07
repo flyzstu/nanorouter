@@ -33,7 +33,9 @@ Use the standard `testing` package with `httptest` and in-memory SQLite (`sql.Op
 
 ## Commit & Pull Request Guidelines
 
-Branch is `main` with a Gitea remote (`git@coding.fly97.fun:fly97/nanorouter.git`). Use Conventional Commit-style messages: `feat: add cerebras route`, `fix: preserve stream usage`, or `docs: update provider setup`. Keep commits focused. Pull requests should explain the affected endpoints/providers, configuration changes, fallback or compatibility implications, and verification commands run. Include sanitized request/response examples for protocol changes.
+Branch is `main` mirrored to two remotes: `origin` (Gitea, `git@coding.fly97.fun:fly97/nanorouter.git`) and `github` (private GitHub, `https://github.com/flyzstu/nanorouter.git`). By default every commit, tag, and history rewrite must be pushed to both remotes and both must end up pointing at the same SHAs — only skip one side when the user explicitly asks. Push both and verify with `git push origin main && git push github main` (add `--tags` / `--force` as needed) and `git ls-remote origin main && git ls-remote github main`.
+
+Use Conventional Commit-style messages: `feat: add cerebras route`, `fix: preserve stream usage`, or `docs: update provider setup`. Keep commits focused. Pull requests should explain the affected endpoints/providers, configuration changes, fallback or compatibility implications, and verification commands run. Include sanitized request/response examples for protocol changes.
 
 ## CI & Container
 
