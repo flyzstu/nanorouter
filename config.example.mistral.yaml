@@ -4,38 +4,66 @@
 # 1. 先运行 `nanorouter login mistral`（或 headless 机器加 --no-browser）完成浏览器授权
 # 2. 复制此文件为 config.yaml 或合并到现有配置
 # 3. 启动 nanorouter 即可使用 Mistral 模型
+#
+# 注意：base_url 必须带 /v1（Mistral 的 OpenAI 兼容端点是
+# https://api.mistral.ai/v1/chat/completions）；漏掉 /v1 会被上游 404
+# （"no Route matched with those values"）。
 
 routes:
   mistral-vibe:
     strategy: weighted_round_robin
     candidates:
-      - id: mistral-medium
-        base_url: https://api.mistral.ai
+      - id: mistral-large-4
+        base_url: https://api.mistral.ai/v1
         mistral_token_file: true
-        model: mistral-medium-latest
-        expose_as: mistral-medium
-        enabled: true
-        attempt_timeout: 60s
-
-      - id: mistral-large
-        base_url: https://api.mistral.ai
-        mistral_token_file: true
-        model: mistral-large-latest
-        expose_as: mistral-large
+        model: mistral-large-4
+        expose_as: mistral-large-4
         enabled: true
         attempt_timeout: 90s
+        responses_via_chat_completions: true
+
+      - id: mistral-medium-3-5
+        base_url: https://api.mistral.ai/v1
+        mistral_token_file: true
+        model: mistral-medium-3-5
+        expose_as: mistral-medium-3-5
+        enabled: true
+        attempt_timeout: 60s
+        responses_via_chat_completions: true
+
+      - id: zai-glm-5-3
+        base_url: https://api.mistral.ai/v1
+        mistral_token_file: true
+        model: zai-glm-5-3
+        expose_as: zai-glm-5-3
+        enabled: true
+        attempt_timeout: 90s
+        responses_via_chat_completions: true
+
+      - id: zai-glm-5-3-flash
+        base_url: https://api.mistral.ai/v1
+        mistral_token_file: true
+        model: zai-glm-5-3-flash
+        expose_as: zai-glm-5-3-flash
+        enabled: true
+        attempt_timeout: 60s
+        responses_via_chat_completions: true
 
 # 凭据解析顺序：MISTRAL_API_KEY 环境变量 → ~/.nanorouter/mistral_token.json
 # （login mistral 写入，0600）。凭据是 Mistral 平台 API key，不会自动刷新；
 # 失效后重新运行 `nanorouter login mistral` 即可。
+#
+# 思考型模型（mistral-large-4、zai-glm-5-3、zai-glm-5-3-flash）的
+# message.content 返回 parts 数组（thinking + text），网关原样透传；
+# mistral-medium-3-5 返回纯字符串。
 
 # 可选：与其他路由合并使用
 # free-fast:
 #   candidates:
-#     - id: mistral-medium
-#       base_url: https://api.mistral.ai
+#     - id: mistral-medium-3-5
+#       base_url: https://api.mistral.ai/v1
 #       mistral_token_file: true
-#       model: mistral-medium-latest
+#       model: mistral-medium-3-5
 #       weight: 2
 #     - id: other-provider
 #       base_url: https://api.example.com/v1

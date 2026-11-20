@@ -284,9 +284,9 @@ routes:
   mistral-vibe:
     candidates:
       - id: mistral-medium
-        base_url: https://api.mistral.ai
+        base_url: https://api.mistral.ai/v1
         mistral_token_file: true
-        model: mistral-medium-latest
+        model: mistral-medium-3-5
         expose_as: mistral-medium
 ```
 

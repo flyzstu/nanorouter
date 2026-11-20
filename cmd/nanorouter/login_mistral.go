@@ -38,7 +38,7 @@ On a headless/remote server:
   approval for an API key and saves it.
 
 The key is saved to ~/.nanorouter/mistral_token.json. Configure the route
-candidate with mistral_token_file: true and base_url https://api.mistral.ai.`,
+candidate with mistral_token_file: true and base_url https://api.mistral.ai/v1.`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx, cancel := context.WithTimeout(context.Background(), timeout+time.Minute)

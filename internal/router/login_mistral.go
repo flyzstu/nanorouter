@@ -58,10 +58,10 @@ const (
 	// mistralMaxPollFailures 连续轮询失败上限（官方 _max_consecutive_poll_failures）。
 	mistralMaxPollFailures = 3
 
-	// mistralAPIOrigin 是 OpenAI 兼容 API 的默认 origin（对齐
-	// DEFAULT_MISTRAL_SERVER_URL）。sign_in/exchange 走 console /api 前缀，
-	// 生成请求走该 origin 的 /v1/chat/completions。
-	mistralAPIOrigin = "https://api.mistral.ai"
+	// mistralChatBaseURL 是候选 base_url 的正确形态：网关按 base+"/"+path
+	// 拼接（path=chat/completions），漏掉 /v1 会被上游 404
+	// （"no Route matched with those values"）。
+	mistralChatBaseURL = "https://api.mistral.ai/v1"
 )
 
 // mistralTokenCache 缓存凭据文件的解析结果，语义与 zcodeTokenCache 一致：
@@ -174,7 +174,7 @@ func RunMistralLogin(ctx context.Context, opts MistralLoginOptions) (string, err
 		return "", fmt.Errorf("store token failed: %w", err)
 	}
 	say("Login complete. Credential stored at %s", path)
-	say("Configure the candidate with mistral_token_file: true and base_url %s", mistralAPIOrigin)
+	say("Configure the candidate with mistral_token_file: true and base_url %s", mistralChatBaseURL)
 	return path, nil
 }
 

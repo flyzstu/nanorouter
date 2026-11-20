@@ -43,19 +43,22 @@ headless/远程服务器：
 routes:
   mistral-vibe:
     candidates:
-      - id: mistral-medium
-        base_url: https://api.mistral.ai
+      - id: mistral-medium-3-5
+        base_url: https://api.mistral.ai/v1
         mistral_token_file: true
-        model: mistral-medium-latest
-        expose_as: mistral-medium
+        model: mistral-medium-3-5
+        expose_as: mistral-medium-3-5
 ```
+
+`base_url` 必须带 `/v1`；漏掉会命中上游 404
+（`no Route matched with those values`）。
 
 ### 3. 验证
 
 ```bash
 curl http://127.0.0.1:8080/v1/chat/completions \
   -H "Content-Type: application/json" \
-  -d '{"model":"mistral-medium","messages":[{"role":"user","content":"hi"}]}'
+  -d '{"model":"mistral-medium-3-5","messages":[{"role":"user","content":"hi"}]}'
 ```
 
 ## 凭据解析顺序
