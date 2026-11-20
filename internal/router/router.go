@@ -1519,6 +1519,17 @@ func (r *Router) do(ctx context.Context, u Candidate, endpoint string, streamed 
 		// 透明解压，resp.Body 变成原始 gzip 字节，后续 JSON/SSE 解析全挂。
 		// project_id 已随 {project, model, request} 信封放在请求体里，
 		// 不再追加 ?project= 查询参数。
+	} else if u.MistralTokenFile {
+		// Mistral Vibe 凭据：标准 OpenAI 兼容 Bearer，key 来自凭据文件
+		// （login mistral 写入）。与 credential 主链一致：env 命中优先，
+		// 未命中读文件。
+		key := credential
+		if key == "" {
+			key = r.resolveCandidateAPIKey(ctx, u)
+		}
+		if key != "" {
+			req.Header.Set("Authorization", "Bearer "+key)
+		}
 	} else if key := resolveAPIKey(u.APIKeyEnv); key != "" {
 		req.Header.Set("Authorization", "Bearer "+key)
 	}

@@ -268,6 +268,11 @@ func (r *Router) resolveCandidateAPIKey(ctx context.Context, u Candidate) string
 	if key := resolveAPIKey(u.APIKeyEnv); key != "" {
 		return key
 	}
+	if u.MistralTokenFile {
+		// Mistral 候选没有数据库凭据（API key 不会自动刷新），凭据文件
+		// 是 env 未命中后的唯一回退。
+		return mistralTokenFileKey()
+	}
 	if !u.ZcodeTokenFile {
 		return ""
 	}

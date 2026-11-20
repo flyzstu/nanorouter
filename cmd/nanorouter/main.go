@@ -55,6 +55,7 @@ credential under ~/.nanorouter/ for gateway candidates to read back.`,
 	}
 	login.AddCommand(newLoginZcodeCommand())
 	login.AddCommand(newLoginGoogleCommand())
+	login.AddCommand(newLoginMistralCommand())
 	return login
 }
 

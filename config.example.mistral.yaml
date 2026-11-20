@@ -1,0 +1,44 @@
+# Mistral Vibe 路由示例配置
+#
+# 使用方法：
+# 1. 先运行 `nanorouter login mistral`（或 headless 机器加 --no-browser）完成浏览器授权
+# 2. 复制此文件为 config.yaml 或合并到现有配置
+# 3. 启动 nanorouter 即可使用 Mistral 模型
+
+routes:
+  mistral-vibe:
+    strategy: weighted_round_robin
+    candidates:
+      - id: mistral-medium
+        base_url: https://api.mistral.ai
+        mistral_token_file: true
+        model: mistral-medium-latest
+        expose_as: mistral-medium
+        enabled: true
+        attempt_timeout: 60s
+
+      - id: mistral-large
+        base_url: https://api.mistral.ai
+        mistral_token_file: true
+        model: mistral-large-latest
+        expose_as: mistral-large
+        enabled: true
+        attempt_timeout: 90s
+
+# 凭据解析顺序：MISTRAL_API_KEY 环境变量 → ~/.nanorouter/mistral_token.json
+# （login mistral 写入，0600）。凭据是 Mistral 平台 API key，不会自动刷新；
+# 失效后重新运行 `nanorouter login mistral` 即可。
+
+# 可选：与其他路由合并使用
+# free-fast:
+#   candidates:
+#     - id: mistral-medium
+#       base_url: https://api.mistral.ai
+#       mistral_token_file: true
+#       model: mistral-medium-latest
+#       weight: 2
+#     - id: other-provider
+#       base_url: https://api.example.com/v1
+#       api_key_env: OTHER_API_KEY
+#       model: gpt-4
+#       weight: 1

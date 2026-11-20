@@ -43,4 +43,4 @@ The Gitea Actions workflow in `.gitea/workflows/build-image.yaml` builds the Doc
 
 ## Security & Configuration
 
-Use environment variables referenced by `api_key_env`; do not place secrets in YAML. The one sanctioned on-disk exception is `~/.nanorouter/zcode_token.json` (0600, written only by the `login zcode` subcommand and read back by candidates with `zcode_token_file: true`). Treat `responses_via_chat_completions` as a limited adapter: unsupported Responses features must fail explicitly rather than being silently dropped.
+Use environment variables referenced by `api_key_env`; do not place secrets in YAML. The sanctioned on-disk exceptions are `~/.nanorouter/zcode_token.json` and `~/.nanorouter/mistral_token.json` (0600, written only by the `login zcode` / `login mistral` subcommands and read back by candidates with `zcode_token_file: true` / `mistral_token_file: true`). Treat `responses_via_chat_completions` as a limited adapter: unsupported Responses features must fail explicitly rather than being silently dropped.

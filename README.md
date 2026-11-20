@@ -272,6 +272,28 @@ curl "http://127.0.0.1:8080/zcode/login" -H "Authorization: Bearer $NANOROUTER_A
 
 翻译边界（显式 400 `unsupported_openai_feature`，不静默丢弃）：`n > 1`、`response_format` 结构化输出、非零 `presence/frequency_penalty`、`logit_bias`、`logprobs`、`top_logprobs`。下游未携带 `max_tokens` / `max_completion_tokens` 时，Messages 协议要求必填，网关默认注入 `max_tokens: 4096`——需要更长输出请显式传 `max_tokens`。已知无声降级记录于 design.md：assistant 历史的 `reasoning_content`（Anthropic 要求思维块签名，未签名的无法回传）、OpenAI 记账字段（`store`/`metadata` 等），以及白名单映射的自然舍弃 `parallel_tool_calls`/`verbosity`（流式 Responses 链上的 thinking_delta 同样不进入 Responses 事件）。`reasoning_effort` 映射为 thinking 预算（minimal→1K … max→32K），预算不足 `max_tokens` 时钳制，`"none"` 关闭。流式 usage 从 `message_start`（输入侧）与 `message_delta`（累计输出侧）合并采集，账本与 OpenAI 上游同一张表。
 
+## Mistral Vibe 上游（浏览器登录）
+
+网关支持 Mistral Vibe：`nanorouter login mistral` 通过浏览器完成 PKCE 登录
+（对齐 mistral-vibe 客户端的 sign-in / poll / exchange 流程），换取的 Mistral
+平台 API key 写入 `~/.nanorouter/mistral_token.json`（0600，原子写入）。上游是
+标准 OpenAI 兼容 API，无需协议适配：
+
+```yaml
+routes:
+  mistral-vibe:
+    candidates:
+      - id: mistral-medium
+        base_url: https://api.mistral.ai
+        mistral_token_file: true
+        model: mistral-medium-latest
+        expose_as: mistral-medium
+```
+
+凭据解析顺序：`MISTRAL_API_KEY` 环境变量 → 凭据文件（5 秒进程内缓存）。key
+不会自动刷新，失效后重新 `login mistral` 即可；headless 机器加 `--no-browser`
+复制 URL 授权。流程细节见 [MISTRAL_VIBE.md](MISTRAL_VIBE.md)。
+
 ## OpenCode Go 上游
 
 [OpenCode Go](https://opencode.ai/docs/zh-cn/go/) 是低成本的编程模型订阅服务（首月 5 美元，之后每月 10 美元），提供一批经基准测试的开源编程模型。在 [opencode.ai/auth](https://opencode.ai/auth) 订阅并复制 API 密钥，由 `OPENCODE_GO_API_KEY` 注入：

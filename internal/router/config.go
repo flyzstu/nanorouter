@@ -480,6 +480,11 @@ type Candidate struct {
 	// 默认 ~/.nanorouter/google_token.json（login google 写入）。
 	// 仅对 GoogleAntigravity 候选有意义。
 	GoogleTokenFile bool `yaml:"google_token_file"`
+	// MistralTokenFile 允许从凭据文件读取 Mistral 平台 API key：
+	// 默认 ~/.nanorouter/mistral_token.json（login mistral 写入）。
+	// 凭据是普通 API key，请求走标准 OpenAI chat completions，
+	// 无需协议适配，也无需本地刷新。
+	MistralTokenFile bool `yaml:"mistral_token_file"`
 	// Probe 显式控制该候选是否在熔断后开启后台异步探活；未配置时继承全局 health_check.enabled。
 	Probe *bool `yaml:"probe"`
 	// Headers 允许针对上游候选配置额外的自定义 HTTP 头（可覆盖默认头）。
