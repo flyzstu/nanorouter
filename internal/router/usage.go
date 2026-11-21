@@ -19,19 +19,7 @@ func findUsage(v any) (Usage, bool) {
 	switch x := v.(type) {
 	case map[string]any:
 		if raw, ok := x["usage"].(map[string]any); ok {
-			u := Usage{Prompt: number(raw["prompt_tokens"]), Completion: number(raw["completion_tokens"]), Total: number(raw["total_tokens"]), Source: "upstream"}
-			if u.Prompt == 0 {
-				// Anthropic 形状：input_tokens 不含缓存命中/写入，与
-				// 翻译路径保持同一记账口径，一并计入 prompt 侧。
-				u.Prompt = number(raw["input_tokens"]) + number(raw["cache_read_input_tokens"]) + number(raw["cache_creation_input_tokens"])
-			}
-			if u.Completion == 0 {
-				u.Completion = number(raw["output_tokens"])
-			}
-			if u.Total == 0 {
-				u.Total = u.Prompt + u.Completion
-			}
-			return u, true
+			return usageFromRaw(raw), true
 		}
 		for _, child := range x {
 			if u, ok := findUsage(child); ok {
@@ -47,6 +35,33 @@ func findUsage(v any) (Usage, bool) {
 	}
 	return Usage{}, false
 }
+
+// usageFromRaw 解析 usage 对象，兼容 OpenAI 与 Anthropic 两套字段名。
+func usageFromRaw(raw map[string]any) Usage {
+	u := Usage{Prompt: number(raw["prompt_tokens"]), Completion: number(raw["completion_tokens"]), Total: number(raw["total_tokens"]), Source: "upstream"}
+	if u.Prompt == 0 {
+		// Anthropic 形状：input_tokens 不含缓存命中/写入，与
+		// 翻译路径保持同一记账口径，一并计入 prompt 侧。
+		u.Prompt = number(raw["input_tokens"]) + number(raw["cache_read_input_tokens"]) + number(raw["cache_creation_input_tokens"])
+	}
+	if u.Completion == 0 {
+		u.Completion = number(raw["output_tokens"])
+	}
+	if u.Total == 0 {
+		u.Total = u.Prompt + u.Completion
+	}
+	u.Reasoning = detailNumber(raw["completion_tokens_details"], "reasoning_tokens")
+	u.Cached = detailNumber(raw["prompt_tokens_details"], "cached_tokens")
+	return u
+}
+
+func detailNumber(v any, key string) int64 {
+	if details, ok := v.(map[string]any); ok {
+		return number(details[key])
+	}
+	return 0
+}
+
 func number(v any) int64 {
 	if f, ok := v.(float64); ok {
 		return int64(f)

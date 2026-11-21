@@ -573,9 +573,9 @@ func responseBase(id, model string, createdAt int64, status string, incomplete, 
 		"reasoning": map[string]any{"effort": nil, "summary": nil},
 		"usage": map[string]any{
 			"input_tokens":          usage.Prompt,
-			"input_tokens_details":  map[string]any{"cached_tokens": 0},
+			"input_tokens_details":  map[string]any{"cached_tokens": usage.Cached},
 			"output_tokens":         usage.Completion,
-			"output_tokens_details": map[string]any{"reasoning_tokens": 0},
+			"output_tokens_details": map[string]any{"reasoning_tokens": usage.Reasoning},
 			"total_tokens":          usage.Total,
 		},
 	}
@@ -652,7 +652,7 @@ func contentText(v any) string {
 }
 func usageFromMap(data map[string]any) Usage {
 	if raw, ok := data["usage"].(map[string]any); ok {
-		return Usage{Prompt: number(raw["prompt_tokens"]), Completion: number(raw["completion_tokens"]), Total: number(raw["total_tokens"]), Source: "upstream"}
+		return usageFromRaw(raw)
 	}
 	return Usage{Source: "unavailable"}
 }
