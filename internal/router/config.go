@@ -482,9 +482,15 @@ type Candidate struct {
 	GoogleTokenFile bool `yaml:"google_token_file"`
 	// MistralTokenFile 允许从凭据文件读取 Mistral 平台 API key：
 	// 默认 ~/.nanorouter/mistral_token.json（login mistral 写入）。
-	// 凭据是普通 API key，请求走标准 OpenAI chat completions，
-	// 无需协议适配，也无需本地刷新。
+	// 凭据是普通 API key，无需本地刷新。
 	MistralTokenFile bool `yaml:"mistral_token_file"`
+	// MistralCompat 把 Mistral 的非标准 chat completion 响应规整成 OpenAI
+	// 形状：content parts 折成字符串、thinking 部分移入 reasoning_content、
+	// 剥掉 choice 级 response_error、tool_calls[].index 与 chunk 级私有字段
+	// （p），并把流式 usage 补成 include_usage 要求的 choices:[] 尾帧。
+	// 仅对原生 Chat Completions 的上游生效；不动请求体，凭据仍按
+	// mistral_token_file 读取。
+	MistralCompat bool `yaml:"mistral_compat"`
 	// Probe 显式控制该候选是否在熔断后开启后台异步探活；未配置时继承全局 health_check.enabled。
 	Probe *bool `yaml:"probe"`
 	// Headers 允许针对上游候选配置额外的自定义 HTTP 头（可覆盖默认头）。
@@ -548,6 +554,12 @@ func (u Candidate) validate(global RetryConfig) error {
 	}
 	if u.GoogleTokenFile && !u.GoogleAntigravity {
 		return fmt.Errorf("google_token_file requires google_antigravity to be enabled")
+	}
+	if u.MistralCompat && (u.Anthropic || u.GoogleAntigravity) {
+		return fmt.Errorf("mistral_compat targets native Chat Completions upstreams and conflicts with anthropic / google_antigravity")
+	}
+	if u.MistralCompat && u.Responses {
+		return fmt.Errorf("mistral_compat normalizes Chat Completions responses; use responses_via_chat_completions instead of responses: true")
 	}
 	if u.Anthropic {
 		if u.Responses {

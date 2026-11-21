@@ -1,13 +1,16 @@
 # Mistral Vibe 集成
 
 nanorouter 支持 Mistral Vibe 作为上游：通过浏览器登录换取 Mistral 平台
-API key，之后走标准 OpenAI 兼容的 chat completions 协议，无需协议适配。
+API key，之后请求标准 OpenAI 兼容的 chat completions 协议；响应由可选的
+`mistral_compat` 规整层收敛到 OpenAI 形状。
 
 ## 特性
 
 - **浏览器登录（PKCE）**：对齐 mistral-vibe 客户端的 sign-in / poll /
   exchange 三步流程，自动打开浏览器，headless 机器可复制 URL 授权
-- **标准协议**：上游就是 OpenAI 兼容 API，流式、工具调用等能力直接透传
+- **协议规整**：`mistral_compat: true` 把 content parts 折成字符串、
+  thinking 移入 `reasoning_content`、剥离私有 chunk 字段 `p`，并按
+  `include_usage` 补发 `choices:[]` usage 尾帧
 - **凭据文件**：API key 存 `~/.nanorouter/mistral_token.json`（0600），
   原子写入；请求路径带 5 秒进程内缓存
 - **Origin 校验**：登录服务返回的 sign_in_url / poll_url 必须落在 console /
@@ -46,12 +49,18 @@ routes:
       - id: mistral-medium-3-5
         base_url: https://api.mistral.ai/v1
         mistral_token_file: true
+        mistral_compat: true
         model: mistral-medium-3-5
         expose_as: mistral-medium-3-5
 ```
 
 `base_url` 必须带 `/v1`；漏掉会命中上游 404
-（`no Route matched with those values`）。
+（`no Route matched with those values`）。`mistral_compat` 只改写响应：
+非流式 `content` parts 折成字符串、thinking 移入 `reasoning_content`、
+剥掉 choice 级 `response_error` 与非流式 `tool_calls[].index`；流式剥离
+私有字段 `p` 与内联 usage，并在下游请求了 `stream_options.include_usage`
+时补发标准 `choices:[]` usage 尾帧。错误体同时被包成 `{"error": {...}}`
+信封。未开启时响应原样透传。
 
 ### 3. 验证
 
@@ -81,8 +90,9 @@ curl http://127.0.0.1:8080/v1/chat/completions \
 
 - 凭据是普通平台 API key，不是 OAuth refresh token：不自动刷新，失效后
   重新 `login mistral`
-- 上游是标准 OpenAI 兼容 API：没有协议转换层，`anthropic`、
-  `google_antigravity` 等开关不适用
+- 上游协议是 OpenAI 兼容的 Chat Completions：没有请求侧转换层，
+  `anthropic`、`google_antigravity` 等开关不适用；响应侧可选的
+  `mistral_compat` 仅做形状规整
 
 ## 安全说明
 

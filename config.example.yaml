@@ -271,12 +271,15 @@ routes:
           - reasoning_content
 
       # Mistral Medium 3.5 原生支持 Chat Completions；Responses 通过适配器提供。
+      # mistral_compat 规整 thinking 模型的 content parts、私有字段 p 与
+      # 内联 usage；Mistral Medium 返回纯字符串，开启后行为不变。
       - id: mistral-medium-3-5
         base_url: https://api.mistral.ai/v1
         api_key_env: MISTRAL_API_KEY
         model: mistral-medium-3-5
         expose_as: mistral-medium-3-5
         weight: 1
+        mistral_compat: true
         responses_via_chat_completions: true
         enabled: true
         drop_request_fields:

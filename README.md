@@ -277,7 +277,11 @@ curl "http://127.0.0.1:8080/zcode/login" -H "Authorization: Bearer $NANOROUTER_A
 网关支持 Mistral Vibe：`nanorouter login mistral` 通过浏览器完成 PKCE 登录
 （对齐 mistral-vibe 客户端的 sign-in / poll / exchange 流程），换取的 Mistral
 平台 API key 写入 `~/.nanorouter/mistral_token.json`（0600，原子写入）。上游是
-标准 OpenAI 兼容 API，无需协议适配：
+OpenAI 兼容的 Chat Completions，但响应形状有偏差：thinking 模型把 `content`
+返回成 parts 数组、流式 chunk 带私有字段 `p`、usage 内联在最后一个内容帧且
+不补 `choices:[]` 独立帧、错误体是扁平对象而非 `{"error": {...}}` 信封。开启
+`mistral_compat: true` 后网关在响应方向规整成标准 OpenAI 形状（thinking 移入
+`reasoning_content`），请求体与凭据逻辑不变：
 
 ```yaml
 routes:
@@ -286,6 +290,7 @@ routes:
       - id: mistral-medium
         base_url: https://api.mistral.ai/v1
         mistral_token_file: true
+        mistral_compat: true
         model: mistral-medium-3-5
         expose_as: mistral-medium
 ```

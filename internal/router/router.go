@@ -772,6 +772,8 @@ func (r *Router) proxy(endpoint string, defaultRoutes ...string) http.HandlerFun
 			encoded := prepared.encoded
 			upstreamEndpoint := prepared.upstreamEndpoint
 			adaptedResponses := prepared.adaptedResponses
+			mistralCompat := prepared.mistralCompat
+			streamUsage := prepared.streamUsage
 			credential := prepared.credential
 			queueStart := time.Now()
 			release, acquired := r.acquire(ctx, u)
@@ -825,6 +827,7 @@ func (r *Router) proxy(endpoint string, defaultRoutes ...string) http.HandlerFun
 				requestID: requestID, routeName: routeName, endpoint: endpoint,
 				u: u, attempt: attempt, streamed: streamed,
 				adaptedResponses: adaptedResponses, upstreamEndpoint: upstreamEndpoint,
+				mistralCompat: mistralCompat, streamUsage: streamUsage,
 				credential: credential, latency: latency,
 				start: start, startedAt: startedAt, meta: meta,
 			}
@@ -878,7 +881,13 @@ type preparedAttempt struct {
 	encoded          []byte
 	upstreamEndpoint string
 	adaptedResponses bool
-	credential       string
+	// mistralCompat 表示本次上游响应需要 Mistral→OpenAI 规整；
+	// 经 Anthropic/Gemini 翻译的候选由各自适配器负责，不叠加。
+	mistralCompat bool
+	// streamUsage 记录下游是否请求了 stream_options.include_usage，
+	// 决定流式适配器是否补发 choices:[] usage 尾帧。
+	streamUsage bool
+	credential  string
 }
 
 type proxyRequestError struct {
@@ -945,6 +954,10 @@ func (r *Router) prepareAttempt(ctx context.Context, payload map[string]any, u C
 		}
 	}
 	prepared.payload["model"] = u.Model
+	// 只规整最终仍是 Chat Completions 的响应；Anthropic/Gemini 候选即使
+	// 误配 mistral_compat，也由各自协议适配器处理且配置校验已拒绝。
+	prepared.mistralCompat = u.MistralCompat && prepared.upstreamEndpoint == "chat_completions"
+	prepared.streamUsage = streamWantsUsage(prepared.payload)
 	prepared.encoded, _ = json.Marshal(prepared.payload)
 	return nil
 }
@@ -962,6 +975,8 @@ type proxyAttempt struct {
 	attempt          int
 	streamed         bool
 	adaptedResponses bool
+	mistralCompat    bool
+	streamUsage      bool
 	credential       string
 	upstreamEndpoint string
 	latency          int
@@ -973,6 +988,13 @@ type proxyAttempt struct {
 func (r *Router) handleStreamingResponse(w http.ResponseWriter, resp *http.Response, a proxyAttempt) {
 	var usage Usage
 	var streamErr error
+	var mistral *mistralSSEAdapter
+	if a.mistralCompat {
+		// Responses 链式降级也走这里：事件适配器需要内容帧是字符串，
+		// 而 usage 只能在独立帧里看到，因此为它强制 include_usage。
+		mistral = newMistralSSEAdapter(resp.Body, a.streamUsage || a.adaptedResponses)
+		resp.Body = mistral
+	}
 	switch {
 	case a.adaptedResponses && a.u.Anthropic:
 		usage, streamErr = r.streamMessagesAsChat(w, resp, true, a.routeName)
@@ -986,6 +1008,13 @@ func (r *Router) handleStreamingResponse(w http.ResponseWriter, resp *http.Respo
 		// messages 端点的同方言透传也在默认分支：SSE 原样转发，
 		// usage 由 stream 内的合并逻辑采集。
 		usage, streamErr = r.stream(w, resp)
+	}
+	// 默认 include_usage 时规整器已补发标准 usage 帧，r.stream 会采到；
+	// 未请求 usage 时帧被移除，改用适配器旁路捕获的值记录用量。
+	if mistral != nil {
+		if captured := mistral.Usage(); captured.Source == "upstream" {
+			usage = captured
+		}
 	}
 	// cancelAttempt 会置空 attemptCtx 的 deadline，必须先判定再取消。
 	attemptTimedOut := errors.Is(a.attemptCtx.Err(), context.DeadlineExceeded) && a.ctx.Err() == nil
@@ -1161,6 +1190,17 @@ func (r *Router) handleNonStreamingResponse(w http.ResponseWriter, resp *http.Re
 		return true
 	}
 	r.success(a.u)
+	if a.mistralCompat {
+		normalized, err := normalizeMistralCompletion(b)
+		if err != nil {
+			a.release()
+			writeAPIErrorDialect(w, http.StatusBadGateway, "cannot normalize upstream chat response: "+err.Error(), "upstream_error", a.endpoint)
+			r.record(a.requestID, a.routeName, a.u, a.endpoint, resp.StatusCode, a.latency, false, a.attempt, Usage{Source: "unavailable"}, "upstream", a.meta)
+			r.logRequestFailed(a.requestID, a.endpoint, a.routeName, false, http.StatusBadGateway, a.attempt+1, time.Since(a.startedAt), "response_adaptation_failed")
+			return false
+		}
+		b = normalized
+	}
 	var err error
 	if a.adaptedResponses {
 		if a.u.Anthropic {
@@ -1774,6 +1814,11 @@ func (r *Router) copyErrorResponse(w http.ResponseWriter, resp *http.Response, u
 	// 同方言透传，上游诊断原样到达。
 	if u.Anthropic && endpoint != "messages" {
 		body = anthropicErrorToChat(body)
+	}
+	// Mistral 的错误体是扁平对象；只有在显式开启规整的候选上改写，
+	// 其他上游的同名错误保持透明转发。
+	if u.MistralCompat {
+		body = mistralErrorToOpenAI(body)
 	}
 	r.copyHeaders(w, resp.Header)
 	w.WriteHeader(resp.StatusCode)

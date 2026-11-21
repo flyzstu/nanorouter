@@ -18,6 +18,7 @@ routes:
         mistral_token_file: true
         model: mistral-large-4
         expose_as: mistral-large-4
+        mistral_compat: true
         enabled: true
         attempt_timeout: 90s
         responses_via_chat_completions: true
@@ -27,6 +28,7 @@ routes:
         mistral_token_file: true
         model: mistral-medium-3-5
         expose_as: mistral-medium-3-5
+        mistral_compat: true
         enabled: true
         attempt_timeout: 60s
         responses_via_chat_completions: true
@@ -36,6 +38,7 @@ routes:
         mistral_token_file: true
         model: zai-glm-5-3
         expose_as: zai-glm-5-3
+        mistral_compat: true
         enabled: true
         attempt_timeout: 90s
         responses_via_chat_completions: true
@@ -45,6 +48,7 @@ routes:
         mistral_token_file: true
         model: zai-glm-5-3-flash
         expose_as: zai-glm-5-3-flash
+        mistral_compat: true
         enabled: true
         attempt_timeout: 60s
         responses_via_chat_completions: true
@@ -54,8 +58,10 @@ routes:
 # 失效后重新运行 `nanorouter login mistral` 即可。
 #
 # 思考型模型（mistral-large-4、zai-glm-5-3、zai-glm-5-3-flash）的
-# message.content 返回 parts 数组（thinking + text），网关原样透传；
-# mistral-medium-3-5 返回纯字符串。
+# message.content 返回 parts 数组（thinking + text），流式 chunk 还带私有
+# 字段 p，usage 内联在最后一个内容帧。mistral_compat: true 把这些规整为
+# OpenAI 形状（thinking → reasoning_content，并补发 choices:[] usage 尾帧）；
+# mistral-medium-3-5 返回纯字符串，开启后行为不变。
 
 # 可选：与其他路由合并使用
 # free-fast:

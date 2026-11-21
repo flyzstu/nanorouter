@@ -198,6 +198,8 @@ reasoning summary 没有纯 Chat Completions 等价表示，必须返回 400，�
 
 Cerebras `gpt-oss-120b` 与 Mistral 一样使用原生 Chat Completions 加 Responses 适配的组合。它的普通 Chat 路径可保留工具调用与结构化输出；若下游一定需要完整的 Responses 工具/状态语义，应优先路由到 Groq 或 OpenRouter 的原生 Responses 候选。
 
+Mistral 的 Chat Completions 响应不满足 OpenAI 形状：thinking 模型的 `message.content` 是 parts 数组，流式 chunk 带私有字段 `p`，usage 内联在最后一个内容帧且不补 `choices:[]` 独立帧，错误体是扁平对象。候选级 `mistral_compat: true` 在响应方向规整：content parts 折成字符串、thinking 写入 `reasoning_content`、剥离 `response_error` / 非流式 `tool_calls[].index` / `p`，并在下游请求 `stream_options.include_usage` 时补发标准 usage 尾帧。该开关不改写请求，也不影响故障切换；`responses_via_chat_completions` 叠加时先规整成 OpenAI chunk，再进入 Responses 包装，流式规整器为此会强制补发 usage 帧供适配器采集。`mistral_compat` 与 `anthropic` / `google_antigravity` / `responses: true` 互斥（配置校验直接拒绝），避免规整器与协议翻译层双重改写。
+
 ## 上游参数清洗与客户端仿真
 
 兼容不等于每个字段都支持。候选可声明 `drop_request_fields` 与 `drop_message_fields`，网关仅在请求已选定该候选后删除这些字段。这样 Groq 的不支持字段不会导致 400，同时切换到其他供应商时仍保留原请求。清洗适合无副作用的观测、日志概率或元数据字段；会改变结果数量、工具执行或状态机行为的字段不应自动改写。
