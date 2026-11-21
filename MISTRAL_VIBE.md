@@ -50,6 +50,7 @@ routes:
         base_url: https://api.mistral.ai/v1
         mistral_token_file: true
         mistral_compat: true
+        drop_request_fields: ["store"]
         model: mistral-medium-3-5
         expose_as: mistral-medium-3-5
 ```
@@ -61,6 +62,10 @@ routes:
 私有字段 `p` 与内联 usage，并在下游请求了 `stream_options.include_usage`
 时补发标准 `choices:[]` usage 尾帧。错误体同时被包成 `{"error": {...}}`
 信封。未开启时响应原样透传。
+
+请求方向唯一的例外是 `store`：OpenAI 客户端（omp、部分 SDK）会发送
+`store: false`，Mistral 以 422 `invalid_request_error` 拒绝。在候选上配
+`drop_request_fields: ["store"]` 即可，清洗只影响选中该候选的请求。
 
 ### 3. 验证
 

@@ -19,6 +19,8 @@ routes:
         model: mistral-large-4
         expose_as: mistral-large-4
         mistral_compat: true
+        # OpenAI 客户端（如 omp）会发 store:false，Mistral 以 422 拒绝
+        drop_request_fields: ["store"]
         enabled: true
         attempt_timeout: 90s
         responses_via_chat_completions: true
@@ -29,6 +31,8 @@ routes:
         model: mistral-medium-3-5
         expose_as: mistral-medium-3-5
         mistral_compat: true
+        # OpenAI 客户端（如 omp）会发 store:false，Mistral 以 422 拒绝
+        drop_request_fields: ["store"]
         enabled: true
         attempt_timeout: 60s
         responses_via_chat_completions: true
@@ -39,6 +43,8 @@ routes:
         model: zai-glm-5-3
         expose_as: zai-glm-5-3
         mistral_compat: true
+        # OpenAI 客户端（如 omp）会发 store:false，Mistral 以 422 拒绝
+        drop_request_fields: ["store"]
         enabled: true
         attempt_timeout: 90s
         responses_via_chat_completions: true
@@ -49,6 +55,8 @@ routes:
         model: zai-glm-5-3-flash
         expose_as: zai-glm-5-3-flash
         mistral_compat: true
+        # OpenAI 客户端（如 omp）会发 store:false，Mistral 以 422 拒绝
+        drop_request_fields: ["store"]
         enabled: true
         attempt_timeout: 60s
         responses_via_chat_completions: true

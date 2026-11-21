@@ -281,7 +281,9 @@ OpenAI 兼容的 Chat Completions，但响应形状有偏差：thinking 模型�
 返回成 parts 数组、流式 chunk 带私有字段 `p`、usage 内联在最后一个内容帧且
 不补 `choices:[]` 独立帧、错误体是扁平对象而非 `{"error": {...}}` 信封。开启
 `mistral_compat: true` 后网关在响应方向规整成标准 OpenAI 形状（thinking 移入
-`reasoning_content`），请求体与凭据逻辑不变：
+`reasoning_content`），请求体与凭据逻辑不变。唯一需要路由侧配合的是 `store`
+字段：OpenAI 客户端（例如 omp）默认发送 `store: false`，Mistral 会以 422
+`invalid_request_error` 拒绝，因此在候选上配置 `drop_request_fields: ["store"]`：
 
 ```yaml
 routes:
@@ -291,6 +293,7 @@ routes:
         base_url: https://api.mistral.ai/v1
         mistral_token_file: true
         mistral_compat: true
+        drop_request_fields: ["store"]
         model: mistral-medium-3-5
         expose_as: mistral-medium
 ```
