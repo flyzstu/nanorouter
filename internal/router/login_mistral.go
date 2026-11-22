@@ -58,6 +58,11 @@ const (
 	// mistralMaxPollFailures 连续轮询失败上限（官方 _max_consecutive_poll_failures）。
 	mistralMaxPollFailures = 3
 
+	// mistralUserAgent 在 sign-in / poll / exchange 三条请求上声明第一方客户端身份，
+	// 与官方 vibe/utils/http.py 的 get_user_agent() 一致（Mistral-Vibe/{__version__}）。
+	// 升级所对齐的上游版本时同步修改。
+	mistralUserAgent = "Mistral-Vibe/3.1.4"
+
 	// mistralChatBaseURL 是候选 base_url 的正确形态：网关按 base+"/"+path
 	// 拼接（path=chat/completions），漏掉 /v1 会被上游 404
 	// （"no Route matched with those values"）。
@@ -194,6 +199,7 @@ func mistralStartSignIn(ctx context.Context, client *http.Client, apiBase, brows
 		return nil, err
 	}
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("User-Agent", mistralUserAgent)
 
 	resp, err := client.Do(req)
 	if err != nil {
@@ -292,6 +298,7 @@ func mistralPollOnce(ctx context.Context, client *http.Client, pollURL string) (
 	if err != nil {
 		return "", "", "", err
 	}
+	req.Header.Set("User-Agent", mistralUserAgent)
 	resp, err := client.Do(req)
 	if err != nil {
 		return "", "", "", err
@@ -334,6 +341,7 @@ func mistralExchange(ctx context.Context, client *http.Client, process *mistralS
 		return "", err
 	}
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("User-Agent", mistralUserAgent)
 
 	resp, err := client.Do(req)
 	if err != nil {

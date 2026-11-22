@@ -31,6 +31,7 @@ type fakeMistralConsole struct {
 	pollStatus   int    // poll 的 HTTP 状态码（默认 200）
 	exchangeReqs chan<- *mistralExchangeRecord
 	signInReqs   chan<- *http.Request
+	userAgents   []string // 每个入站请求的 User-Agent，按到达顺序
 }
 
 // mistralExchangeRecord 捕获 exchange 请求的头与体。
@@ -40,6 +41,9 @@ type mistralExchangeRecord struct {
 }
 
 func (f *fakeMistralConsole) ServeHTTP(w http.ResponseWriter, req *http.Request) {
+	f.mu.Lock()
+	f.userAgents = append(f.userAgents, req.Header.Get("User-Agent"))
+	f.mu.Unlock()
 	switch {
 	case req.Method == http.MethodPost && req.URL.Path == "/api/vibe/sign-in":
 		if f.signInReqs != nil {
@@ -185,6 +189,41 @@ func TestRunMistralLoginHappyPath(t *testing.T) {
 	// 网关回退读取：凭据文件 → key。
 	if key := mistralTokenFileKey(); key != "mk-test-key-123" {
 		t.Fatalf("fallback key=%q", key)
+	}
+}
+
+// 官方 console 依据第一方 UA 区分 Vibe 客户端；sign-in / poll / exchange 三条请求都必须带上它。
+func TestMistralLoginRequestsCarryVibeUserAgent(t *testing.T) {
+	server, console := newMistralTestConsole(t, func(c *fakeMistralConsole) {
+		c.pollBody = `{"status":"completed","exchange_token":"tok-xyz"}`
+	})
+
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	resetMistralTokenCache()
+	t.Cleanup(resetMistralTokenCache)
+
+	opts := MistralLoginOptions{
+		BrowserBaseURL: server.URL,
+		APIBaseURL:     server.URL + "/api",
+		PollTimeout:    10 * time.Second,
+		PollInterval:   10 * time.Millisecond,
+		TokenStorePath: filepath.Join(home, ".nanorouter", mistralTokenStoreName),
+		Output:         io.Discard,
+	}
+	if _, err := RunMistralLogin(context.Background(), opts); err != nil {
+		t.Fatalf("login: %v", err)
+	}
+
+	console.mu.Lock()
+	defer console.mu.Unlock()
+	if len(console.userAgents) < 3 {
+		t.Fatalf("requests=%d", len(console.userAgents))
+	}
+	for index, userAgent := range console.userAgents {
+		if userAgent != mistralUserAgent {
+			t.Fatalf("request %d user-agent=%q want %q", index, userAgent, mistralUserAgent)
+		}
 	}
 }
 
