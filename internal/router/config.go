@@ -364,6 +364,9 @@ type Route struct {
 	Strategy    string            `yaml:"strategy"`
 	RetryBudget RetryBudgetConfig `yaml:"retry_budget"`
 	Candidates  []Candidate       `yaml:"candidates"`
+	// ReasoningLevels 声明该路由模型支持的 reasoning effort 阶梯，经 /v1/models
+	// 的 metadata.supported_reasoning_levels 对下游发布（空 = 不声明）。
+	ReasoningLevels []string `yaml:"reasoning_levels"`
 }
 
 // RetryBudgetConfig 用令牌预算限制故障切换带来的请求放大。每个初始请求补充 Ratio 个令牌，

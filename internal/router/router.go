@@ -608,7 +608,11 @@ func (r *Router) models(w http.ResponseWriter, q *http.Request) {
 	data := make([]map[string]any, 0, len(modelIDs))
 	created := time.Now().Unix()
 	for _, id := range modelIDs {
-		data = append(data, map[string]any{"id": id, "object": "model", "created": created, "owned_by": "nanorouter"})
+		entry := map[string]any{"id": id, "object": "model", "created": created, "owned_by": "nanorouter"}
+		if route, ok := r.cfg.Routes[id]; ok && len(route.ReasoningLevels) > 0 {
+			entry["metadata"] = map[string]any{"supported_reasoning_levels": route.ReasoningLevels}
+		}
+		data = append(data, entry)
 	}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]any{"object": "list", "data": data})
