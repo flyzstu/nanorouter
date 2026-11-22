@@ -72,10 +72,16 @@ type Router struct {
 	allCandidates     []Candidate
 	proberCancel      context.CancelFunc
 	proberDone        chan struct{}
-	registry          *prometheus.Registry
-	logger            *zap.Logger
-	retryBackoff      func(int) time.Duration
-	retryWait         func(context.Context, time.Duration) bool
+	// vibeMu 保护目录自动发现的结果；与 mu 分开，避免每请求路由解析与熔断状态抢同一把锁。
+	vibeMu       sync.RWMutex
+	vibeModels   []vibeModel
+	vibeRoutes   map[string]vibeRouteEntry
+	vibeCancel   context.CancelFunc
+	vibeDone     chan struct{}
+	registry     *prometheus.Registry
+	logger       *zap.Logger
+	retryBackoff func(int) time.Duration
+	retryWait    func(context.Context, time.Duration) bool
 	// zcodeLogin 是 ZCode 登录的后台任务快照，由 r.mu 保护；nil 表示从未触发。
 	// 与 states（熔断）分开：后者按候选 id 存，这是一次性人工动作。
 	zcodeLogin *zcodeLoginTask
@@ -202,6 +208,12 @@ func NewWithLogger(cfg Config, db *sql.DB, logger *zap.Logger) (*Router, error) 
 		r.proberDone = make(chan struct{})
 		go r.runProber(ctx)
 	}
+	if r.hasVibeCatalogCandidates() {
+		ctx, cancel := context.WithCancel(context.Background())
+		r.vibeCancel = cancel
+		r.vibeDone = make(chan struct{})
+		go r.runVibeCatalog(ctx)
+	}
 	r.startZcodeCredentialCheck()
 	return r, nil
 }
@@ -279,6 +291,13 @@ func (r *Router) Close(ctx context.Context) error {
 		r.proberCancel()
 		select {
 		case <-r.proberDone:
+		case <-ctx.Done():
+		}
+	}
+	if r.vibeCancel != nil {
+		r.vibeCancel()
+		select {
+		case <-r.vibeDone:
 		case <-ctx.Done():
 		}
 	}
@@ -594,13 +613,39 @@ func writeJSON(w http.ResponseWriter, status int, payload any) {
 
 func (r *Router) models(w http.ResponseWriter, q *http.Request) {
 	modelIDs := make([]string, 0, len(r.cfg.Routes))
+	seen := make(map[string]bool, len(r.cfg.Routes))
+	add := func(id string) {
+		if id == "" || seen[id] {
+			return
+		}
+		seen[id] = true
+		modelIDs = append(modelIDs, id)
+	}
+	metadata := make(map[string]map[string]any)
 	for name, route := range r.cfg.Routes {
 		if hasEnabledAggregateCandidate(route) {
-			modelIDs = append(modelIDs, name)
+			add(name)
+			if meta := routeModelMetadata(route); len(meta) > 0 {
+				metadata[name] = meta
+			}
 		}
 		for _, candidate := range route.Candidates {
 			if candidate.ExposeAs != "" && candidate.IsEnabled() {
-				modelIDs = append(modelIDs, candidate.ExposeAs)
+				add(candidate.ExposeAs)
+				if _, ok := metadata[candidate.ExposeAs]; !ok {
+					if meta := candidateModelMetadata(route, candidate); len(meta) > 0 {
+						metadata[candidate.ExposeAs] = meta
+					}
+				}
+			}
+		}
+	}
+	// 目录模型只是补充：显式配置的同名条目已在上面占位，这里不覆盖其元数据。
+	for _, model := range r.vibeModelsSnapshot() {
+		add(model.id)
+		if _, ok := metadata[model.id]; !ok {
+			if meta := model.metadata(); len(meta) > 0 {
+				metadata[model.id] = meta
 			}
 		}
 	}
@@ -609,13 +654,46 @@ func (r *Router) models(w http.ResponseWriter, q *http.Request) {
 	created := time.Now().Unix()
 	for _, id := range modelIDs {
 		entry := map[string]any{"id": id, "object": "model", "created": created, "owned_by": "nanorouter"}
-		if route, ok := r.cfg.Routes[id]; ok && len(route.ReasoningLevels) > 0 {
-			entry["metadata"] = map[string]any{"supported_reasoning_levels": route.ReasoningLevels}
+		if meta, ok := metadata[id]; ok {
+			entry["metadata"] = meta
 		}
 		data = append(data, entry)
 	}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]any{"object": "list", "data": data})
+}
+
+// routeModelMetadata 汇总聚合路由可发布的参数：上下文窗口只承诺所有候选都能
+// 满足的最小值，推理档位来自路由自身的 reasoning_levels。
+func routeModelMetadata(route Route) map[string]any {
+	meta := make(map[string]any, 2)
+	length := 0
+	for _, candidate := range route.Candidates {
+		if !candidate.IsAggregateEnabled() || candidate.ContextLength <= 0 {
+			continue
+		}
+		if length == 0 || candidate.ContextLength < length {
+			length = candidate.ContextLength
+		}
+	}
+	if length > 0 {
+		meta["context_length"] = length
+	}
+	if len(route.ReasoningLevels) > 0 {
+		meta["supported_reasoning_levels"] = route.ReasoningLevels
+	}
+	return meta
+}
+
+func candidateModelMetadata(route Route, candidate Candidate) map[string]any {
+	meta := make(map[string]any, 2)
+	if candidate.ContextLength > 0 {
+		meta["context_length"] = candidate.ContextLength
+	}
+	if len(route.ReasoningLevels) > 0 {
+		meta["supported_reasoning_levels"] = route.ReasoningLevels
+	}
+	return meta
 }
 func (r *Router) proxy(endpoint string, defaultRoutes ...string) http.HandlerFunc {
 	return func(w http.ResponseWriter, q *http.Request) {
@@ -1308,7 +1386,8 @@ func (r *Router) routeForModel(name string) (Route, bool) {
 			}
 		}
 	}
-	return Route{}, false
+	// 目录自动发现的模型是显式配置的兜底：路由名与 expose_as 永远优先。
+	return r.vibeRouteForModel(name)
 }
 
 // 日志字段仅包含运行元数据，禁止将 prompt、模型回复和 Authorization 写入日志。

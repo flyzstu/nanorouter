@@ -208,7 +208,7 @@ SenseNova 目前推荐使用 `token.sensenova.cn/v1` 端点，该端点为标准
 字段约束到 `[1, limit]`。因此 SenseNova 不会再因下游请求超过 `65536`（或传入 `0`）而返回
 `field MaxTokens invalid`，同时原始值仍可供故障切换到限制不同的其他候选使用。
 
-若路由中同时存在不支持 `reasoning_effort` 的其他候选（如 Groq、Agnes、Mistral、Cerebras），应在那些候选上配置 `drop_request_fields: [reasoning_effort]`。清洗在选中候选后不影响故障转移时其他候选接收该字段的能力。
+若路由中同时存在不支持 `reasoning_effort` 的其他候选（如 Groq、Agnes、Cerebras），应在那些候选上配置 `drop_request_fields: [reasoning_effort]`。Mistral Vibe 的思考型模型（`mistral-large-4-0` low/medium/high、`mistral-medium-3.5` none/high、`zai-glm-5-3*`）接受该字段，无需清洗；可用档位也可从 `/model-catalog` 的 `parameters.reasoning` 直接读到（见"Mistral Vibe 上游"）。清洗在选中候选后不影响故障转移时其他候选接收该字段的能力。
 
 适配器支持：`input`（文本/图片消息及手动回传的 `output_text`）、`instructions`、常用采样参数、`max_output_tokens`、`reasoning.effort`、`text.verbosity`、`text.format` 结构化输出、自定义函数 `tools` / `tool_choice` / `parallel_tool_calls`、`function_call` / `function_call_output`、流式事件与 usage。Chat 返回的函数调用、拒绝和 token 截断状态也会转换为对应 Responses Item 或状态。
 
@@ -289,14 +289,29 @@ OpenAI 兼容的 Chat Completions，但响应形状有偏差：thinking 模型�
 routes:
   mistral-vibe:
     candidates:
-      - id: mistral-medium
+      - id: mistral-catalog
         base_url: https://api.mistral.ai/v1
         mistral_token_file: true
         mistral_compat: true
+        vibe_catalog: true
         drop_request_fields: ["store"]
-        model: mistral-medium-3-5
-        expose_as: mistral-medium
+        drop_message_fields: ["reasoning_content"]
+        model: mistral-large-4-0   # 占位，目录里的 id 会覆盖它
 ```
+
+`vibe_catalog: true` 让候选在启动时及之后每 15 分钟（失败 1 分钟）拉取
+`GET {base_url}/model-catalog?surface=vibe-code`：目录里无 `requires` 套餐限制、
+支持函数调用的模型会自动出现在 `GET /v1/models`（`publisher` 只是模型作者，
+zai / deepseek 等第三方模型同样由 Mistral 第一方转发，照常发布），
+带 `metadata.context_length` 与 `metadata.supported_reasoning_levels`，其 `id`
+与 `aliases` 都可直接作为 `model` 路由到该候选。拉取失败只记日志并沿用上次
+结果（fail-open），配置里显式的路由名与 `expose_as` 始终优先。不需要自动发现时
+可改用普通候选，并用 `context_length: <tokens>` 手动声明窗口。
+
+`drop_message_fields: ["reasoning_content"]` 用于跨供应商复用 assistant 历史：
+Mistral 的请求校验是 `extra_forbidden`，历史里带 `reasoning_content`（含空串）
+会 422，网关会按候选配置剥掉该字段。`login mistral` 的三条请求都已携带
+`User-Agent: Mistral-Vibe/3.1.4`（对齐官方客户端）。
 
 凭据解析顺序：`MISTRAL_API_KEY` 环境变量 → 凭据文件（5 秒进程内缓存）。key
 不会自动刷新，失效后重新 `login mistral` 即可；headless 机器加 `--no-browser`

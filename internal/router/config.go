@@ -494,6 +494,17 @@ type Candidate struct {
 	// 仅对原生 Chat Completions 的上游生效；不动请求体，凭据仍按
 	// mistral_token_file 读取。
 	MistralCompat bool `yaml:"mistral_compat"`
+	// VibeCatalog 让该候选在启动时（以及随后定期）拉取 Mistral 的模型目录
+	// GET {base_url}/model-catalog?surface=vibe-code，把目录里的模型自动发布为
+	// 可路由模型：/v1/models 会列出它们（带 context_length 与
+	// supported_reasoning_levels），下游指定这些 id 时走本候选并把线上 model
+	// 换成目录里的规范 id。目录拉取失败保持上一次成功结果，配置里已有的
+	// 路由名与 expose_as 永远优先。
+	VibeCatalog bool `yaml:"vibe_catalog"`
+	// ContextLength 声明该模型可用的上下文窗口（tokens），经 /v1/models 的
+	// metadata.context_length 发布；0 表示不声明。vibe_catalog 拉到的模型
+	// 用目录里的 max_context_length，无需配置本项。
+	ContextLength int `yaml:"context_length"`
 	// Probe 显式控制该候选是否在熔断后开启后台异步探活；未配置时继承全局 health_check.enabled。
 	Probe *bool `yaml:"probe"`
 	// Headers 允许针对上游候选配置额外的自定义 HTTP 头（可覆盖默认头）。
@@ -563,6 +574,24 @@ func (u Candidate) validate(global RetryConfig) error {
 	}
 	if u.MistralCompat && u.Responses {
 		return fmt.Errorf("mistral_compat normalizes Chat Completions responses; use responses_via_chat_completions instead of responses: true")
+	}
+	if u.ContextLength < 0 {
+		return fmt.Errorf("negative context_length")
+	}
+	if u.VibeCatalog && strings.TrimSpace(u.BaseURL) == "" {
+		return fmt.Errorf("vibe_catalog requires base_url")
+	}
+	if u.VibeCatalog && (u.Anthropic || u.GoogleAntigravity) {
+		return fmt.Errorf("vibe_catalog reads the Mistral model catalog and conflicts with anthropic / google_antigravity")
+	}
+	if u.VibeCatalog && u.LlamaServer {
+		return fmt.Errorf("vibe_catalog reads the Mistral model catalog; llama_server upstreams do not serve it")
+	}
+	if u.VibeCatalog && u.Responses {
+		return fmt.Errorf("vibe_catalog targets the Mistral API, which serves no /v1/responses; use responses_via_chat_completions instead of responses: true")
+	}
+	if u.VibeCatalog && u.APIKeyEnv == "" && !u.MistralTokenFile {
+		return fmt.Errorf("vibe_catalog requires a Mistral credential: set api_key_env or mistral_token_file")
 	}
 	if u.Anthropic {
 		if u.Responses {

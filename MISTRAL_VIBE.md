@@ -15,6 +15,10 @@ API key，之后请求标准 OpenAI 兼容的 chat completions 协议；响应�
   原子写入；请求路径带 5 秒进程内缓存
 - **Origin 校验**：登录服务返回的 sign_in_url / poll_url 必须落在 console /
   api origin 下，防止授权过程被引到第三方页面
+- **第一方身份**：sign-in / poll / exchange 请求携带
+  `User-Agent: Mistral-Vibe/3.1.4`，与官方客户端一致
+- **模型自动发现**：`vibe_catalog: true` 拉取 `/model-catalog`，把模型、上下文
+  窗口与推理档位直接发布到 `/v1/models`
 
 ## 快速开始
 
@@ -46,13 +50,14 @@ headless/远程服务器：
 routes:
   mistral-vibe:
     candidates:
-      - id: mistral-medium-3-5
+      - id: mistral-catalog
         base_url: https://api.mistral.ai/v1
         mistral_token_file: true
+        model: mistral-large-4-0   # 占位，目录里的 id 会覆盖它
+        vibe_catalog: true         # 自动发布整个模型目录
         mistral_compat: true
         drop_request_fields: ["store"]
-        model: mistral-medium-3-5
-        expose_as: mistral-medium-3-5
+        drop_message_fields: ["reasoning_content"]
 ```
 
 `base_url` 必须带 `/v1`；漏掉会命中上游 404
@@ -63,16 +68,52 @@ routes:
 时补发标准 `choices:[]` usage 尾帧。错误体同时被包成 `{"error": {...}}`
 信封。未开启时响应原样透传。
 
-请求方向唯一的例外是 `store`：OpenAI 客户端（omp、部分 SDK）会发送
-`store: false`，Mistral 以 422 `invalid_request_error` 拒绝。在候选上配
-`drop_request_fields: ["store"]` 即可，清洗只影响选中该候选的请求。
+请求方向的清洗有两处：
+
+- `store`：OpenAI 客户端（omp、部分 SDK）会发送 `store: false`，Mistral 以
+  422 `invalid_request_error` 拒绝。在候选上配 `drop_request_fields: ["store"]`。
+- `reasoning_content`：下游若曾接入 DeepSeek 兼容上游，assistant 历史会带
+  `reasoning_content`（包括空串），Mistral 的请求校验是 `extra_forbidden`，
+  同样 422。配 `drop_message_fields: ["reasoning_content"]` 后由网关剥掉，
+  只影响选中该候选的请求，不影响其他上游读取同一段历史。
 
 ### 3. 验证
 
 ```bash
 curl http://127.0.0.1:8080/v1/chat/completions \
   -H "Content-Type: application/json" \
-  -d '{"model":"mistral-medium-3-5","messages":[{"role":"user","content":"hi"}]}'
+  -d '{"model":"mistral-large-4-0","messages":[{"role":"user","content":"hi"}]}'
+```
+
+## 模型目录自动发现（`vibe_catalog`）
+
+候选设 `vibe_catalog: true` 后，网关按官方客户端的路径拉目录：
+
+```
+GET {base_url}/model-catalog?surface=vibe-code
+```
+
+- **何时拉**：启动即拉一次；成功每 15 分钟刷新，失败 1 分钟后重试。
+  单个候选失败时保留它上一次成功的条目，全部失败只记日志，不影响启动与
+  已有路由（fail-open）。
+- **发布哪些**：只保留 `requires` 为 `null`（未声明套餐门槛）、
+  `capabilities.function_calling` 不为 false 的条目——与官方客户端的过滤、`_hide_reasons` 一致，需要更高套餐的模型
+  不会出现在列表里。`publisher` 只是模型作者（`mistral` / `zai` / `deepseek`），
+  这些模型都由 Mistral 第一方转发，因此不按它过滤。
+- **路由**：目录里的 `id` 与 `aliases` 都可直接作为 `model` 使用，网关照常
+  把线上 `model` 换成目录规范 id；配置里显式声明的路由名与 `expose_as`
+  永远优先，目录只做兜底。
+- **上下文与档位**：`/v1/models` 的 `metadata` 带 `context_length`
+  （目录 `max_context_length`）与 `supported_reasoning_levels`
+  （目录 `parameters.reasoning`）。手写候选也可用 `context_length: <tokens>`
+  声明窗口；聚合路由取所有候选声明值里的最小值，显式路由或 `expose_as` 与目录
+  同名且自身未声明 `context_length` / `reasoning_levels` 时，由目录补齐这两项
+  metadata。
+
+```json
+{"id": "mistral-large-4-0", "object": "model", "owned_by": "nanorouter",
+ "metadata": {"context_length": 1048576,
+              "supported_reasoning_levels": ["low", "medium", "high"]}}
 ```
 
 ## 凭据解析顺序

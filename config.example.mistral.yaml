@@ -13,74 +13,65 @@ routes:
   mistral-vibe:
     strategy: weighted_round_robin
     candidates:
-      - id: mistral-large-4
+      # 推荐写法：一个候选发布整个模型目录。启动时（随后每 15 分钟）拉取
+      # GET {base_url}/model-catalog?surface=vibe-code，把目录里的模型自动
+      # 发布成可路由 ID，并在 /v1/models 的 metadata 里带上 context_length
+      # 与 supported_reasoning_levels；上游新增模型无需改配置。
+      - id: mistral-catalog
         base_url: https://api.mistral.ai/v1
         mistral_token_file: true
-        model: mistral-large-4
-        expose_as: mistral-large-4
+        # 候选的 model 会被目录里的规范 id 覆盖，这里只是占位。
+        model: mistral-large-4-0
+        vibe_catalog: true
         mistral_compat: true
         # OpenAI 客户端（如 omp）会发 store:false，Mistral 以 422 拒绝
         drop_request_fields: ["store"]
+        # 跨供应商复用的 assistant 历史可能带 reasoning_content（例如从
+        # DeepSeek 兼容上游转来），Mistral 以 422 extra_forbidden 拒绝空值。
+        drop_message_fields: ["reasoning_content"]
         enabled: true
-        attempt_timeout: 90s
+        attempt_timeout: 120s
         responses_via_chat_completions: true
 
-      - id: mistral-medium-3-5
-        base_url: https://api.mistral.ai/v1
-        mistral_token_file: true
-        model: mistral-medium-3-5
-        expose_as: mistral-medium-3-5
-        mistral_compat: true
-        # OpenAI 客户端（如 omp）会发 store:false，Mistral 以 422 拒绝
-        drop_request_fields: ["store"]
-        enabled: true
-        attempt_timeout: 60s
-        responses_via_chat_completions: true
-
-      - id: zai-glm-5-3
-        base_url: https://api.mistral.ai/v1
-        mistral_token_file: true
-        model: zai-glm-5-3
-        expose_as: zai-glm-5-3
-        mistral_compat: true
-        # OpenAI 客户端（如 omp）会发 store:false，Mistral 以 422 拒绝
-        drop_request_fields: ["store"]
-        enabled: true
-        attempt_timeout: 90s
-        responses_via_chat_completions: true
-
-      - id: zai-glm-5-3-flash
-        base_url: https://api.mistral.ai/v1
-        mistral_token_file: true
-        model: zai-glm-5-3-flash
-        expose_as: zai-glm-5-3-flash
-        mistral_compat: true
-        # OpenAI 客户端（如 omp）会发 store:false，Mistral 以 422 拒绝
-        drop_request_fields: ["store"]
-        enabled: true
-        attempt_timeout: 60s
-        responses_via_chat_completions: true
+# 备选写法：逐个手写候选。适合只想开放固定几个模型、或上游目录不可用时。
+# 每个候选可用 context_length 声明上下文窗口，/v1/models 会以
+# metadata.context_length 发布（目录模式无需配置，目录里有 max_context_length）。
+#
+#      - id: mistral-large-4
+#        base_url: https://api.mistral.ai/v1
+#        mistral_token_file: true
+#        model: mistral-large-4-0
+#        expose_as: mistral-large-4-0
+#        context_length: 1048576
+#        mistral_compat: true
+#        drop_request_fields: ["store"]
+#        drop_message_fields: ["reasoning_content"]
+#        enabled: true
+#        attempt_timeout: 90s
+#        responses_via_chat_completions: true
+#
+#      - id: mistral-medium-3-5
+#        base_url: https://api.mistral.ai/v1
+#        mistral_token_file: true
+#        model: mistral-medium-3-5
+#        expose_as: mistral-medium-3-5
+#        context_length: 262144
+#        mistral_compat: true
+#        drop_request_fields: ["store"]
+#        drop_message_fields: ["reasoning_content"]
+#        enabled: true
+#        attempt_timeout: 60s
+#        responses_via_chat_completions: true
 
 # 凭据解析顺序：MISTRAL_API_KEY 环境变量 → ~/.nanorouter/mistral_token.json
 # （login mistral 写入，0600）。凭据是 Mistral 平台 API key，不会自动刷新；
 # 失效后重新运行 `nanorouter login mistral` 即可。
 #
-# 思考型模型（mistral-large-4、zai-glm-5-3、zai-glm-5-3-flash）的
-# message.content 返回 parts 数组（thinking + text），流式 chunk 还带私有
-# 字段 p，usage 内联在最后一个内容帧。mistral_compat: true 把这些规整为
-# OpenAI 形状（thinking → reasoning_content，并补发 choices:[] usage 尾帧）；
-# mistral-medium-3-5 返回纯字符串，开启后行为不变。
-
-# 可选：与其他路由合并使用
-# free-fast:
-#   candidates:
-#     - id: mistral-medium-3-5
-#       base_url: https://api.mistral.ai/v1
-#       mistral_token_file: true
-#       model: mistral-medium-3-5
-#       weight: 2
-#     - id: other-provider
-#       base_url: https://api.example.com/v1
-#       api_key_env: OTHER_API_KEY
-#       model: gpt-4
-#       weight: 1
+# 思考型模型（mistral-large-4-0、zai-glm-5-3、zai-glm-5-3-flash、
+# deepseek-v4-1-flash-1017）的 message.content 返回 parts 数组
+# （thinking + text），流式 chunk 还带私有字段 p，usage 内联在最后一个内容帧。
+# mistral_compat: true 把这些规整为 OpenAI 形状（thinking → reasoning_content，
+# 并补发 choices:[] usage 尾帧）；mistral-medium-3.5 返回纯字符串，开启后行为不变。
+#
+# login mistral 的三条请求（sign-in / poll / exchange）都带
+# User-Agent: Mistral-Vibe/3.1.4，对齐官方客户端的身份声明。
