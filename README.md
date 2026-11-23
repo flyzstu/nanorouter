@@ -543,7 +543,7 @@ curl "http://127.0.0.1:8080/v1/models" \
     go test ./internal/router -run APIKeyPostgres -count=1 -v
   ```
 
-- CI：`.gitea/workflows/build-image.yaml` 的 `test` job 使用 `services: postgres`，运行 `go test ./...`、race 测试和 `make smoke-api-keys`；镜像构建依赖测试通过。`services` 只在容器 job 中启动，当前 `ubuntu-latest` 标签映射到 Docker 镜像；旧 runner 不等待 service healthcheck，Postgres 测试内部会重试连接。
+- CI：`.gitea/workflows/image-on-tags.yaml` 的 `test` job 使用 `services: postgres`，运行 `go test ./...`、race 测试和 `make smoke-api-keys`；镜像构建依赖测试通过。`services` 只在容器 job 中启动，当前 `ubuntu-latest` 标签映射到 Docker 镜像；旧 runner 不等待 service healthcheck，Postgres 测试内部会重试连接。
 
 ## 查看用量
 
