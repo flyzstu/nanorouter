@@ -2,14 +2,19 @@ name: Build container image
 
 # 只在打 tag 时构建：main 的 push 与 PR 都不触发，避免同一次发布
 # 被 main push 和 tag push 各构建一遍。
+# Gitea 把只写 tags 的 push 规则当成“所有分支也匹配”，因此必须显式
+# 用 branches-ignore 排除分支；job 上再加 ref 守卫兜底。
 on:
   push:
+    branches-ignore:
+      - '**'
     tags:
       - '*'
   workflow_dispatch:
 
 jobs:
   test:
+    if: gitea.event_name == 'workflow_dispatch' || startsWith(gitea.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     services:
       postgres:
@@ -40,6 +45,7 @@ jobs:
         run: ./scripts/api-keys-smoke.sh
 
   build:
+    if: gitea.event_name == 'workflow_dispatch' || startsWith(gitea.ref, 'refs/tags/')
     needs: test
     runs-on: ubuntu-latest
     env:
