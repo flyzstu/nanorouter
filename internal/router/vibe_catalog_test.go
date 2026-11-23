@@ -196,6 +196,9 @@ func TestMistralExampleConfigLoadsCatalogCandidate(t *testing.T) {
 	if !candidate.VibeCatalog || !candidate.MistralCompat || !candidate.ResponsesViaChatCompletions {
 		t.Fatalf("candidate=%+v", candidate)
 	}
+	if candidate.Model != "" {
+		t.Fatalf("catalog candidate should not need a placeholder model, got %q", candidate.Model)
+	}
 	if strings.Join(candidate.DropMessageFields, ",") != "reasoning_content" {
 		t.Fatalf("drop_message_fields=%v", candidate.DropMessageFields)
 	}
@@ -230,6 +233,7 @@ func TestVibeCatalogValidation(t *testing.T) {
 	if err := (Candidate{ID: "v", VibeCatalog: true, BaseURL: "https://api.mistral.ai/v1", APIKeyEnv: "K"}).validate(global); err != nil {
 		t.Fatalf("valid candidate rejected: %v", err)
 	}
+
 }
 
 func TestVibeCatalogAliasDoesNotShadowCanonicalID(t *testing.T) {

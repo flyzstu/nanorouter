@@ -662,7 +662,8 @@ func LoadConfig(path string) (Config, error) {
 			return c, fmt.Errorf("route %q has no candidates", name)
 		}
 		for _, u := range r.Candidates {
-			if u.ID == "" || u.BaseURL == "" || u.Model == "" {
+			// vibe_catalog 候选的 model 由目录解析结果填充，可以为空。
+			if u.ID == "" || u.BaseURL == "" || (u.Model == "" && !u.VibeCatalog) {
 				return c, fmt.Errorf("route %q has an incomplete candidate", name)
 			}
 			if err := u.validate(c.Retry); err != nil {

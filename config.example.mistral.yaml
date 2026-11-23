@@ -20,8 +20,7 @@ routes:
       - id: mistral-catalog
         base_url: https://api.mistral.ai/v1
         mistral_token_file: true
-        # 候选的 model 会被目录里的规范 id 覆盖，这里只是占位。
-        model: mistral-large-4-0
+        # 无需写 model：路由命中目录条目后会把线上 model 换成目录规范 id。
         vibe_catalog: true
         mistral_compat: true
         # OpenAI 客户端（如 omp）会发 store:false，Mistral 以 422 拒绝
