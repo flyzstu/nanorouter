@@ -1,12 +1,11 @@
 name: Build container image
 
+# 只在打 tag 时构建：main 的 push 与 PR 都不触发，避免同一次发布
+# 被 main push 和 tag push 各构建一遍。
 on:
   push:
-    branches:
-      - main
     tags:
       - '*'
-  pull_request:
   workflow_dispatch:
 
 jobs:

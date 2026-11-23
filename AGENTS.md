@@ -39,7 +39,7 @@ Use Conventional Commit-style messages: `feat: add cerebras route`, `fix: preser
 
 ## CI & Container
 
-The Gitea Actions workflow in `.gitea/workflows/build-image.yaml` builds the Docker image on every push and PR; on `main` pushes or manual runs it pushes `:<sha>` and `:latest` to the Gitea container registry. Dockerfile deploys distroless non-root and reads `/etc/nanorouter/config.yaml`.
+The Gitea Actions workflow in `.gitea/workflows/build-image.yaml` builds the Docker image only on **tag pushes** (plus `workflow_dispatch` for manual reruns); `main` pushes and PRs no longer trigger it, so one release is never built twice. A tag run pushes `:<sha>`, `:<tag>` and `:latest` to the Gitea container registry; a manual run on a branch pushes `:<sha>` and `:main`. Dockerfile deploys distroless non-root and reads `/etc/nanorouter/config.yaml`.
 
 ## Security & Configuration
 

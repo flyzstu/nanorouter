@@ -99,13 +99,15 @@ docker run --rm -p 8080:8080 \
   nanorouter:local
 ```
 
-仓库的 Gitea Actions 工作流会在 `main` 分支 push、Pull Request 和手动触发时构建镜像。
-在 `main` 分支 push 或手动触发时，构建产物会推送到同名 Gitea 容器包：
-`coding.fly97.fun/fly97/nanorouter:<commit-sha>` 与 `coding.fly97.fun/fly97/nanorouter:latest`。
+仓库的 Gitea Actions 工作流只在**推送 tag** 时构建镜像（`main` 分支 push 与 Pull Request 都不触发，
+避免同一次发布被 main push 和 tag push 各构建一遍）；`workflow_dispatch` 用于手动重跑。
+tag 构建把产物推送到同名 Gitea 容器包，同时打三个标签：
+`coding.fly97.fun/fly97/nanorouter:<commit-sha>`、`coding.fly97.fun/fly97/nanorouter:<tag>`
+与 `coding.fly97.fun/fly97/nanorouter:latest`；手动触发非 tag 引用时推 `:<commit-sha>` 与 `:main`。
 
-推送前需在仓库 Actions Secrets 设置 `GITEA_PACKAGE_USERNAME`（PAT 所属用户名）和
-`GITEA_PACKAGE_TOKEN`（具有 Package Read/Write 权限的个人访问令牌）。Gitea 的内置作业令牌
-在部分版本无法发布 OCI 包，因此工作流不依赖它；Pull Request 仅构建验证，不访问上述密钥。
+推送前需在仓库 Actions Secrets 设置 `REGISTRY_USERNAME`（PAT 所属用户名）和
+`REGISTRY_TOKEN`（具有 Package Read/Write 权限的个人访问令牌）。Gitea 的内置作业令牌
+在部分版本无法发布 OCI 包，因此工作流不依赖它。
 
 将 `config.yaml` 中每一个 `model` 改为供应商当前实际支持的模型 ID，并为非 OpenAI 兼容供应商填入其兼容 API 基地址。只有实际支持 Responses API 的候选才应设为 `responses: true`；否则该候选只会参与 Chat Completions 路由。
 
