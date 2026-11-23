@@ -50,9 +50,13 @@ zcode_reset:
 # manage_public 让 /v1/api-keys 在网关层跳过鉴权，交给反代（如 Traefik +
 # Authelia）承担管理授权；开启时必须强制 /v1/api-keys 经过边缘身份验证，
 # 并阻止「携带认证头即绕过反代」的规则覆盖它。
+# root_admin_only 让根 auth_env Key 只用于管理端点，调用生成端点一律 403，
+# 管理凭据与调用凭据分离；客户端一律使用业务 Key。
 api_keys:
   enabled: false
   manage_public: false
+  root_admin_only: false
+
 request_timeout: 90s
 # 全局覆盖转发到上游的 User-Agent。默认 Go-http-client/x.x 会被部分上游
 # （如 Nous Research 的 Cloudflare WAF）拦截并返回 403；可设为常规客户端 UA，

@@ -507,12 +507,14 @@ curl -X POST "http://127.0.0.1:8080/v1/zcode/reset/use" \
 ```yaml
 api_keys:
   enabled: true
-  manage_public: false   # 管理端点交给反代 SSO 时设为 true
+  manage_public: false      # 管理端点交给反代 SSO 时设为 true
+  root_admin_only: false    # 根 Key 只用于管理、禁止调生成端点时设为 true
 ```
 
 - 业务 Key 只放行 `/v1/chat/completions`、`/v1/responses`、`/v1/messages`、对应无 `/v1` 别名、`/zhipu-aicoding/*`、`/zhipuaicoding/*` 与 `/v1/models`；统计、用量、重置卡、`/metrics`、Key 管理一律 403。
 - `manage_public: false`（默认）：管理端点要求根 `auth_env` Key（Bearer/X-Api-Key/Basic）；业务 Key 不能管理 Key。
 - `manage_public: true`：管理端点在网关层跳过鉴权，交给反代（如 Traefik + Authelia）。必须把 `/v1/api-keys` 加入强制 Authelia 的高优先级规则，否则伪造认证头即可匿名创建/吊销 Key。推荐把 nanorouter 放在只和反代共享的 Docker 网络里。
+- `root_admin_only: true`：根 `auth_env` Key 只能访问管理端点，调用生成/统计等业务面返回 403（`root_key_admin_only`）。管理凭据与调用凭据分离，root Key 不随生成流量出现在 access log 里；客户端一律使用业务 Key。
 - `auth_env` 可留空。留空且 `manage_public: false` 时没有管理凭据，管理端点不可用；`api_keys.enabled: false` 且 `auth_env` 为空时保持旧的开放行为。
 - `auth_env` 留空且 `api_keys.enabled: true` 时，管理页面本身还需要 `stats_public: true`（并由反代保护），否则 `/stats` 会 401，无法创建第一把 Key。
 - `stats_public` 开启时统计面本来就是公开的；业务 Key 的 scope 限制只对需要鉴权的路径生效。

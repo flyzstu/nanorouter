@@ -114,9 +114,13 @@ type ZcodeResetConfig struct {
 // Authelia）承担管理授权。它与 stats_public 刻意分开：统计面公开不等于
 // 允许发 Key。开启时必须让反代强制 /v1/api-keys 经过身份验证，并阻止
 // 「携带认证头即绕过反代」的规则覆盖它。
+// RootAdminOnly 让根 auth_env Key 只用于管理端点（列表/创建/吊销 API
+// Key），调用生成端点一律 403。这样管理凭据与调用凭据职责分离：客户端
+// 只拿业务 Key，root Key 不随生成流量出现在 access log 里。
 type APIKeysConfig struct {
 	Enabled      bool `yaml:"enabled"`
 	ManagePublic bool `yaml:"manage_public"`
+	RootAdminOnly bool `yaml:"root_admin_only"`
 }
 
 // HealthCheckConfig 控制熔断后的后台异步探活机制。

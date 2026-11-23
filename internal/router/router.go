@@ -492,6 +492,12 @@ func (r *Router) auth(next http.Handler) http.Handler {
 			writeJSONError(w, http.StatusForbidden, "只有根 auth_env Key 可以管理 API Key", "api_keys_admin_required")
 			return
 		}
+		// root_admin_only：根 Key 只用于管理端点，调生成/统计等业务面一律
+		// 403，管理凭据与调用凭据彻底分开。
+		if role == authRoleRoot && r.cfg.APIKeys.RootAdminOnly && !isAPIKeyAdminPath(path) {
+			writeJSONError(w, http.StatusForbidden, "此 Key 仅用于管理，不能调用生成端点", "root_key_admin_only")
+			return
+		}
 		// 业务 Key 只放行生成面；统计/用量/重置卡/metrics 一律 403。
 		if role == authRoleManaged && !isGenerationPath(path) {
 			writeJSONError(w, http.StatusForbidden, "该 API Key 仅允许调用生成端点", "api_key_scope_forbidden")

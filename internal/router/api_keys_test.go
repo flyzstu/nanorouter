@@ -214,6 +214,7 @@ func TestAPIKeyAuthMatrix(t *testing.T) {
 		anonModels   int
 		anonAdmin    int
 		rootAdmin    int
+		rootModels   int // 根 Key 调 /v1/models 的期望码
 	}{
 		{
 			name: "root + managed, no public admin", envKey: "root-secret",
@@ -223,6 +224,17 @@ func TestAPIKeyAuthMatrix(t *testing.T) {
 			anonModels:   http.StatusUnauthorized,
 			anonAdmin:    http.StatusUnauthorized,
 			rootAdmin:    http.StatusOK,
+			rootModels:   http.StatusOK,
+		},
+		{
+			name: "root admin only blocks generation", envKey: "root-secret",
+			apiKeys:      APIKeysConfig{Enabled: true, RootAdminOnly: true},
+			managedPath:  http.StatusOK,
+			managedAdmin: http.StatusForbidden,
+			anonModels:   http.StatusUnauthorized,
+			anonAdmin:    http.StatusUnauthorized,
+			rootAdmin:    http.StatusOK,
+			rootModels:   http.StatusForbidden,
 		},
 		{
 			name: "manage_public exempts admin only", envKey: "root-secret",
@@ -232,6 +244,7 @@ func TestAPIKeyAuthMatrix(t *testing.T) {
 			anonModels:   http.StatusUnauthorized,
 			anonAdmin:    http.StatusOK,
 			rootAdmin:    http.StatusOK,
+			rootModels:   http.StatusOK,
 		},
 		{
 			name: "no root key but managed enabled", envKey: "",
@@ -241,6 +254,7 @@ func TestAPIKeyAuthMatrix(t *testing.T) {
 			anonModels:   http.StatusUnauthorized,
 			anonAdmin:    http.StatusServiceUnavailable,
 			rootAdmin:    http.StatusServiceUnavailable,
+			rootModels:   http.StatusUnauthorized,
 		},
 		{
 			name: "no root key with manage_public", envKey: "",
@@ -250,6 +264,7 @@ func TestAPIKeyAuthMatrix(t *testing.T) {
 			anonModels:   http.StatusUnauthorized,
 			anonAdmin:    http.StatusOK,
 			rootAdmin:    http.StatusOK,
+			rootModels:   http.StatusUnauthorized,
 		},
 		{
 			name: "disabled keeps root behavior", envKey: "root-secret",
@@ -259,6 +274,7 @@ func TestAPIKeyAuthMatrix(t *testing.T) {
 			anonModels:   http.StatusUnauthorized,
 			anonAdmin:    http.StatusUnauthorized,
 			rootAdmin:    http.StatusServiceUnavailable,
+			rootModels:   http.StatusOK,
 		},
 		{
 			name: "disabled and no root key stays open", envKey: "",
@@ -268,6 +284,7 @@ func TestAPIKeyAuthMatrix(t *testing.T) {
 			anonModels:   http.StatusOK,
 			anonAdmin:    http.StatusServiceUnavailable,
 			rootAdmin:    http.StatusServiceUnavailable,
+			rootModels:   http.StatusOK,
 		},
 		{
 			name: "manage_public ignored when disabled", envKey: "",
@@ -277,6 +294,7 @@ func TestAPIKeyAuthMatrix(t *testing.T) {
 			anonModels:   http.StatusOK,
 			anonAdmin:    http.StatusServiceUnavailable,
 			rootAdmin:    http.StatusServiceUnavailable,
+			rootModels:   http.StatusOK,
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -307,6 +325,9 @@ func TestAPIKeyAuthMatrix(t *testing.T) {
 			}
 			if res := doAPIKeyRequest(handler, http.MethodGet, "/v1/api-keys", "", tc.envKey); res.Code != tc.rootAdmin {
 				t.Fatalf("root /v1/api-keys = %d, want %d", res.Code, tc.rootAdmin)
+			}
+			if res := doAPIKeyRequest(handler, http.MethodGet, "/v1/models", "", tc.envKey); res.Code != tc.rootModels {
+				t.Fatalf("root /v1/models = %d, want %d", res.Code, tc.rootModels)
 			}
 
 			// 统计面公开时，业务 Key 与匿名请求一样直接放行；不公开时业务
