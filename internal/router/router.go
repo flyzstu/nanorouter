@@ -1039,6 +1039,10 @@ func (r *Router) prepareAttempt(ctx context.Context, payload map[string]any, u C
 	// 只规整最终仍是 Chat Completions 的响应；Anthropic/Gemini 候选即使
 	// 误配 mistral_compat，也由各自协议适配器处理且配置校验已拒绝。
 	prepared.mistralCompat = u.MistralCompat && prepared.upstreamEndpoint == "chat_completions"
+	if prepared.mistralCompat {
+		// temperature=0 的请求补 top_p=1，否则 Mistral 以 3054 拒绝。
+		normalizeMistralSampling(prepared.payload)
+	}
 	prepared.streamUsage = streamWantsUsage(prepared.payload)
 	prepared.encoded, _ = json.Marshal(prepared.payload)
 	return nil

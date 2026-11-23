@@ -334,3 +334,67 @@ func sseDataFrames(t *testing.T, body string) []string {
 	}
 	return frames
 }
+
+func TestMistralCompatGreedySamplingAddsTopP(t *testing.T) {
+	cases := []struct {
+		name    string
+		body    string
+		wantTop any // nil 表示上游不应收到 top_p
+	}{
+		{
+			name:    "greedy sampling gets top_p",
+			body:    `{"model":"zcode","temperature":0,"messages":[{"role":"user","content":"hi"}]}`,
+			wantTop: float64(1),
+		},
+		{
+			name:    "explicit top_p is preserved",
+			body:    `{"model":"zcode","temperature":0,"top_p":0.5,"messages":[{"role":"user","content":"hi"}]}`,
+			wantTop: 0.5,
+		},
+		{
+			name: "nonzero temperature untouched",
+			body: `{"model":"zcode","temperature":0.7,"messages":[{"role":"user","content":"hi"}]}`,
+		},
+		{
+			name: "absent temperature untouched",
+			body: `{"model":"zcode","messages":[{"role":"user","content":"hi"}]}`,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var seen map[string]any
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				raw, err := io.ReadAll(r.Body)
+				if err != nil {
+					t.Errorf("read body: %v", err)
+				}
+				if err := json.Unmarshal(raw, &seen); err != nil {
+					t.Errorf("decode body: %v", err)
+				}
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(mistralThinkingCompletion))
+			}))
+			defer upstream.Close()
+			r, _ := newZcodeTestRouter(t, Candidate{
+				ID: "mistral", BaseURL: upstream.URL + "/v1", Model: "mistral-large-4", MistralCompat: true,
+			})
+			rec := postJSON(t, r, "/v1/chat/completions", tc.body)
+			if rec.Code != http.StatusOK {
+				t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+			}
+			got, ok := seen["top_p"]
+			if tc.wantTop == nil {
+				if ok {
+					t.Fatalf("upstream received unexpected top_p=%v", got)
+				}
+				return
+			}
+			if !ok {
+				t.Fatalf("upstream body missing top_p: %v", seen)
+			}
+			if gotFloat, ok := got.(float64); !ok || gotFloat != tc.wantTop.(float64) {
+				t.Fatalf("top_p=%v want %v", got, tc.wantTop)
+			}
+		})
+	}
+}

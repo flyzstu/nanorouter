@@ -77,6 +77,11 @@ routes:
   同样 422。配 `drop_message_fields: ["reasoning_content"]` 后由网关剥掉，
   只影响选中该候选的请求，不影响其他上游读取同一段历史。
 
+另有一处无需配置的自动补齐：`temperature: 0` 表示贪心采样，Mistral 要求
+同时给出 `top_p: 1`，否则以 `3054 top_p must be 1 when using greedy
+sampling` 拒绝。`mistral_compat` 候选收到 `temperature: 0` 且未显式指定
+`top_p` 时会补上 `top_p: 1`；显式 `top_p` 与非 0 温度一律原样透传。
+
 ### 3. 验证
 
 ```bash

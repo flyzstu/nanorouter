@@ -9,14 +9,16 @@ import (
 	json "github.com/goccy/go-json"
 )
 
-// Mistral 的 chat completions 与 OpenAI 规范存在三类偏差：
+// Mistral 的 chat completions 与 OpenAI 规范存在四类偏差：
 //  1. assistant content 可能是 parts 数组，thinking 部分混在其中；
 //  2. 流式 chunk 带私有字段 p，usage 内联在最后一个内容帧且不会补
 //     choices:[] 独立帧，即使请求了 stream_options.include_usage；
-//  3. 错误体是扁平对象，而不是 {"error": {...}} 信封。
+//  3. 错误体是扁平对象，而不是 {"error": {...}} 信封；
+//  4. temperature=0 表示贪心采样，此时上游要求 top_p 必须为 1，否则
+//     直接 400（error code 3054），而 OpenAI 客户端通常只发 temperature。
 //
-// 本文件只在候选显式配置 mistral_compat 时介入，且只改写响应方向：
-// 请求体、凭据与故障切换语义保持原样。
+// 本文件只在候选显式配置 mistral_compat 时介入，且只改写响应方向；
+// 请求方向唯一的介入是第 4 条：补 top_p，不动温度语义、凭据与故障切换。
 
 var mistralCompletionFields = map[string]bool{
 	"id": true, "object": true, "created": true, "model": true,
@@ -439,4 +441,34 @@ func (a *mistralSSEAdapter) writeRaw(payload []byte) {
 	a.out.WriteString("data: ")
 	a.out.Write(payload)
 	a.out.WriteString("\n\n")
+}
+
+// normalizeMistralSampling 补齐 Mistral 的贪心采样约束：temperature=0 即贪心
+// 采样，上游要求 top_p 必须为 1，否则 400（code 3054）。客户端只发
+// temperature=0 时补上 top_p=1；显式指定 top_p 的请求不动，非 0 温度也不动。
+func normalizeMistralSampling(payload map[string]any) {
+	if _, ok := payload["top_p"]; ok {
+		return
+	}
+	if !isZeroNumber(payload["temperature"]) {
+		return
+	}
+	payload["top_p"] = 1
+}
+
+func isZeroNumber(v any) bool {
+	switch n := v.(type) {
+	case float64:
+		return n == 0
+	case float32:
+		return n == 0
+	case int:
+		return n == 0
+	case int64:
+		return n == 0
+	case json.Number:
+		f, err := n.Float64()
+		return err == nil && f == 0
+	}
+	return false
 }
