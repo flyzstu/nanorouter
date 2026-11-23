@@ -118,8 +118,8 @@ type ZcodeResetConfig struct {
 // Key），调用生成端点一律 403。这样管理凭据与调用凭据职责分离：客户端
 // 只拿业务 Key，root Key 不随生成流量出现在 access log 里。
 type APIKeysConfig struct {
-	Enabled      bool `yaml:"enabled"`
-	ManagePublic bool `yaml:"manage_public"`
+	Enabled       bool `yaml:"enabled"`
+	ManagePublic  bool `yaml:"manage_public"`
 	RootAdminOnly bool `yaml:"root_admin_only"`
 }
 
