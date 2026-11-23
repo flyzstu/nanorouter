@@ -265,6 +265,7 @@ type mistralSSEAdapter struct {
 	model        string
 	created      int64
 	finished     bool
+	finishReason string
 	err          error
 }
 
@@ -299,11 +300,13 @@ func (a *mistralSSEAdapter) Close() error {
 }
 
 // Usage 返回观测到的上游 usage；没有 usage 时为 unavailable，
-// 由调用方决定是否回退到流内旁路采集的结果。
+// 由调用方决定是否回退到流内旁路采集的结果。finish_reason 独立于 usage
+// 帧存在，调用方合并时保留。
 func (a *mistralSSEAdapter) Usage() Usage {
 	if a.usage.Source != "upstream" {
-		return Usage{Source: "unavailable"}
+		return Usage{Source: "unavailable", FinishReason: a.finishReason}
 	}
+	a.usage.FinishReason = a.finishReason
 	return a.usage
 }
 
@@ -389,6 +392,9 @@ func (a *mistralSSEAdapter) capture(chunk map[string]any) {
 	}
 	if created := number(chunk["created"]); created != 0 {
 		a.created = created
+	}
+	if finish := finishReasonFromChunk(chunk); finish != "" {
+		a.finishReason = finish
 	}
 	if rawUsage, ok := chunk["usage"].(map[string]any); ok {
 		a.usageRaw = rawUsage

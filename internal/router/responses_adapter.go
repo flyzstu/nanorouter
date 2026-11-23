@@ -345,6 +345,7 @@ func (r *Router) streamChatAsResponses(w http.ResponseWriter, resp *http.Respons
 		}
 		if err == io.EOF {
 			state.complete(usage)
+			usage.FinishReason = state.finish
 			return usage, nil
 		}
 		if err != nil {

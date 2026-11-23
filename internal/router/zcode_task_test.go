@@ -347,13 +347,13 @@ func TestZcodeLoginWritesCredentialToDatabase(t *testing.T) {
 				ZcodeChannelBigmodel).Scan(&key); err != nil {
 				t.Fatalf("凭据未写入数据库: %v", err)
 			}
-			if key != "111.222" {
-				t.Fatalf("api_key=%q", key)
+			if key != "pat-token-1" {
+				t.Fatalf("api_key=%q（应为签发的 PAT）", key)
 			}
 			// 热加载：不经重启，下一次解析就能读到库里的 key。
 			if got := r.resolveCandidateAPIKey(t.Context(), Candidate{
 				ZcodeTokenFile: true, ZcodeChannel: ZcodeChannelBigmodel,
-			}); got != "111.222" {
+			}); got != "pat-token-1" {
 				t.Fatalf("热加载失败: %q", got)
 			}
 			// 凭据文件不应再被创建（端点走 DB 分支）。

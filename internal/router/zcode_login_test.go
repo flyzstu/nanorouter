@@ -2,6 +2,7 @@ package router
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -79,13 +80,17 @@ func (f *fakeZcodeGateway) handler(w http.ResponseWriter, req *http.Request) {
 	}
 }
 
-// fakeBigmodelBiz 模拟 BigModel 业务链：账户 → key 列表/创建 → secret。
+// fakeBigmodelBiz 模拟 BigModel 业务链：账户 → key 列表/创建 → PAT 签发。
 func fakeBigmodelBiz(t *testing.T, existingKey bool) *httptest.Server {
 	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		auth := req.Header.Get("Authorization")
-		// BigModel 接受裸 OAuth token，绝不能带 Bearer 前缀。
-		if auth != "oauth-token-1" {
-			t.Errorf("biz authorization=%q (want bare oauth token)", auth)
+		// access_tokens 签发用 Bearer 登录 token，其余业务口用裸 token。
+		want := "oauth-token-1"
+		if strings.HasSuffix(req.URL.Path, "/access_tokens") {
+			want = "Bearer oauth-token-1"
+		}
+		if auth != want {
+			t.Errorf("biz authorization=%q (want %q)", auth, want)
 		}
 		switch {
 		case req.URL.Path == "/api/biz/customer/getCustomerInfo":
@@ -97,9 +102,20 @@ func fakeBigmodelBiz(t *testing.T, existingKey bool) *httptest.Server {
 				_, _ = w.Write([]byte(`{"code":0,"data":[]}`))
 			}
 		case req.URL.Path == "/api/biz/v1/organization/org1/projects/prj1/api_keys" && req.Method == http.MethodPost:
+			var created map[string]any
+			_ = json.NewDecoder(req.Body).Decode(&created)
+			if created["name"] != "zcode-api-key" || created["usageScene"] != float64(1) {
+				t.Errorf("create body=%v (want name + usageScene:1)", created)
+			}
 			_, _ = w.Write([]byte(`{"code":0,"data":{"name":"zcode-api-key","apiKey":"111"}}`))
-		case req.URL.Path == "/api/biz/v1/organization/org1/projects/prj1/api_keys/copy/111":
-			_, _ = w.Write([]byte(`{"code":0,"data":{"secretKey":"222"}}`))
+		case req.URL.Path == "/api/biz/v1/organization/org1/projects/prj1/api_keys/111/access_tokens":
+			var issued map[string]any
+			_ = json.NewDecoder(req.Body).Decode(&issued)
+			if issued["clientType"] != "zcode" || issued["clientVersion"] != "4.0.0" {
+				t.Errorf("issue body=%v (want clientType zcode + clientVersion 4.0.0)", issued)
+			}
+			expiry := time.Now().Add(time.Hour).Unix()
+			_, _ = w.Write([]byte(fmt.Sprintf(`{"code":0,"data":{"enable":true,"accessToken":"pat-token-1","tokenType":"Bearer","expiresIn":3600,"expiresAt":%d}}`, expiry)))
 		default:
 			t.Errorf("unexpected biz path %s %s", req.Method, req.URL.Path)
 			http.NotFound(w, req)
@@ -156,8 +172,14 @@ func TestRunZcodeLoginHappyPath(t *testing.T) {
 	if entry == nil {
 		t.Fatalf("document=%v", document)
 	}
-	if entry["api_key"] != "111.222" {
-		t.Fatalf("api_key=%v（应为 id.secret 形式）", entry["api_key"])
+	if entry["api_key"] != "pat-token-1" {
+		t.Fatalf("api_key=%v（应为签发的 PAT）", entry["api_key"])
+	}
+	if entry["api_key_id"] != "111" || entry["organization_id"] != "org1" || entry["project_id"] != "prj1" {
+		t.Fatalf("PAT location missing: %v", entry)
+	}
+	if _, ok := entry["pat_expires_at"].(string); !ok {
+		t.Fatalf("pat_expires_at missing: %v", entry)
 	}
 	if entry["zcode_jwt_token"] != "platform-jwt" || entry["oauth_access_token"] != "oauth-token-1" {
 		t.Fatalf("platform pair missing: %v", entry)
@@ -172,14 +194,14 @@ func TestRunZcodeLoginHappyPath(t *testing.T) {
 		if probe["max_tokens"] != float64(1) {
 			t.Fatalf("probe=%v", probe)
 		}
-		if got := record.Header.Get("x-api-key"); got != "111.222" {
+		if got := record.Header.Get("x-api-key"); got != "pat-token-1" {
 			t.Fatalf("probe key=%q", got)
 		}
 	default:
 		t.Fatal("probe request missing")
 	}
-	// 网关回退读取：凭据文件 → key。
-	if key := zcodeTokenFileKey(ZcodeChannelBigmodel); key != "111.222" {
+	// 网关回退读取：凭据文件 → PAT。
+	if key := zcodeTokenFileKey(ZcodeChannelBigmodel); key != "pat-token-1" {
 		t.Fatalf("fallback key=%q", key)
 	}
 }
@@ -209,7 +231,7 @@ func TestRunZcodeLoginCreatesKeyWhenMissing(t *testing.T) {
 		t.Fatalf("login: %v", err)
 	}
 	raw, _ := os.ReadFile(path)
-	if !strings.Contains(string(raw), "111.222") {
+	if !strings.Contains(string(raw), "pat-token-1") {
 		t.Fatalf("created key missing: %s", raw)
 	}
 }

@@ -25,14 +25,21 @@ import (
 // OAuth token 目前没有消费方（Start Plan 未支持），但留着它们才能在将来
 // 启用时不必重新登录一次。
 type ZcodeCredential struct {
-	Channel      string
-	APIKey       string
-	PlatformJWT  string
-	OAuthToken   string
-	UserName     string
-	DeviceMid    string
-	CreatedAt    time.Time
-	LastVerified time.Time
+	Channel     string
+	APIKey      string
+	PlatformJWT string
+	OAuthToken  string
+	UserName    string
+	DeviceMid   string
+	// PAT 位置三元组与到期时刻：请求路径凭此续期短期 token。
+	// 存量登录（v3 id.secret）这些字段为空，读到即按原样返回 api_key，
+	// 下次重新登录后自然补齐。
+	APIKeyID       string
+	OrganizationID string
+	ProjectID      string
+	PATExpiresAt   time.Time
+	CreatedAt      time.Time
+	LastVerified   time.Time
 }
 
 // zcodeCredentialStore 是凭据的读写层，带进程内缓存。
@@ -99,7 +106,7 @@ func (s *zcodeCredentialStore) load(ctx context.Context) (map[string]ZcodeCreden
 
 func (s *zcodeCredentialStore) query(ctx context.Context) (map[string]ZcodeCredential, error) {
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT channel, api_key, platform_jwt, oauth_token, user_name, device_mid, created_at, last_verified FROM zcode_credentials`)
+		`SELECT channel, api_key, platform_jwt, oauth_token, user_name, device_mid, api_key_id, organization_id, project_id, pat_expires_at, created_at, last_verified FROM zcode_credentials`)
 	if err != nil {
 		return nil, err
 	}
@@ -107,10 +114,11 @@ func (s *zcodeCredentialStore) query(ctx context.Context) (map[string]ZcodeCrede
 	entries := map[string]ZcodeCredential{}
 	for rows.Next() {
 		var c ZcodeCredential
-		var createdAt, lastVerified string
-		if err := rows.Scan(&c.Channel, &c.APIKey, &c.PlatformJWT, &c.OAuthToken, &c.UserName, &c.DeviceMid, &createdAt, &lastVerified); err != nil {
+		var patExpiresAt, createdAt, lastVerified string
+		if err := rows.Scan(&c.Channel, &c.APIKey, &c.PlatformJWT, &c.OAuthToken, &c.UserName, &c.DeviceMid, &c.APIKeyID, &c.OrganizationID, &c.ProjectID, &patExpiresAt, &createdAt, &lastVerified); err != nil {
 			return nil, err
 		}
+		c.PATExpiresAt = parseCredentialTime(patExpiresAt)
 		c.CreatedAt = parseCredentialTime(createdAt)
 		c.LastVerified = parseCredentialTime(lastVerified)
 		entries[c.Channel] = c
@@ -167,14 +175,20 @@ func (s *zcodeCredentialStore) save(ctx context.Context, c ZcodeCredential) erro
 	// 登录成功即视为已验证：登录链在落库前刚用这个 key 打过一次探测。
 	c.LastVerified = now
 	verified := c.LastVerified.Format(time.RFC3339Nano)
+	patExpires := ""
+	if !c.PATExpiresAt.IsZero() {
+		patExpires = c.PATExpiresAt.UTC().Format(time.RFC3339Nano)
+	}
 
 	// 先 UPDATE 再 INSERT，不用方言相关的 UPSERT：PostgreSQL 与 SQLite 的
 	// upsert 语法不同，而「先改后插」在双方言下行为一致。命中 UPDATE 时
 	// rowsAffected 为 1，就此收工；为 0 说明该渠道还没有记录，走 INSERT。
 	res, err := s.db.ExecContext(ctx,
 		`UPDATE zcode_credentials SET api_key=$1, platform_jwt=$2, oauth_token=$3,
-		 user_name=$4, device_mid=$5, last_verified=$6 WHERE channel=$7`,
-		c.APIKey, c.PlatformJWT, c.OAuthToken, c.UserName, c.DeviceMid, verified, c.Channel)
+		 user_name=$4, device_mid=$5, api_key_id=$6, organization_id=$7, project_id=$8, pat_expires_at=$9,
+		 last_verified=$10 WHERE channel=$11`,
+		c.APIKey, c.PlatformJWT, c.OAuthToken, c.UserName, c.DeviceMid,
+		c.APIKeyID, c.OrganizationID, c.ProjectID, patExpires, verified, c.Channel)
 	if err != nil {
 		return fmt.Errorf("update zcode credential failed: %w", err)
 	}
@@ -183,9 +197,10 @@ func (s *zcodeCredentialStore) save(ctx context.Context, c ZcodeCredential) erro
 		return nil
 	}
 	if _, err := s.db.ExecContext(ctx,
-		`INSERT INTO zcode_credentials (api_key, platform_jwt, oauth_token, user_name, device_mid, created_at, last_verified, channel)
-		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+		`INSERT INTO zcode_credentials (api_key, platform_jwt, oauth_token, user_name, device_mid, api_key_id, organization_id, project_id, pat_expires_at, created_at, last_verified, channel)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`,
 		c.APIKey, c.PlatformJWT, c.OAuthToken, c.UserName, c.DeviceMid,
+		c.APIKeyID, c.OrganizationID, c.ProjectID, patExpires,
 		c.CreatedAt.Format(time.RFC3339Nano), verified, c.Channel); err != nil {
 		// 多副本并发登录时另一个副本可能刚插入同一渠道：让出，它已写好。
 		if isDuplicateKey(err) {
@@ -250,5 +265,30 @@ func ensureZcodeCredentialTable(ctx context.Context, db *sql.DB) error {
 	if err != nil {
 		return fmt.Errorf("create zcode_credentials failed: %w", err)
 	}
+	return ensureZcodeCredentialPATColumns(ctx, db)
+}
+
+// ensureZcodeCredentialPATColumns 幂等追加 PAT 四列：存量表（v3 登录建的）
+// 没有它们。SQLite 与 PG 都不支持带 IF NOT EXISTS 的 ADD COLUMN，
+// 靠重复错误归一忽略——两方言的报错都含固定子串。
+func ensureZcodeCredentialPATColumns(ctx context.Context, db *sql.DB) error {
+	for _, column := range []string{
+		"api_key_id TEXT NOT NULL DEFAULT ''",
+		"organization_id TEXT NOT NULL DEFAULT ''",
+		"project_id TEXT NOT NULL DEFAULT ''",
+		"pat_expires_at TEXT NOT NULL DEFAULT ''",
+	} {
+		if _, err := db.ExecContext(ctx, "ALTER TABLE zcode_credentials ADD COLUMN "+column); err != nil {
+			if isDuplicateColumn(err) {
+				continue
+			}
+			return fmt.Errorf("alter zcode_credentials failed: %w", err)
+		}
+	}
 	return nil
+}
+
+func isDuplicateColumn(err error) bool {
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "duplicate column") || strings.Contains(msg, "already exists")
 }

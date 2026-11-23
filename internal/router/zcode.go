@@ -13,6 +13,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
+	"net/http"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -26,22 +27,21 @@ import (
 // ZCode 平台常量（上游合同，勿改名）。
 const (
 	ZcodeDefaultOrigin    = "https://zcode.z.ai"
-	ZcodeClientVersion    = "3.17.1"
+	ZcodeClientVersion    = "4.0.0"
 	ZcodeAnthropicVersion = "2023-06-01"
 
 	ZcodeChannelBigmodel = "bigmodel"
 	ZcodeChannelZai      = "zai"
 )
 
-// ZCode CLI 固定客户端身份值，逐字复刻参考客户端。
+// ZCode CLI 固定客户端身份值，逐字复刻官方客户端。
 const (
-	zcodeReferer         = "https://zcode.z.ai"
-	zcodeTitle           = "Z Code@electron"
-	zcodeReleaseChannel  = "production"
-	zcodeAgent           = "glm"
-	zcodeClientLanguage  = "zh-CN"
-	zcodeClientTimezone  = "Asia/Shanghai"
-	zcodeSessionTypeMain = "main"
+	zcodeReferer        = "https://zcode.z.ai"
+	zcodeTitle          = "Z Code@cli"
+	zcodeReleaseChannel = "production"
+	zcodeAgent          = "glm"
+	zcodeClientLanguage = "zh-CN"
+	zcodeClientTimezone = "Asia/Shanghai"
 )
 
 // zcodeGatewayPath 返回渠道对应的 Messages 网关路径（不带前导斜杠，
@@ -117,10 +117,13 @@ type zcodeRequestIDs struct {
 	session string
 	request string
 	trace   string
+	query   string
 }
 
 // deriveZcodeRequestIDs 派生一次上游请求的关联 id。会话 id 来自对话本身
-// （首个 user turn），请求/追踪 id 每次全新——与 ids.ts 的 deriveRequestIDs 一致。
+// （首个 user turn），请求/追踪/query id 每次全新——与官方
+// createModelRequestAttributionHeaders 一致：query 也是请求级观测字段，
+// 缺失时官方直接省略该头（此处恒有值，恒发）。
 func deriveZcodeRequestIDs(messages []any) zcodeRequestIDs {
 	seed := zcodeConversationSeed(messages)
 	if seed == "" || seed == "{}" {
@@ -130,6 +133,7 @@ func deriveZcodeRequestIDs(messages []any) zcodeRequestIDs {
 		session: zcodeStableID("ses", seed),
 		request: zcodeRandomID("req", 16),
 		trace:   zcodeRandomID("trace", 16),
+		query:   zcodeRandomID("query", 16),
 	}
 }
 
@@ -146,20 +150,59 @@ func deriveZcodeRequestIDs(messages []any) zcodeRequestIDs {
 func zcodeClientIdentityHeaders() map[string]string {
 	osName := zcodePlatformName()
 	headers := map[string]string{
-		"HTTP-Referer":         zcodeReferer,
-		"X-Title":              zcodeTitle,
-		"X-ZCode-App-Version":  ZcodeClientVersion,
-		"X-Release-Channel":    zcodeReleaseChannel,
-		"X-Client-Language":    zcodeClientLanguage,
-		"X-Client-Timezone":    zcodeClientTimezone,
-		"X-ZCode-Agent":        zcodeAgent,
-		"X-Platform":           osName + "-" + zcodeArchName(),
-		"X-Os-Category":        zcodeOSCategory(osName),
-		"X-Os-Version":         zcodeOSVersion(),
-		"x-zcode-session-type": zcodeSessionTypeMain,
-		"anthropic-version":    ZcodeAnthropicVersion,
+		"HTTP-Referer":        zcodeReferer,
+		"X-Title":             zcodeTitle,
+		"X-ZCode-App-Version": ZcodeClientVersion,
+		"X-Release-Channel":   zcodeReleaseChannel,
+		"X-Client-Language":   zcodeClientLanguage,
+		"X-Client-Timezone":   zcodeClientTimezone,
+		"X-ZCode-Agent":       zcodeAgent,
+		"X-Platform":          osName + "-" + zcodeArchName(),
+		"X-Os-Category":       zcodeOSCategory(osName),
+		"X-Os-Version":        zcodeOSVersion(),
+		"anthropic-version":   ZcodeAnthropicVersion,
 	}
 	return headers
+}
+
+// zcodeSessionType* 对应官方 ModelRequestSessionType 四值。网关的单次请求
+// 都是主 agent 的模型调用，默认 main；下游若显式带了合法值则透传（官方语义：
+// 该头只能由调用上下文生成并覆盖静态值）。
+const (
+	zcodeSessionTypeMain     = "main"
+	zcodeSessionTypeSubagent = "subagent"
+	zcodeSessionTypeSideChat = "side_chat"
+	zcodeSessionTypeOther    = "other"
+)
+
+// zcodeSessionTypeForRequest 解析本次请求的类型头。下游透传优先（官方覆盖
+// 语义），非法值回落 main 而非阻断请求——与官方 querySource 非法值只省略
+// 的容错思路一致。
+func zcodeSessionTypeForRequest(incoming *http.Request) string {
+	if incoming != nil {
+		if v := strings.TrimSpace(incoming.Header.Get("x-zcode-session-type")); v == zcodeSessionTypeMain ||
+			v == zcodeSessionTypeSubagent || v == zcodeSessionTypeSideChat || v == zcodeSessionTypeOther {
+			return v
+		}
+	}
+	return zcodeSessionTypeMain
+}
+
+// zcodeUserAgentSuffix 复刻 AI SDK 在官方 UA 之后的追加串：
+// createAnthropic 加 ai-sdk/anthropic/<ver>，postToApi 再加
+// ai-sdk/provider-utils/<ver> 与运行时标记。网关不是 Node，用官方观察到的
+// 系列版本定值，保证指纹一致。
+const zcodeUserAgentSuffix = " ai-sdk/anthropic/3.0.81 ai-sdk/provider-utils/4.0.27 runtime/node.js/v24.x"
+
+// zcodeBetaHeaders 返回官方 tool-search 场景头。触发条件对齐
+// toolSearchHeaders：Coding Plan 请求带 tools 即启用 toolSearch，beta 头
+// 追加 TOOL_SEARCH_BETA；无 tools 时不发。
+func zcodeBetaHeaders(payload map[string]any) map[string]string {
+	tools, ok := payload["tools"].([]any)
+	if !ok || len(tools) == 0 {
+		return nil
+	}
+	return map[string]string{"anthropic-beta": "advanced-tool-use-2025-11-20"}
 }
 
 // zcodeDeviceHeaders 返回设备身份头（X-Device-Mid）。官方只在 deviceMid
@@ -278,8 +321,13 @@ func (r *Router) resolveCandidateAPIKey(ctx context.Context, u Candidate) string
 	}
 	if r.zcodeCredentials != nil {
 		if c, ok := r.zcodeCredentials.get(ctx, u.ZcodeChannel); ok {
-			return c.APIKey
+			return r.patForStoredCredential(ctx, c)
 		}
+	}
+	// 文件源同样走 PAT 续期：login zcode 写入的分组文件含位置三元组
+	// 与 OAuth token；官方 v2/参考文件无此信息，退回原样返回。
+	if key := r.patForFileRecord(ctx, u.ZcodeChannel); key != "" {
+		return key
 	}
 	return zcodeTokenFileKey(u.ZcodeChannel)
 }

@@ -94,6 +94,9 @@ type Router struct {
 	// 让测试可以直接构造 Router{}。
 	zcodeUsage     *zcodeUsageCache
 	zcodeUsageOnce sync.Once
+	// zcodePAT 是 PAT 签发的进程内缓存，懒初始化（见 zcode_project_token.go）。
+	zcodePAT     *zcodePATCache
+	zcodePATOnce sync.Once
 	// zcodeReset 是重置卡 status 的进程内缓存，懒初始化（见 zcode_reset.go）。
 	zcodeReset     *zcodeResetStatusCache
 	zcodeResetOnce sync.Once
@@ -1100,6 +1103,9 @@ func (r *Router) handleStreamingResponse(w http.ResponseWriter, resp *http.Respo
 	if mistral != nil {
 		if captured := mistral.Usage(); captured.Source == "upstream" {
 			usage = captured
+		} else if captured.FinishReason != "" && usage.FinishReason == "" {
+			// 未请求 usage 时旁路无用量，但收尾帧仍在：只补原因。
+			usage.FinishReason = captured.FinishReason
 		}
 	}
 	// cancelAttempt 会置空 attemptCtx 的 deadline，必须先判定再取消。
@@ -1207,6 +1213,9 @@ func (r *Router) handleUpstreamFailure(w http.ResponseWriter, resp *http.Respons
 		// 换到另一个候选也只是把同一个坏凭据再试一遍。此时改为触发
 		// 一次登录，拿到新 key 后下一请求自然恢复。
 		if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
+			// PAT 被拒只废弃指纹命中的那一代：下一请求用存的 OAuth token
+			// 重签，无需等整轮设备码登录（后者仍并行触发兜底）。
+			r.noteZcodePATRejected(a.credential)
 			r.maybeTriggerZcodeRelogin(a.u, "upstream rejected the credential")
 		}
 		upstreamError := r.copyErrorResponse(w, resp, a.u, a.endpoint)
@@ -1540,6 +1549,7 @@ func successLogFields(requestID, route string, u Candidate, endpoint string, att
 		zap.Int64("completion_tokens", usage.Completion),
 		zap.Int64("total_tokens", usage.Total),
 		zap.String("usage_source", usage.Source),
+		zap.String("finish_reason", usage.FinishReason),
 	)
 }
 func (r *Router) do(ctx context.Context, u Candidate, endpoint string, streamed bool, body []byte, payload map[string]any, incomingReq *http.Request, credential string) (*http.Response, error) {
@@ -1590,8 +1600,8 @@ func (r *Router) do(ctx context.Context, u Candidate, endpoint string, streamed 
 	req.Header.Set("Accept", "application/json, text/event-stream")
 	ua := u.UserAgent
 	if ua == "" && u.SimulateZcode {
-		// 显式 user_agent 优先；未配置时复刻 ZCode 桌面客户端 UA。
-		ua = "ZCode/" + ZcodeClientVersion
+		// 显式 user_agent 优先；未配置时复刻 ZCode CLI 经 AI SDK 发出的完整 UA。
+		ua = "ZCode/" + ZcodeClientVersion + zcodeUserAgentSuffix
 	} else if ua == "" && u.SimulateOpenCode {
 		ua = defaultOpenCodeUserAgent
 	} else if ua == "" {
@@ -1625,12 +1635,18 @@ func (r *Router) do(ctx context.Context, u Candidate, endpoint string, streamed 
 			for name, value := range zcodeDeviceHeaders(r.zcodeDeviceMid(ctx)) {
 				req.Header.Set(name, value)
 			}
-			// CLI 的归因 id：会话 id 从对话派生（同会话稳定），请求/
-			// 追踪 id 每次全新；x-session-affinity 同步会话 id。
+			// 归因 id：会话 id 从对话派生（同会话稳定），请求/追踪/query id
+			// 每次全新。x-session-affinity 是旧指纹，官方 v4 已无此头，删除。
+			// x-zcode-query-source / x-zcode-session-features 官方只在调用上下
+			// 文有值时才发，网关无此上下文，不伪造（与 deviceMid 同理）。
 			req.Header.Set("x-request-id", ids.request)
 			req.Header.Set("x-session-id", ids.session)
-			req.Header.Set("x-session-affinity", ids.session)
+			req.Header.Set("x-query-id", ids.query)
 			req.Header.Set("x-zcode-trace-id", ids.trace)
+			req.Header.Set("x-zcode-session-type", zcodeSessionTypeForRequest(incomingReq))
+			for name, value := range zcodeBetaHeaders(payload) {
+				req.Header.Set(name, value)
+			}
 		}
 	} else if u.GoogleAntigravity {
 		// Google Antigravity 使用 OAuth token 认证
@@ -1939,17 +1955,23 @@ func (r *Router) stream(w http.ResponseWriter, resp *http.Response) (Usage, erro
 	reader := acquireSSEReader(resp.Body)
 	defer releaseSSEReader(reader)
 	usage := Usage{Source: "unavailable"}
+	finishReason := ""
 	for {
 		line, err := reader.ReadBytes('\n')
 		if len(line) > 0 {
 			_, _ = w.Write(line)
 			trimmed := bytes.TrimSpace(line)
 			if bytes.HasPrefix(trimmed, []byte("data:")) {
-				if u := usageFromJSON(bytes.TrimSpace(bytes.TrimPrefix(trimmed, []byte("data:")))); u.Source == "upstream" {
+				payload := bytes.TrimSpace(bytes.TrimPrefix(trimmed, []byte("data:")))
+				if u := usageFromJSON(payload); u.Source == "upstream" {
 					// Anthropic 的 usage 分段到达（message_start 带输入侧、
 					// message_delta 带累计输出侧）；合并而非覆盖，OpenAI 的
 					// 单帧 usage 语义不受影响。
 					usage = mergeUsage(usage, u)
+				}
+				// 收尾帧的 finish_reason 与 usage 可能不在同一帧到达，各记各的。
+				if finish := finishReasonFromPayload(payload); finish != "" {
+					finishReason = finish
 				}
 			}
 			if f != nil {
@@ -1958,6 +1980,7 @@ func (r *Router) stream(w http.ResponseWriter, resp *http.Response) (Usage, erro
 		}
 		if err != nil {
 			if err == io.EOF {
+				usage.FinishReason = finishReason
 				return usage, nil
 			}
 			return usage, err
@@ -1976,6 +1999,9 @@ func mergeUsage(dst, src Usage) Usage {
 	}
 	dst.Total = dst.Prompt + dst.Completion
 	dst.Source = "upstream"
+	if dst.FinishReason == "" {
+		dst.FinishReason = src.FinishReason
+	}
 	return dst
 }
 

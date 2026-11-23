@@ -36,3 +36,22 @@ func TestResponseBaseReportsUsageDetails(t *testing.T) {
 		t.Fatalf("cached_tokens = %v, want 1", input["cached_tokens"])
 	}
 }
+
+func TestFinishReasonFromPayload(t *testing.T) {
+	if got := finishReasonFromPayload([]byte(`{"choices":[{"finish_reason":"length"}]}`)); got != "length" {
+		t.Fatalf("finish = %q, want length", got)
+	}
+	if got := finishReasonFromPayload([]byte(`{"choices":[{"delta":{},"finish_reason":null}]}`)); got != "" {
+		t.Fatalf("finish = %q, want empty", got)
+	}
+	if got := finishReasonFromPayload([]byte(`{"usage":{"total_tokens":3}}`)); got != "" {
+		t.Fatalf("finish = %q, want empty", got)
+	}
+}
+
+func TestMergeUsageKeepsFinishReason(t *testing.T) {
+	merged := mergeUsage(Usage{Source: "unavailable"}, Usage{Source: "upstream", Total: 3, FinishReason: "stop"})
+	if merged.FinishReason != "stop" {
+		t.Fatalf("finish = %q, want stop", merged.FinishReason)
+	}
+}

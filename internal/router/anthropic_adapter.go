@@ -834,6 +834,7 @@ func (r *Router) streamMessagesAsChat(w http.ResponseWriter, resp *http.Response
 			// Anthropic 不使用 [DONE] 终止符；遇到时按流结束处理以容忍混合上游。
 			if string(payload) == "[DONE]" {
 				translator.complete()
+				translator.usage.FinishReason = translator.finish
 				return translator.usage, nil
 			}
 			if streamErr := translator.consume(event, payload); streamErr != nil {
@@ -846,6 +847,7 @@ func (r *Router) streamMessagesAsChat(w http.ResponseWriter, resp *http.Response
 		if err == io.EOF {
 			translator.complete()
 			translator.flushNow()
+			translator.usage.FinishReason = translator.finish
 			return translator.usage, nil
 		}
 		if err != nil {

@@ -69,10 +69,10 @@ func readZcodeDeviceMid(path string) string {
 	return strings.TrimSpace(state.DeviceMid)
 }
 
-// zcodeSessionIDFor 取本次请求的会话 id，供 metadata.user_id 与
-// x-session-id / x-session-affinity 共用同一来源：两者必须同值，否则上游
-// 看到的是同一会话的两个标识。翻译后的 payload 已把 Chat 的 messages 换成
-// Messages 形状，而首个 user turn 在两条链路上都存在，故取 messages 即可。
+// zcodeSessionIDFor 取本次请求的会话 id，供 metadata.user_id 与 x-session-id
+// 共用同一来源：上游看到的是同一会话的同一标识。翻译后的 payload 已把 Chat
+// 的 messages 换成 Messages 形状，而首个 user turn 在两条链路上都存在，
+// 故取 messages 即可。
 func zcodeSessionIDFor(payload map[string]any) string {
 	messages, _ := payload["messages"].([]any)
 	return deriveZcodeRequestIDs(messages).session

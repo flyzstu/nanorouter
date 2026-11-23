@@ -313,12 +313,12 @@ func zcodeDataOf(envelope map[string]any) map[string]any {
 	return map[string]any{}
 }
 
-// exchangeZcodeKey 把 OAuth access token 兑换为渠道的 Coding Plan key。
-// 两个渠道共享三步链：取组织/项目 → 找到或创建 zcode-api-key → 读
-// secretKey 组成 id.secret；差异只在业务 token 的取得方式。
-func exchangeZcodeKey(ctx context.Context, client *http.Client, oauthToken, channel string) (string, error) {
+// exchangeZcodeKey 把 OAuth access token 兑换为渠道的短期 PAT 及其位置。
+// 官方 v4 不再下发长期 id.secret：找到或创建 Coding Plan API key 后，
+// 用 `POST {keyList}/{apiKeyId}/access_tokens` 换短期 token（plan §3）。
+func exchangeZcodeKey(ctx context.Context, client *http.Client, oauthToken, channel string) (zcodePATMaterial, error) {
 	if strings.TrimSpace(oauthToken) == "" || strings.ContainsAny(oauthToken, "\r\n ") {
-		return "", fmt.Errorf("the OAuth access token cannot ride an HTTP header")
+		return zcodePATMaterial{}, fmt.Errorf("the OAuth access token cannot ride an HTTP header")
 	}
 	switch channel {
 	case ZcodeChannelBigmodel:
@@ -326,61 +326,59 @@ func exchangeZcodeKey(ctx context.Context, client *http.Client, oauthToken, chan
 	case ZcodeChannelZai:
 		return zcodeExchangeZai(ctx, client, oauthToken)
 	default:
-		return "", fmt.Errorf("unsupported channel %q", channel)
+		return zcodePATMaterial{}, fmt.Errorf("unsupported channel %q", channel)
 	}
 }
 
-func zcodeExchangeBigmodel(ctx context.Context, client *http.Client, oauthToken string) (string, error) {
-	// BigModel 的业务 API 直接接受 OAuth token，且不带 Bearer 前缀——
-	// 参考客户端明确标注这是 load-bearing 的差异。
-	headers := map[string]string{
-		"Authorization": oauthToken,
+// zcodeBizHeaders 拼业务 API 头：customerInfo 恒用裸 token（Bearer 前缀
+// 会被误判为登录失效）；个人 key 管理保留既有格式（zai Bearer/bigmodel 裸）。
+func zcodeBizHeaders(loginToken, channel string, forKeyManagement bool) map[string]string {
+	auth := loginToken
+	if forKeyManagement && channel == ZcodeChannelZai {
+		auth = "Bearer " + loginToken
+	}
+	return map[string]string{
+		"Authorization": auth,
 		"Content-Type":  "application/json",
 		"User-Agent":    "ZCode/" + ZcodeClientVersion,
 	}
-	origin := zcodeBigmodelBizURL
-	return zcodeExchangeChain(ctx, client, origin, headers, "默认机构", "默认项目")
 }
 
-func zcodeExchangeZai(ctx context.Context, client *http.Client, oauthToken string) (string, error) {
-	origin := zcodeZaiBizURL
-	login, err := zcodeCallJSON(ctx, client, "trading the Z.ai business token", origin+"/api/auth/z/login", http.MethodPost,
-		map[string]string{"Content-Type": "application/json", "User-Agent": "ZCode/" + ZcodeClientVersion},
-		map[string]any{"token": oauthToken})
-	if err != nil {
-		return "", err
-	}
-	businessToken, _ := zcodeDataOf(login)["access_token"].(string)
-	if businessToken == "" {
-		return "", fmt.Errorf("the Z.ai business token exchange returned no access token")
-	}
-	headers := map[string]string{
-		"Authorization": "Bearer " + businessToken,
-		"Content-Type":  "application/json",
-		"User-Agent":    "ZCode/" + ZcodeClientVersion,
-	}
-	return zcodeExchangeChain(ctx, client, origin, headers, "", "")
+func zcodeExchangeBigmodel(ctx context.Context, client *http.Client, oauthToken string) (zcodePATMaterial, error) {
+	// BigModel 的业务 API 直接接受 OAuth token，loginToken 即它本身。
+	return zcodeExchangeChain(ctx, client, zcodeBigmodelBizURL, oauthToken, ZcodeChannelBigmodel)
 }
 
-// zcodeExchangeChain 执行 getCustomerInfo → api_keys 兑换链。BigModel
-// 偏好名为 默认机构/默认项目 的记录（找不到取第一个），Z.ai 只有一组。
-func zcodeExchangeChain(ctx context.Context, client *http.Client, origin string, headers map[string]string, preferredOrg, preferredProject string) (string, error) {
-	customer, err := zcodeCallJSON(ctx, client, "reading the account", origin+"/api/biz/customer/getCustomerInfo", http.MethodGet, headers, nil)
+func zcodeExchangeZai(ctx context.Context, client *http.Client, oauthToken string) (zcodePATMaterial, error) {
+	loginToken, err := zcodeZaiBusinessLogin(ctx, client, oauthToken)
 	if err != nil {
-		return "", err
+		return zcodePATMaterial{}, err
 	}
-	organizationID, projectID, err := zcodeChooseProject(zcodeDataOf(customer), preferredOrg, preferredProject)
+	return zcodeExchangeChain(ctx, client, zcodeZaiBizURL, loginToken, ZcodeChannelZai)
+}
+
+// zcodeExchangeChain 执行 getCustomerInfo → key 找到或创建 → PAT 签发。
+// 项目选择走官方 coding-plan 默认语义：不过滤 projectType，优先含
+// 默认机构/默认项目 的记录，找不到取第一个。
+func zcodeExchangeChain(ctx context.Context, client *http.Client, origin, loginToken, channel string) (zcodePATMaterial, error) {
+	bare := zcodeBizHeaders(loginToken, channel, false)
+	customer, err := zcodeCallJSON(ctx, client, "reading the account", origin+"/api/biz/customer/getCustomerInfo", http.MethodGet, bare, nil)
 	if err != nil {
-		return "", err
+		return zcodePATMaterial{}, err
 	}
+	organizationID, projectID, err := zcodeChooseProject(zcodeDataOf(customer), "默认机构", "默认项目")
+	if err != nil {
+		return zcodePATMaterial{}, err
+	}
+	keyHeaders := zcodeBizHeaders(loginToken, channel, true)
 	listURL := fmt.Sprintf("%s/api/biz/v1/organization/%s/projects/%s/api_keys",
 		origin, url.PathEscape(organizationID), url.PathEscape(projectID))
-	listed, err := zcodeCallJSON(ctx, client, "listing the Coding Plan API keys", listURL, http.MethodGet, headers, nil)
+	listed, err := zcodeCallJSON(ctx, client, "listing the Coding Plan API keys", listURL, http.MethodGet, keyHeaders, nil)
 	if err != nil {
-		return "", err
+		return zcodePATMaterial{}, err
 	}
 	apiKeyID := ""
-	foundNamedKey := false
+	foundNamed := false
 	dataList, _ := listed["data"].([]any)
 	for _, raw := range dataList {
 		entry, ok := raw.(map[string]any)
@@ -388,42 +386,33 @@ func zcodeExchangeChain(ctx context.Context, client *http.Client, origin string,
 			continue
 		}
 		if name, _ := entry["name"].(string); name == ZcodeExchangeKeyName {
-			foundNamedKey = true
+			foundNamed = true
 			apiKeyID, _ = entry["apiKey"].(string)
 			break
 		}
 	}
-	if foundNamedKey && apiKeyID == "" {
-		// 参考客户端对「找到同名条目但无 id」直接报错；回退创建会产生
-		// 重复 key，两份 key 中只有一份的 secret 被轮换管理。
-		return "", fmt.Errorf("the existing %s entry carries no id", ZcodeExchangeKeyName)
+	if foundNamed && apiKeyID == "" {
+		// 找到同名条目但无 id 时直接报错；回退创建会产生重复 key，
+		// 两份 key 里只有一份的 PAT 会被续期。
+		return zcodePATMaterial{}, fmt.Errorf("the existing %s entry carries no id", ZcodeExchangeKeyName)
 	}
 	if apiKeyID == "" {
-		created, err := zcodeCallJSON(ctx, client, "creating the Coding Plan API key", listURL, http.MethodPost, headers,
-			map[string]any{"name": ZcodeExchangeKeyName})
+		created, err := zcodeCallJSON(ctx, client, "creating the Coding Plan API key", listURL, http.MethodPost, keyHeaders,
+			map[string]any{"name": ZcodeExchangeKeyName, "usageScene": 1})
 		if err != nil {
-			return "", err
+			return zcodePATMaterial{}, err
 		}
 		apiKeyID, _ = zcodeDataOf(created)["apiKey"].(string)
 		if apiKeyID == "" {
-			return "", fmt.Errorf("the Coding Plan API key carries no id")
+			return zcodePATMaterial{}, fmt.Errorf("the Coding Plan API key carries no id")
 		}
 	}
-	copied, err := zcodeCallJSON(ctx, client, "reading the Coding Plan API key secret", listURL+"/copy/"+url.PathEscape(apiKeyID), http.MethodGet, headers, nil)
+	loc := zcodePATLocation{OrganizationID: organizationID, ProjectID: projectID, APIKeyID: apiKeyID}
+	token, expiresAt, err := zcodeIssuePAT(ctx, client, origin, loginToken, loc)
 	if err != nil {
-		return "", err
+		return zcodePATMaterial{}, fmt.Errorf("issuing the project token failed: %s", zcodePATErrorCode(err))
 	}
-	secretKey, _ := zcodeDataOf(copied)["secretKey"].(string)
-	key := apiKeyID
-	if secretKey != "" {
-		key = apiKeyID + "." + secretKey
-	}
-	// key 的全部用途是 riding 一个 Authorization 头；无法过头的值在这里
-	// 就拒绝，消息里不携带 key 本身。
-	if strings.TrimSpace(key) == "" || strings.ContainsAny(key, "\r\n ") {
-		return "", fmt.Errorf("the exchanged Coding Plan key cannot ride an HTTP header")
-	}
-	return key, nil
+	return zcodePATMaterial{Token: token, Location: loc, ExpiresAt: expiresAt}, nil
 }
 
 func zcodeChooseProject(data map[string]any, preferredOrg, preferredProject string) (string, string, error) {
@@ -625,14 +614,15 @@ func RunZcodeLogin(ctx context.Context, opts ZcodeLoginOptions) (string, error) 
 			if opts.OnProgress != nil {
 				opts.OnProgress(zcodeLoginExchanging, "", time.Time{})
 			}
-			key, err := exchangeZcodeKey(ctx, client, decision.token, channel)
+			mat, err := exchangeZcodeKey(ctx, client, decision.token, channel)
 			if err != nil {
 				return "", err
 			}
-			if err := probeZcodeKey(ctx, client, origin, channel, key); err != nil {
+			// 探测在 PAT 签发之后跑：确认网关接受的正是即将落盘的 token。
+			if err := probeZcodeKey(ctx, client, origin, channel, mat.Token); err != nil {
 				return "", err
 			}
-			path, err := storeZcodeToken(opts.TokenStorePath, channel, key, decision.jwt, decision.token, decision.user, opts.Store)
+			path, err := storeZcodePAT(opts.TokenStorePath, channel, mat, decision.jwt, decision.token, decision.user, opts.Store)
 			if err != nil {
 				return "", err
 			}
@@ -671,6 +661,12 @@ func isLoopbackHost(host string) bool {
 // 仍是旧的过期 token，于是再触发一次 OAuth，循环往复。返回的路径是给日志与
 // 状态端点看的标识，DB 写入时以 channel 代替。
 func storeZcodeToken(path, channel, key, jwt, oauthToken, user string, store *zcodeCredentialStore) (string, error) {
+	return storeZcodePAT(path, channel, zcodePATMaterial{Token: key}, jwt, oauthToken, user, store)
+}
+
+// storeZcodePAT 落盘 PAT 完整材料：api_key 存短期 token，位置三元组与到期
+// 时刻一并保存，请求路径凭此续期，不必重走 customerInfo。
+func storeZcodePAT(path, channel string, mat zcodePATMaterial, jwt, oauthToken, user string, store *zcodeCredentialStore) (string, error) {
 	if store != nil {
 		// 设备身份随凭据一起落库：它属于机器而非账号，与 key 同生命周期，
 		// 顺带让 metadata 注入不再依赖 ZCode 客户端的 telemetry 文件。
@@ -679,12 +675,16 @@ func storeZcodeToken(path, channel, key, jwt, oauthToken, user string, store *zc
 			deviceMid = readZcodeDeviceMid(filepath.Join(home, ".zcode", "v2", zcodeDeviceStateName))
 		}
 		if err := store.save(context.Background(), ZcodeCredential{
-			Channel:     channel,
-			APIKey:      key,
-			PlatformJWT: jwt,
-			OAuthToken:  oauthToken,
-			UserName:    user,
-			DeviceMid:   deviceMid,
+			Channel:        channel,
+			APIKey:         mat.Token,
+			PlatformJWT:    jwt,
+			OAuthToken:     oauthToken,
+			UserName:       user,
+			DeviceMid:      deviceMid,
+			APIKeyID:       mat.Location.APIKeyID,
+			OrganizationID: mat.Location.OrganizationID,
+			ProjectID:      mat.Location.ProjectID,
+			PATExpiresAt:   mat.ExpiresAt,
 		}); err != nil {
 			return "", err
 		}
@@ -701,10 +701,8 @@ func storeZcodeToken(path, channel, key, jwt, oauthToken, user string, store *zc
 	if raw, err := os.ReadFile(path); err == nil {
 		_ = json.Unmarshal(raw, &document)
 	}
-	// 不写 expires_at：poll 不回传 key 的有效期；过期由网关 401 暴露，
-	// zcodeKeyFromRecord 的 expires_at 检查只服务于参考客户端的文件。
 	entry := map[string]any{
-		"api_key":    key,
+		"api_key":    mat.Token,
 		"updated_at": time.Now().UTC().Format(time.RFC3339),
 	}
 	if jwt != "" {
@@ -715,6 +713,18 @@ func storeZcodeToken(path, channel, key, jwt, oauthToken, user string, store *zc
 	}
 	if user != "" {
 		entry["user"] = user
+	}
+	if mat.Location.APIKeyID != "" {
+		entry["api_key_id"] = mat.Location.APIKeyID
+	}
+	if mat.Location.OrganizationID != "" {
+		entry["organization_id"] = mat.Location.OrganizationID
+	}
+	if mat.Location.ProjectID != "" {
+		entry["project_id"] = mat.Location.ProjectID
+	}
+	if !mat.ExpiresAt.IsZero() {
+		entry["pat_expires_at"] = mat.ExpiresAt.UTC().Format(time.RFC3339Nano)
 	}
 	document[channel] = entry
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {

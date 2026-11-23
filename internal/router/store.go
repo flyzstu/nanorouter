@@ -60,10 +60,10 @@ func Migrate(ctx context.Context, db *sql.DB) error {
 // Usage 仅保存上游明确返回的数字；避免用不同 tokenizer 的估算值混入账本。
 type Usage struct {
 	Prompt, Completion, Total int64
-	// Reasoning/Cached 来自 *_tokens_details，仅用于 Responses 使用量回填；
-	// Total 仍是上游返回的 total_tokens（含 reasoning），不重复累加。
-	Reasoning, Cached int64
-	Source            string
+	Reasoning, Cached         int64
+	Source                    string
+	// FinishReason 是上游流的终止原因（stop/length/tool_calls/…），仅诊断用，不进账本。
+	FinishReason string
 }
 type Record struct {
 	ID, Route, UpstreamID, UpstreamModel, Endpoint, ErrorKind string

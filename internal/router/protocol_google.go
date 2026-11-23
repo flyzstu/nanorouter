@@ -428,6 +428,7 @@ func (r *Router) streamGeminiAsChat(w http.ResponseWriter, resp *http.Response, 
 		f.Flush()
 	}
 
+	usage.FinishReason = finishReason
 	return usage, nil
 }
 

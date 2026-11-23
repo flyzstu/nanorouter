@@ -50,7 +50,7 @@ func TestZcodeMessagesPassthroughPinsHeaders(t *testing.T) {
 		if req.URL.Path != "/api/v1/ultra/anthropic/v1/messages" {
 			t.Fatalf("path=%s", req.URL.Path)
 		}
-		if got := req.Header.Get("User-Agent"); got != "ZCode/"+ZcodeClientVersion {
+		if got := req.Header.Get("User-Agent"); got != "ZCode/4.0.0 ai-sdk/anthropic/3.0.81 ai-sdk/provider-utils/4.0.27 runtime/node.js/v24.x" {
 			t.Fatalf("user-agent=%q", got)
 		}
 		if got := req.Header.Get("anthropic-version"); got != ZcodeAnthropicVersion {
@@ -62,8 +62,11 @@ func TestZcodeMessagesPassthroughPinsHeaders(t *testing.T) {
 		if got := req.Header.Get("Authorization"); got != "Bearer "+downstreamKey {
 			t.Fatalf("authorization=%q", got)
 		}
-		if got := req.Header.Get("X-ZCode-App-Version"); got != ZcodeClientVersion {
+		if got := req.Header.Get("X-ZCode-App-Version"); got != "4.0.0" {
 			t.Fatalf("x-zcode-app-version=%q", got)
+		}
+		if got := req.Header.Get("X-Title"); got != "Z Code@cli" {
+			t.Fatalf("x-title=%q", got)
 		}
 		if got := req.Header.Get("X-Client-Language"); got != "zh-CN" {
 			t.Fatalf("x-client-language=%q", got)
@@ -81,8 +84,17 @@ func TestZcodeMessagesPassthroughPinsHeaders(t *testing.T) {
 		if !strings.HasPrefix(req.Header.Get("x-request-id"), "req_") {
 			t.Fatalf("x-request-id=%q", req.Header.Get("x-request-id"))
 		}
+		if !strings.HasPrefix(req.Header.Get("x-query-id"), "query_") {
+			t.Fatalf("x-query-id=%q", req.Header.Get("x-query-id"))
+		}
 		if !strings.HasPrefix(req.Header.Get("x-zcode-trace-id"), "trace_") {
 			t.Fatalf("x-zcode-trace-id=%q", req.Header.Get("x-zcode-trace-id"))
+		}
+		if got := req.Header.Get("x-session-affinity"); got != "" {
+			t.Fatalf("x-session-affinity must be gone, got %q", got)
+		}
+		if got := req.Header.Get("anthropic-beta"); got != "" {
+			t.Fatalf("anthropic-beta must be absent without tools, got %q", got)
 		}
 		var in map[string]any
 		_ = json.NewDecoder(req.Body).Decode(&in)
@@ -117,6 +129,71 @@ func TestZcodeMessagesPassthroughPinsHeaders(t *testing.T) {
 	}
 	if prompt != 3 || completion != 2 {
 		t.Fatalf("usage prompt=%d completion=%d", prompt, completion)
+	}
+}
+
+func TestZcodeBetaHeaderOnlyWithTools(t *testing.T) {
+	betas := make([]string, 0, 2)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		betas = append(betas, req.Header.Get("anthropic-beta"))
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"m","type":"message","role":"assistant","content":[{"type":"text","text":"hi"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}`))
+	}))
+	defer upstream.Close()
+	r, _ := newZcodeTestRouter(t, Candidate{
+		ID: "zcode-cn", BaseURL: upstream.URL, Model: "glm-5.3", APIKeyEnv: "TEST_ZCODE_BETA_KEY",
+		Anthropic: true, SimulateZcode: true, ZcodeChannel: ZcodeChannelBigmodel,
+	})
+	t.Setenv("TEST_ZCODE_BETA_KEY", "k.secret")
+	withTools := `{"model":"zcode","max_tokens":8,"messages":[{"role":"user","content":"hi"}],"tools":[{"name":"get_time","input_schema":{"type":"object"}}]}`
+	if rec := postJSON(t, r, "/v1/messages", withTools); rec.Code != 200 {
+		t.Fatalf("tools status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	withoutTools := `{"model":"zcode","max_tokens":8,"messages":[{"role":"user","content":"hi"}]}`
+	if rec := postJSON(t, r, "/v1/messages", withoutTools); rec.Code != 200 {
+		t.Fatalf("plain status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if len(betas) != 2 {
+		t.Fatalf("captured %d requests", len(betas))
+	}
+	if betas[0] != "advanced-tool-use-2025-11-20" {
+		t.Fatalf("beta with tools=%q", betas[0])
+	}
+	if betas[1] != "" {
+		t.Fatalf("beta without tools=%q", betas[1])
+	}
+}
+
+func TestZcodeSessionTypePassthrough(t *testing.T) {
+	var got string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		got = req.Header.Get("x-zcode-session-type")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"m","type":"message","role":"assistant","content":[{"type":"text","text":"hi"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}`))
+	}))
+	defer upstream.Close()
+	r, _ := newZcodeTestRouter(t, Candidate{
+		ID: "zcode-cn", BaseURL: upstream.URL, Model: "glm-5.3", APIKeyEnv: "TEST_ZCODE_ST_KEY",
+		Anthropic: true, SimulateZcode: true, ZcodeChannel: ZcodeChannelBigmodel,
+	})
+	t.Setenv("TEST_ZCODE_ST_KEY", "k.secret")
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{"model":"zcode","max_tokens":8,"messages":[{"role":"user","content":"hi"}]}`))
+	req.Header.Set("x-zcode-session-type", "subagent")
+	rec := httptest.NewRecorder()
+	r.Handler().ServeHTTP(rec, req)
+	if rec.Code != 200 {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if got != "subagent" {
+		t.Fatalf("session-type=%q", got)
+	}
+	if got := zcodeSessionTypeForRequest(nil); got != "main" {
+		t.Fatalf("default session-type=%q", got)
+	}
+	bad := httptest.NewRequest(http.MethodPost, "/v1/messages", nil)
+	bad.Header.Set("x-zcode-session-type", "root') OR '1'='1")
+	if got := zcodeSessionTypeForRequest(bad); got != "main" {
+		t.Fatalf("illegal session-type fallback=%q", got)
 	}
 }
 

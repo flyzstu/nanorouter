@@ -12,7 +12,8 @@ package router
 //
 // 解析目标只是"渠道 → 可服务 key"：api-key 后缀条目按 key 名里的渠道词
 // 归类（含 bigmodel/zai，否则落在 active_provider，再退 bigmodel），
-// coding-plan 条目优先于同渠道的非 coding-plan 条目；`eyJhbGci` 平台 JWT
+// coding-plan 条目优先于同渠道的非 coding-plan 条目；含 zai_cn/zai-cn 的
+// 条目显式跳过（中国区个人业务无端点契约，不做）；`eyJhbGci` 平台 JWT
 // 视为无凭据（与参考客户端历史误存行为的兼容一致）。
 
 import (
@@ -101,6 +102,9 @@ func decryptZcodeCredentialValue(value string) (string, bool) {
 }
 
 // parseZcodeV2Credentials 把解密后的 v2 凭据文档归并为 {渠道: 可服务 key}。
+// zai_cn（中国区个人业务）只有显式拒绝：其业务端点尚无契约证据（见
+// docs/zcode-login-rework.md:333），含 zai_cn/zai-cn 的条目直接跳过，不能
+// 落进 zai 桶——两渠道凭据不通用，误路由必然 401 还污染对端访问日志。
 func parseZcodeV2Credentials(document map[string]any) map[string]string {
 	entries := map[string]string{}
 	if document == nil {
@@ -115,6 +119,9 @@ func parseZcodeV2Credentials(document map[string]any) map[string]string {
 	for key, raw := range document {
 		lower := strings.ToLower(key)
 		if !isZcodeV2APIKeyField(lower) {
+			continue
+		}
+		if strings.Contains(lower, "zai_cn") || strings.Contains(lower, "zai-cn") {
 			continue
 		}
 		decoded, ok := decryptZcodeCredentialValue(toString(raw))

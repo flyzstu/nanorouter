@@ -28,6 +28,10 @@ import (
 
 const (
 	zcodeUsageBaseURL = "https://bigmodel.cn"
+	// zai 渠道的用量面与网关同域：官方 v4 里 zai 家族的 origin 是 api.z.ai，
+	// bigmodel 家族走 bigmodel.cn。用量请求按凭据渠道切域，与网关路径
+	// zcodeGatewayPath 的切法同源。
+	zcodeUsageZaiBaseURL = "https://api.z.ai"
 	// 单端点超时。这是页面辅助数据，等待上游超过 8 秒不如尽快返回已缓存
 	// 的旧值——页面还有网关自身的统计可看。
 	zcodeUsageTimeout = 8 * time.Second
@@ -43,6 +47,15 @@ const (
 	// 上游响应体上限：四个端点都是聚合 JSON，8 MiB 绰绰有余，防病态响应。
 	zcodeUsageMaxBodyBytes = 8 << 20
 )
+
+// zcodeUsageBaseURLFor 按凭据渠道选用量域。测试夹具直接改 cache.baseURL，
+// 传空渠道时回落默认域。
+func zcodeUsageBaseURLFor(channel string) string {
+	if channel == ZcodeChannelZai {
+		return zcodeUsageZaiBaseURL
+	}
+	return zcodeUsageBaseURL
+}
 
 // zcodeUsageEndpoint 是一个上游端点：路径与对应的缓存 TTL。windowed 标记
 // 是否携带时间窗参数——quota 是即时快照，glm-usage 调它时不带任何参数。
@@ -121,10 +134,22 @@ func newZcodeUsageCache() *zcodeUsageCache {
 	}
 }
 
-// fetch 拉一个端点。返回 (数据, 失败原因)；数据非空且 err 非空 = 降级中的旧值。
-func (c *zcodeUsageCache) fetch(ctx context.Context, ep zcodeUsageEndpoint, window zcodeUsageWindow, token string) (json.RawMessage, error) {
+// baseFor 按渠道选定用量域。生产环境的 baseURL 恒为默认值之一，
+// 走渠道映射；被显式改成别的（测试桩）时保持覆盖。
+func (c *zcodeUsageCache) baseFor(channel string) string {
+	if c.baseURL != "" && c.baseURL != zcodeUsageBaseURL && c.baseURL != zcodeUsageZaiBaseURL {
+		return c.baseURL
+	}
+	return zcodeUsageBaseURLFor(channel)
+}
+
+// fetch 拉一个端点。channel 决定用量域（回退到 zai 凭据时同时切域，
+// 缓存键按域隔离、互不污染）；cache.baseURL 被显式改过（测试桩）时
+// 保持覆盖，生产环境恒为默认值、走渠道映射。
+func (c *zcodeUsageCache) fetch(ctx context.Context, ep zcodeUsageEndpoint, window zcodeUsageWindow, token, channel string) (json.RawMessage, error) {
+	baseURL := c.baseFor(channel)
 	// 时间窗只进带窗端点的缓存键：biz 快照端点跨窗口共享同一份缓存。
-	cacheKey := ep.key
+	cacheKey := baseURL + "|" + ep.key
 	if ep.windowed {
 		cacheKey += "|" + window.cacheKey()
 	}
@@ -153,14 +178,14 @@ func (c *zcodeUsageCache) fetch(ctx context.Context, ep zcodeUsageEndpoint, wind
 		go func() {
 			refreshCtx, cancel := context.WithTimeout(context.Background(), zcodeUsageTimeout)
 			defer cancel()
-			data, err := c.upstream(refreshCtx, ep, window, token)
+			data, err := c.upstream(refreshCtx, ep, window, token, baseURL)
 			c.complete(cacheKey, call, data, err)
 			c.store(cacheKey, data, err)
 		}()
 		return serve.data, result
 	}
 
-	data, err := c.upstream(ctx, ep, window, token)
+	data, err := c.upstream(ctx, ep, window, token, baseURL)
 	c.complete(cacheKey, call, data, err)
 	// 请求被下游取消或自身超时不落缓存：这是本次调用的状态，不是端点的。
 	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
@@ -238,8 +263,11 @@ func (c *zcodeUsageCache) store(cacheKey string, data json.RawMessage, err error
 
 // upstream 发起真正的上游请求。状态码优先于信封解析：4xx/5xx 是传输层
 // 结论，信封 code 只是补充。
-func (c *zcodeUsageCache) upstream(ctx context.Context, ep zcodeUsageEndpoint, window zcodeUsageWindow, token string) (json.RawMessage, error) {
+func (c *zcodeUsageCache) upstream(ctx context.Context, ep zcodeUsageEndpoint, window zcodeUsageWindow, token, baseURL string) (json.RawMessage, error) {
 	values := url.Values{}
+	if baseURL == "" {
+		baseURL = c.baseURL
+	}
 	if ep.windowed {
 		for key, value := range window.params() {
 			values.Set(key, value)
@@ -248,7 +276,7 @@ func (c *zcodeUsageCache) upstream(ctx context.Context, ep zcodeUsageEndpoint, w
 	for key, value := range ep.extraParams {
 		values.Set(key, value)
 	}
-	target := c.baseURL + ep.path
+	target := baseURL + ep.path
 	if len(values) > 0 {
 		target += "?" + values.Encode()
 	}
@@ -447,7 +475,7 @@ func (r *Router) zcodeUsageHandler(w http.ResponseWriter, q *http.Request) {
 		wg.Add(1)
 		go func(ep zcodeUsageEndpoint) {
 			defer wg.Done()
-			data, err := r.zcodeUsageShared().fetch(ctx, ep, window, token)
+			data, err := r.zcodeUsageShared().fetch(ctx, ep, window, token, channel)
 			results <- result{key: ep.key, data: data, err: err}
 		}(ep)
 	}

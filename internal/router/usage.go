@@ -55,6 +55,30 @@ func usageFromRaw(raw map[string]any) Usage {
 	return u
 }
 
+// finishReasonFromChunk 从 OpenAI 兼容流帧提取 choices[0].finish_reason；
+// 空表示该帧不是收尾帧。调用方保留最后一次非空值。
+func finishReasonFromChunk(chunk map[string]any) string {
+	choices, _ := chunk["choices"].([]any)
+	if len(choices) == 0 {
+		return ""
+	}
+	choice, _ := choices[0].(map[string]any)
+	if choice == nil {
+		return ""
+	}
+	finish, _ := choice["finish_reason"].(string)
+	return finish
+}
+
+// finishReasonFromPayload 是 finishReasonFromChunk 的字节入口；解析失败即非收尾帧。
+func finishReasonFromPayload(payload []byte) string {
+	var chunk map[string]any
+	if json.Unmarshal(payload, &chunk) != nil {
+		return ""
+	}
+	return finishReasonFromChunk(chunk)
+}
+
 func detailNumber(v any, key string) int64 {
 	if details, ok := v.(map[string]any); ok {
 		return number(details[key])
