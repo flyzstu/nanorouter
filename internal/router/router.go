@@ -68,10 +68,16 @@ type Router struct {
 	retryBudgetDenied *prometheus.CounterVec
 	retryBudgetTokens *prometheus.GaugeVec
 	probes            *prometheus.CounterVec
+	usageFailures     *prometheus.CounterVec
 	candidates        map[string]Candidate
 	allCandidates     []Candidate
 	proberCancel      context.CancelFunc
 	proberDone        chan struct{}
+	// credentialCheckCancel/credentialCheckDone 管理启动凭据体检的 goroutine。
+	// 它同样要能在 Close 时停下：体检会读库、读凭据文件并可能触发登录，
+	// 关停后继续跑会污染全局 token 缓存。
+	credentialCheckCancel context.CancelFunc
+	credentialCheckDone   chan struct{}
 	// vibeMu 保护目录自动发现的结果；与 mu 分开，避免每请求路由解析与熔断状态抢同一把锁。
 	vibeMu       sync.RWMutex
 	vibeModels   []vibeModel
@@ -103,6 +109,9 @@ type Router struct {
 	// live 是实时会话统计（进行中/存活会话/活跃调用方），懒初始化同上。
 	live     *liveTracker
 	liveOnce sync.Once
+	// usageReader 是 /v1/usage 里 Mistral 账号段的进程内缓存，懒初始化同上。
+	usageReader     *usageReaderCache
+	usageReaderOnce sync.Once
 }
 
 // state 是单个上游的熔断状态。冷却期内不再向它发送新请求，
@@ -130,6 +139,9 @@ func NewWithLogger(cfg Config, db *sql.DB, logger *zap.Logger) (*Router, error) 
 		return nil, err
 	}
 	if err := cfg.HealthCheck.normalize(); err != nil {
+		return nil, err
+	}
+	if err := cfg.Usage.normalize(); err != nil {
 		return nil, err
 	}
 	for routeName, route := range cfg.Routes {
@@ -178,6 +190,7 @@ func NewWithLogger(cfg Config, db *sql.DB, logger *zap.Logger) (*Router, error) 
 		r.allCandidates = append(r.allCandidates, c)
 	}
 	r.probes = prometheus.NewCounterVec(prometheus.CounterOpts{Name: "nanorouter_probes_total", Help: "Background health probe attempts"}, []string{"upstream", "outcome"})
+	r.usageFailures = prometheus.NewCounterVec(prometheus.CounterOpts{Name: "nanorouter_usage_upstream_errors_total", Help: "Account usage reads that failed upstream, by provider"}, []string{"provider"})
 	r.requests = prometheus.NewCounterVec(prometheus.CounterOpts{Name: "nanorouter_requests_total", Help: "Upstream attempts"}, []string{"route", "upstream", "endpoint", "status"})
 	r.tokens = prometheus.NewCounterVec(prometheus.CounterOpts{Name: "nanorouter_tokens_total", Help: "Reported tokens"}, []string{"route", "upstream", "type"})
 	r.failovers = prometheus.NewCounterVec(prometheus.CounterOpts{Name: "nanorouter_failovers_total", Help: "Retries sent to another upstream"}, []string{"route", "reason"})
@@ -197,7 +210,7 @@ func NewWithLogger(cfg Config, db *sql.DB, logger *zap.Logger) (*Router, error) 
 	for routeName, budget := range r.retryBudgets {
 		r.retryBudgetTokens.WithLabelValues(routeName).Set(budget.available())
 	}
-	collectors := []prometheus.Collector{r.requests, r.tokens, r.failovers, r.ttfb, r.queueWait, r.retryWaits, r.inflight, r.concurrency, r.admissionRejected, r.retryBudgetDenied, r.retryBudgetTokens, r.probes, ledgerDropped, ledgerErrors}
+	collectors := []prometheus.Collector{r.requests, r.tokens, r.failovers, r.ttfb, r.queueWait, r.retryWaits, r.inflight, r.concurrency, r.admissionRejected, r.retryBudgetDenied, r.retryBudgetTokens, r.probes, r.usageFailures, ledgerDropped, ledgerErrors}
 	if r.admission != nil {
 		collectors = append(collectors,
 			prometheus.NewGaugeFunc(prometheus.GaugeOpts{Name: "nanorouter_backpressure_inflight", Help: "Requests admitted by global backpressure control"}, func() float64 { return float64(r.admission.inflight.Load()) }),
@@ -217,7 +230,12 @@ func NewWithLogger(cfg Config, db *sql.DB, logger *zap.Logger) (*Router, error) 
 		r.vibeDone = make(chan struct{})
 		go r.runVibeCatalog(ctx)
 	}
-	r.startZcodeCredentialCheck()
+	if r.hasZcodeTokenFileCandidate() {
+		ctx, cancel := context.WithCancel(context.Background())
+		r.credentialCheckCancel = cancel
+		r.credentialCheckDone = make(chan struct{})
+		go r.runZcodeCredentialCheck(ctx)
+	}
 	return r, nil
 }
 func (r *Router) Handler() http.Handler {
@@ -275,6 +293,9 @@ func (r *Router) Handler() http.Handler {
 	// 以自身身份登录第三方账号的特权端点，不接受浏览器的 Basic 回退。
 	mux.Post("/zcode/login", r.startZcodeLogin)
 	mux.Get("/zcode/login", r.zcodeLoginStatus)
+	// 账号额度聚合：把 zcode 用量与 Mistral 账号面归一成一张卡，供下游
+	// 插件直接画计量条。与 /v1/zcode/usage 并存（后者保留上游原样形状）。
+	mux.Get("/v1/usage", r.usageHandler)
 	return r.auth(mux)
 }
 
@@ -301,6 +322,13 @@ func (r *Router) Close(ctx context.Context) error {
 		r.vibeCancel()
 		select {
 		case <-r.vibeDone:
+		case <-ctx.Done():
+		}
+	}
+	if r.credentialCheckCancel != nil {
+		r.credentialCheckCancel()
+		select {
+		case <-r.credentialCheckDone:
 		case <-ctx.Done():
 		}
 	}
@@ -335,7 +363,7 @@ func isAPIKeyAdminPath(path string) bool {
 // 的范围。与 Basic 回退白名单一致（两者都只为同一个页面服务），生成端点
 // 与核销 POST 始终不在其中。
 func isBrowserPath(path string) bool {
-	if path == "/stats" || path == "/v1/stats/summary" || path == "/v1/zcode/usage" {
+	if path == "/stats" || path == "/v1/stats/summary" || path == "/v1/zcode/usage" || path == "/v1/usage" {
 		return true
 	}
 	if path == "/v1/zcode/reset/status" {
@@ -361,7 +389,7 @@ func isGenerationPath(path string) bool {
 // 保持原有认证面。
 func isBasicAuthPath(path string) bool {
 	switch path {
-	case "/stats", "/v1/stats/summary", "/v1/zcode/usage",
+	case "/stats", "/v1/stats/summary", "/v1/zcode/usage", "/v1/usage",
 		"/v1/zcode/reset/status", "/v1/zcode/reset/use":
 		return true
 	}
@@ -377,7 +405,7 @@ func (r *Router) auth(next http.Handler) http.Handler {
 	}
 	// statsAuthPaths 同时是 stats_public 的豁免名单；重置卡端点不在此列——
 	// 统计面公开不等于允许匿名花卡，两者由独立开关控制。
-	statsAuthPaths := map[string]bool{"/stats": true, "/v1/stats/summary": true, "/v1/zcode/usage": true}
+	statsAuthPaths := map[string]bool{"/stats": true, "/v1/stats/summary": true, "/v1/zcode/usage": true, "/v1/usage": true}
 	// resetAuthPaths 只由 zcode_reset.public 豁免。开启时访问控制完全交给
 	// 反代（如 Traefik + Authelia）；部署方必须强制这些路径经过边缘鉴权，
 	// 且不能让「携带认证头即绕过反代」的规则覆盖它们，否则等于公开核销。
@@ -673,12 +701,30 @@ func (r *Router) models(w http.ResponseWriter, q *http.Request) {
 }
 
 // routeModelMetadata 汇总聚合路由可发布的参数：上下文窗口只承诺所有候选都能
-// 满足的最小值，推理档位来自路由自身的 reasoning_levels。
+// 满足的最小值，推理档位来自路由自身的 reasoning_levels，messages 声明原生
+// Messages 协议是否覆盖整条路由，input_modalities 声明是否有候选能收图。
 func routeModelMetadata(route Route) map[string]any {
-	meta := make(map[string]any, 2)
+	meta := make(map[string]any, 3)
 	length := 0
+	// messages 声明"该模型的 Messages 面与 Chat 面等价"：/v1/messages 的候选
+	// 过滤会排除非 anthropic 上游，混合路由走原生协议就会丢掉 chat 候选的
+	// 故障切换，所以只有全部聚合候选都是 anthropic 时才敢声明。下游只在声明
+	// 为真时优先原生协议，否则留在 Chat 面保住完整切换能力。
+	aggregate := 0
+	allAnthropic := true
+	anyVision := false
 	for _, candidate := range route.Candidates {
-		if !candidate.IsAggregateEnabled() || candidate.ContextLength <= 0 {
+		if !candidate.IsAggregateEnabled() {
+			continue
+		}
+		aggregate++
+		if !candidate.Anthropic {
+			allAnthropic = false
+		}
+		if candidate.IsEnabled() && candidate.Vision {
+			anyVision = true
+		}
+		if candidate.ContextLength <= 0 {
 			continue
 		}
 		if length == 0 || candidate.ContextLength < length {
@@ -691,16 +737,32 @@ func routeModelMetadata(route Route) map[string]any {
 	if len(route.ReasoningLevels) > 0 {
 		meta["supported_reasoning_levels"] = route.ReasoningLevels
 	}
+	if aggregate > 0 && allAnthropic {
+		meta["messages"] = true
+	}
+	// input_modalities 只要路由里有一个能收图的候选就发布：发图请求在
+	// candidateEligible 里被收缩到 vision 候选，所以不会落到收不了图的上游。
+	// 与 messages 不同——Messages 面的收缩是协议本身决定的（非 anthropic
+	// 候选无反向翻译层），这里由本网关自己保证。
+	if aggregate > 0 && anyVision {
+		meta["input_modalities"] = []string{"text", "image"}
+	}
 	return meta
 }
 
 func candidateModelMetadata(route Route, candidate Candidate) map[string]any {
-	meta := make(map[string]any, 2)
+	meta := make(map[string]any, 3)
 	if candidate.ContextLength > 0 {
 		meta["context_length"] = candidate.ContextLength
 	}
 	if len(route.ReasoningLevels) > 0 {
 		meta["supported_reasoning_levels"] = route.ReasoningLevels
+	}
+	if candidate.Anthropic {
+		meta["messages"] = true
+	}
+	if candidate.Vision {
+		meta["input_modalities"] = []string{"text", "image"}
 	}
 	return meta
 }
@@ -777,6 +839,10 @@ func (r *Router) proxy(endpoint string, defaultRoutes ...string) http.HandlerFun
 			return
 		}
 		streamed, _ := payload["stream"].(bool)
+		// 只判断一次：这个事实决定候选面，进循环后不再变化。
+		// 只有路由里确实存在声明 vision 的候选时才按图收缩——没有任何声明
+		// 时网关没有依据，必须保持原样转发，否则会静默改变既有部署的行为。
+		requireVision := requestHasImages(payload) && routeHasVision(route)
 		sessionAffinity := strings.TrimSpace(q.Header.Get(sessionAffinityHeader))
 		if sessionAffinity == "" {
 			sessionAffinity = strings.TrimSpace(q.Header.Get("X-Session-Id"))
@@ -798,7 +864,7 @@ func (r *Router) proxy(endpoint string, defaultRoutes ...string) http.HandlerFun
 		// 只修改 model 字段，其他 OpenAI/Responses 字段透明保留，
 		// 因而 tools、图片、response_format 等新字段不需要网关逐一适配。
 		for {
-			u, ok := r.pick(routeName, route, endpoint, attempted, sessionAffinity)
+			u, ok := r.pick(routeName, route, endpoint, attempted, sessionAffinity, requireVision)
 			if !ok {
 				if pending, retryable := earliestPendingRetry(pendingRetries); retryable {
 					delay := time.Until(pending.At)
@@ -1758,7 +1824,7 @@ func newUpstreamHTTPClient() *http.Client {
 	return &http.Client{Transport: transport}
 }
 
-func (r *Router) pick(name string, route Route, endpoint string, excluded map[string]bool, sessionAffinity string) (Candidate, bool) {
+func (r *Router) pick(name string, route Route, endpoint string, excluded map[string]bool, sessionAffinity string, requireVision bool) (Candidate, bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	// 用累计权重定位槽位，避免为大 weight 展开重复候选切片。
@@ -1766,7 +1832,7 @@ func (r *Router) pick(name string, route Route, endpoint string, excluded map[st
 	totalWeight := 0
 	now := time.Now()
 	for _, u := range route.Candidates {
-		if r.candidateEligible(u, endpoint, excluded, now) {
+		if r.candidateEligible(u, endpoint, excluded, now, requireVision) {
 			totalWeight += max(1, u.Weight)
 		}
 	}
@@ -1783,7 +1849,7 @@ func (r *Router) pick(name string, route Route, endpoint string, excluded map[st
 		r.next[name]++
 	}
 	for _, u := range route.Candidates {
-		if !r.candidateEligible(u, endpoint, excluded, now) {
+		if !r.candidateEligible(u, endpoint, excluded, now, requireVision) {
 			continue
 		}
 		weight := max(1, u.Weight)
@@ -1796,8 +1862,14 @@ func (r *Router) pick(name string, route Route, endpoint string, excluded map[st
 	return Candidate{}, false
 }
 
-func (r *Router) candidateEligible(u Candidate, endpoint string, excluded map[string]bool, now time.Time) bool {
+func (r *Router) candidateEligible(u Candidate, endpoint string, excluded map[string]bool, now time.Time, requireVision bool) bool {
 	if !u.IsEnabled() || excluded[u.ID] {
+		return false
+	}
+	// 带图的请求只允许落到声明 vision 的候选：图片在网关是透明字段，
+	// 转发给不收图的上游只会换回一个 400，比提前跳过更糟——跳过还能换成
+	// 同路由里能收图的候选。
+	if requireVision && !u.Vision {
 		return false
 	}
 	if endpoint == "responses" && !u.Responses && !u.ResponsesViaChatCompletions && !u.Anthropic {
@@ -2249,4 +2321,71 @@ func max(a, b int) int {
 		return a
 	}
 	return b
+}
+
+// routeHasVision 报告路由里是否至少有一个可聚合候选声明了 vision。
+// 只有在这种路由上，按图收缩候选面才是"收窄"而不是"改变既有行为"。
+func routeHasVision(route Route) bool {
+	for _, candidate := range route.Candidates {
+		// 与 pick 的候选面保持一致：已禁用或退出聚合的候选不算，否则会把
+		// 一份本来会正常转发的发图请求收缩成"无候选可用"的 503。
+		if candidate.IsEnabled() && candidate.IsAggregateEnabled() && candidate.Vision {
+			return true
+		}
+	}
+	return false
+}
+
+// requestHasImages 判定一次下游请求是否携带图片输入，覆盖三个入站协议：
+// Chat Completions / Responses 的 content part 数组，以及 Messages 的
+// image 块（其形状是 source 而不是 image_url）。
+// 判错方向不对称：多判一次只会把请求收缩到 vision 候选（通常只有一个），
+// 漏判一次会把图片发给不收图的上游换来 400，因此宁可宽松。
+func requestHasImages(payload map[string]any) bool {
+	if messages, ok := payload["messages"].([]any); ok {
+		for _, rawMessage := range messages {
+			message, ok := rawMessage.(map[string]any)
+			if !ok {
+				continue
+			}
+			if contentHasImageParts(message["content"]) {
+				return true
+			}
+		}
+	}
+	// Responses 的 input 可以是字符串、part 数组，或带 content 数组的 item 列表。
+	if contentHasImageParts(payload["input"]) {
+		return true
+	}
+	if items, ok := payload["input"].([]any); ok {
+		for _, rawItem := range items {
+			item, ok := rawItem.(map[string]any)
+			if !ok {
+				continue
+			}
+			if contentHasImageParts(item["content"]) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// contentHasImageParts 检查一个 content 值里是否含图片 part。
+func contentHasImageParts(raw any) bool {
+	parts, ok := raw.([]any)
+	if !ok {
+		return false
+	}
+	for _, rawPart := range parts {
+		part, ok := rawPart.(map[string]any)
+		if !ok {
+			continue
+		}
+		switch part["type"] {
+		case "image_url", "input_image", "image":
+			return true
+		}
+	}
+	return false
 }

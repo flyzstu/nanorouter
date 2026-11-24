@@ -56,6 +56,13 @@ api_keys:
   enabled: false
   manage_public: false
   root_admin_only: false
+# 账号额度聚合端点 /v1/usage 的读取参数。全部可选：缺省按已配置的候选推导
+# （Mistral 的 api_base 取候选 base_url，console 面取官方默认域）。
+# usage:
+#   mistral_api_base: ""          # 租户域与公共域不同时在此覆盖
+#   mistral_console_api_base: ""  # 缺省 https://console.mistral.ai/api
+#   timeout: 3s                   # 单端点超时
+#   disabled: []                  # 可填 zcode / mistral-vibe
 
 request_timeout: 90s
 # 全局覆盖转发到上游的 User-Agent。默认 Go-http-client/x.x 会被部分上游
@@ -107,6 +114,10 @@ routes:
         target_ttfb: 2s
         # llama-server 各版本均支持 Chat Completions；Responses 请求走受限适配。
         responses_via_chat_completions: true
+        # 视觉输入：上游能收图时声明，网关据此在 /v1/models 发布
+        # metadata.input_modalities，并把带图请求只路由到声明了 vision 的候选。
+        # 不声明的路由照旧透明转发图片字段——声明才会收窄候选面。
+        vision: false
         # 其他上游思考模型可能在对话历史中包含 reasoning_content，llama-server 不支持该字段。
         drop_message_fields:
           - reasoning_content

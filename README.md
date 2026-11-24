@@ -7,7 +7,7 @@
 - `POST /v1/chat/completions`
 - `POST /v1/responses`（包括 SSE 原样透传）
 - `POST /v1/messages`（Anthropic Messages 透传，含无 `/v1` 兼容形式）
-- `GET /v1/models`
+- `GET /v1/models`（`metadata` 发布 `context_length`、`supported_reasoning_levels`、`messages: true`（整条路由都是 Anthropic 候选时）与 `input_modalities`（路由里有候选声明 `vision` 时））
 - `nanorouter login zcode`：ZCode Coding Plan 设备码登录子命令（`login` 命令组按供应商拆分，后续可扩展 `login openai` 等）
 - 每个上游的加权轮转、429/错误冷却与请求内指数退避重试
 - SQLite 调用账本、Prometheus `/metrics`
@@ -305,7 +305,8 @@ routes:
 `GET {base_url}/model-catalog?surface=vibe-code`：目录里无 `requires` 套餐限制、
 支持函数调用的模型会自动出现在 `GET /v1/models`（`publisher` 只是模型作者，
 zai / deepseek 等第三方模型同样由 Mistral 第一方转发，照常发布），
-带 `metadata.context_length` 与 `metadata.supported_reasoning_levels`，其 `id`
+带 `metadata.context_length`、`metadata.supported_reasoning_levels` 与
+`metadata.input_modalities`（目录 `capabilities.vision` 为真时），其 `id`
 与 `aliases` 都可直接作为 `model` 路由到该候选。拉取失败只记日志并沿用上次
 结果（fail-open），配置里显式的路由名与 `expose_as` 始终优先。不需要自动发现时
 可改用普通候选，并用 `context_length: <tokens>` 手动声明窗口。
@@ -451,8 +452,9 @@ Cookie、请求正文、prompt、模型回复或密钥。
 两个路径走与其他端点相同的 `auth_env` 认证：API 客户端可用 `Authorization: Bearer <key>` 或 `X-Api-Key: <key>`
 两种传参（并存，OpenAI 系与 Anthropic 系客户端各取所惯，同一把 key 皆可）；浏览器没有请求头注入点，
 未认证访问会弹出原生登录框，用户名或密码任一位填 API key 即可。生成端点不接受 Basic 回退，认证面不放宽。
-内网或反代层已自管访问控制时，可设 `stats_public: true` 将统计面（页面与 `/v1/stats/summary`、`/v1/zcode/usage`
-两个数据端点）整体豁免鉴权、匿名可看——注意用量端点会匿名触发网关外呼智谱并暴露账户级数据，生成端点仍要求 key。
+内网或反代层已自管访问控制时，可设 `stats_public: true` 将统计面（页面与 `/v1/stats/summary`、`/v1/zcode/usage`、
+`/v1/usage` 三个数据端点）整体豁免鉴权、匿名可看——注意用量端点会匿名触发网关外呼智谱或 Mistral 并暴露账户级数据，
+生成端点仍要求 key。
 重置卡端点不受 `stats_public` 影响，需要单独设置 `zcode_reset.public: true`（见下文）。
 `tools_count`/`tool_names`/`client_ip`/`client_agent` 四列来自请求侧元数据（旧库自动迁移补列）：工具名取请求
 `tools` 数组（兼容 OpenAI 与 Anthropic 两种形状），不含响应侧 tool_calls 次数；调用方 IP 直连部署记录 TCP 对端
@@ -466,6 +468,71 @@ Cookie、请求正文、prompt、模型回复或密钥。
 （数据库 → 凭据文件），无需额外配置；未登录时该区块提示先运行 `nanorouter login zcode`。配额缓存 60 秒、
 历史区块 5 分钟、套餐与账户区块 1 小时；上游故障时 10 分钟内降级返回旧值并标注 failures，凭据失效（401/1001）
 如实报错不降级。认证与统计页相同（Bearer、X-Api-Key 或浏览器 Basic 回退；stats_public 开启时匿名可看）。
+
+### 账号额度聚合（`GET /v1/usage`）
+
+把网关手上所有账号级额度归一成一张卡，给下游插件（如 `dsh-nanorouter`）直接画计量条，不必自己解析各家信封：
+
+```sh
+curl "http://127.0.0.1:8080/v1/usage?days=7&include=reset" \
+  -H "Authorization: Bearer $NANOROUTER_API_KEY"
+```
+
+```json
+{
+  "generated_at": "2026-11-24T04:31:18Z",
+  "range": {"start_time": "2026-11-17 12:00:00", "end_time": "2026-11-24 12:00:00", "days": 7, "timezone": "Asia/Shanghai"},
+  "providers": [
+    {
+      "provider": "zcode", "available": true, "credential": "bigmodel", "key_preview": "****6789",
+      "plan": {"name": "GLM Coding Lite", "status": "VALID", "billing_cycle": "annually", "auto_renew": false},
+      "windows": [
+        {"kind": "five_hour", "type": "TOKENS_LIMIT", "unit": 3, "number": 5,
+         "limit": 100, "used": 20, "remaining": 80, "used_percent": 20, "reset_at": 1762300000000}
+      ],
+      "sections": {"usage": {...}, "activity": {...}},
+      "reset": {"channel": "bigmodel", "five_hour_resets": 3, "week_resets": 1, "has_unread_history": true},
+      "failures": []
+    },
+    {
+      "provider": "mistral-vibe", "available": true, "key_preview": "****6789",
+      "plan": {"name": "INDIVIDUAL", "kind": "chat", "title": "Pro", "access_scope": "read"},
+      "windows": [
+        {"kind": "monthly_quota", "limit": 100, "used": 42.5, "remaining": 57.5,
+         "used_percent": 42.5, "reset_at": 1796083200000, "payg_enabled": false}
+      ],
+      "failures": []
+    }
+  ]
+}
+```
+
+| 参数 | 含义 |
+| --- | --- |
+| `days` | 1–366，缺省 7。只影响 zcode 的 windowed 段（`sections` 里带时间窗的聚合），不影响窗口计量条 |
+| `providers` | 逗号分隔，缺省为「已配置凭据的 provider」；显式点名未配置的会以 `available: false` 出现 |
+| `include` | `reset` 时附带重置卡库存（额外读 `/api/v1/coding-plan/reset/status`，需双 token 凭据） |
+
+- `kind` 归一化：`five_hour`（unit 3 & number 5）、`weekly`（unit 6）、`monthly_tools`（unit 5 & number 1）、
+  `monthly_quota`（Mistral 一期 Vibe Code 额度）、`other`。
+- `used_percent` 允许 >100：超支必须看得见，网关不截断。
+- `available` 只表示「有凭据」，不表示上游健康；某个 provider 的失败进它自己的 `failures`，不影响另一个。
+- 状态码按「全部失败」的形态选：全缺凭据 503（`usage_credential_missing`）、全被上游拒绝 401
+  （`usage_credentials_rejected`）、其余全失败 502（`usage_unavailable`）；任一 provider 有数据（含 10 分钟内的
+  降级旧值）即 200。
+- Mistral 段读 `{api_base}/billing/subscription`、`{api_base}/billing/budget` 与 console 的 `/api/vibe/whoami`
+  （与 `dsh-mistral-vibe` 的 `account.ts` 同一套解析）；403/404 视为「该账号没有这一项」，401 才记凭据被拒；
+  whoami 广告的租户域与请求域不一致时进 `failures` 并提示设置 `usage.mistral_api_base`。
+- 缓存：zcode 按段沿用 `/v1/zcode/usage` 的 TTL；Mistral billing 5 分钟、whoami 1 小时，缓存键含凭据指纹
+  （重新 `login mistral` 换 key 后不会读到上一个账号的数字）。
+
+```yaml
+usage:
+  mistral_api_base: ""          # 缺省取 Mistral 候选的 base_url
+  mistral_console_api_base: ""  # 缺省 https://console.mistral.ai/api
+  timeout: 3s                   # 单端点超时
+  disabled: []                  # 可填 zcode / mistral-vibe
+```
 
 ### 额度重置卡（查询 + 手动核销）
 

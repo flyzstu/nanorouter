@@ -158,7 +158,7 @@ func TestStatsPublicAuthMatrix(t *testing.T) {
 
 			// 统计面三路径：默认全 401，公开态全放行（用量端点无凭据时
 			// 进 handler 回 503，鉴权层不再拦截）。
-			for _, path := range []string{"/stats", "/v1/stats/summary", "/v1/zcode/usage"} {
+			for _, path := range []string{"/stats", "/v1/stats/summary", "/v1/zcode/usage", "/v1/usage"} {
 				q := httptest.NewRequest(http.MethodGet, path, nil)
 				rec := httptest.NewRecorder()
 				handler.ServeHTTP(rec, q)

@@ -966,15 +966,15 @@ func TestCandidateAttemptTimeoutTerminatesAdaptedSSE(t *testing.T) {
 func TestHalfOpenCircuitAllowsSingleProbe(t *testing.T) {
 	r := &Router{states: map[string]*state{"recovering": {until: time.Now().Add(-time.Second), failures: 2}}, next: map[string]int{}}
 	route := Route{Candidates: []Candidate{{ID: "recovering"}}}
-	probe, ok := r.pick("route", route, "chat_completions", nil, "")
+	probe, ok := r.pick("route", route, "chat_completions", nil, "", false)
 	if !ok || probe.ID != "recovering" {
 		t.Fatalf("probe=%#v ok=%v", probe, ok)
 	}
-	if _, ok := r.pick("route", route, "chat_completions", nil, ""); ok {
+	if _, ok := r.pick("route", route, "chat_completions", nil, "", false); ok {
 		t.Fatal("second concurrent half-open probe should be rejected")
 	}
 	r.success(probe)
-	if _, ok := r.pick("route", route, "chat_completions", nil, ""); !ok {
+	if _, ok := r.pick("route", route, "chat_completions", nil, "", false); !ok {
 		t.Fatal("successful probe should close the circuit")
 	}
 }
@@ -1176,13 +1176,13 @@ func TestLargeWeightsDoNotChangeWeightedSelection(t *testing.T) {
 	r := &Router{states: map[string]*state{}, next: map[string]int{}}
 	route := Route{Candidates: []Candidate{{ID: "bulk", Weight: 1_000_000}, {ID: "rare", Weight: 1}}}
 	for i := 0; i < 10; i++ {
-		got, ok := r.pick("large", route, "chat_completions", nil, "")
+		got, ok := r.pick("large", route, "chat_completions", nil, "", false)
 		if !ok || got.ID != "bulk" {
 			t.Fatalf("pick %d=%#v ok=%v", i, got, ok)
 		}
 	}
 	r.next["large"] = 1_000_000
-	got, ok := r.pick("large", route, "chat_completions", nil, "")
+	got, ok := r.pick("large", route, "chat_completions", nil, "", false)
 	if !ok || got.ID != "rare" {
 		t.Fatalf("boundary pick=%#v ok=%v", got, ok)
 	}
@@ -1194,7 +1194,7 @@ func BenchmarkPickLargeWeights(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		if _, ok := r.pick("large", route, "chat_completions", nil, ""); !ok {
+		if _, ok := r.pick("large", route, "chat_completions", nil, "", false); !ok {
 			b.Fatal("candidate not selected")
 		}
 	}

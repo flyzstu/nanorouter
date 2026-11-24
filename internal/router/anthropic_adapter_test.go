@@ -638,3 +638,74 @@ func TestAnthropicErrorTypeMapping(t *testing.T) {
 		}
 	}
 }
+
+func TestChatToMessagesKeepsImagesInsideToolResults(t *testing.T) {
+	out := mustTranslate(t, `{
+		"messages":[
+			{"role":"user","content":"render the chart"},
+			{"role":"assistant","content":null,"tool_calls":[
+				{"id":"call_1","type":"function","function":{"name":"chart","arguments":"{}"}}]},
+			{"role":"tool","tool_call_id":"call_1","content":[
+				{"type":"text","text":"here it is"},
+				{"type":"image_url","image_url":{"url":"data:image/png;base64,ZZZZ"}}]}
+		]
+	}`)
+	messages, _ := out["messages"].([]any)
+	var toolBlocks []any
+	for _, rawMessage := range messages {
+		message, _ := rawMessage.(map[string]any)
+		blocks, _ := message["content"].([]any)
+		for _, rawBlock := range blocks {
+			block, _ := rawBlock.(map[string]any)
+			if block["type"] == "tool_result" {
+				toolBlocks = append(toolBlocks, block)
+			}
+		}
+	}
+	if len(toolBlocks) != 1 {
+		t.Fatalf("tool_result blocks=%v", toolBlocks)
+	}
+	result, _ := toolBlocks[0].(map[string]any)
+	content, ok := result["content"].([]any)
+	if !ok {
+		t.Fatalf("an image-bearing tool result must use the block-array form, got %T %v", result["content"], result["content"])
+	}
+	if len(content) != 2 {
+		t.Fatalf("tool_result content=%v", content)
+	}
+	text, _ := content[0].(map[string]any)
+	if text["type"] != "text" || text["text"] != "here it is" {
+		t.Fatalf("text block=%v", text)
+	}
+	image, _ := content[1].(map[string]any)
+	source, _ := image["source"].(map[string]any)
+	if image["type"] != "image" || source["type"] != "base64" || source["data"] != "ZZZZ" {
+		t.Fatalf("image block=%v", image)
+	}
+}
+
+func TestChatToMessagesKeepsPlainToolResultsAsStrings(t *testing.T) {
+	out := mustTranslate(t, `{
+		"messages":[
+			{"role":"user","content":"go"},
+			{"role":"assistant","content":null,"tool_calls":[
+				{"id":"call_1","type":"function","function":{"name":"noop","arguments":"{}"}}]},
+			{"role":"tool","tool_call_id":"call_1","content":[{"type":"text","text":"done"}]}
+		]
+	}`)
+	messages, _ := out["messages"].([]any)
+	for _, rawMessage := range messages {
+		message, _ := rawMessage.(map[string]any)
+		blocks, _ := message["content"].([]any)
+		for _, rawBlock := range blocks {
+			block, _ := rawBlock.(map[string]any)
+			if block["type"] != "tool_result" {
+				continue
+			}
+			// 纯文本工具结果保持字符串：块数组形式会让部分上游多包一层。
+			if text, ok := block["content"].(string); !ok || text != "done" {
+				t.Fatalf("plain tool_result content=%T %v", block["content"], block["content"])
+			}
+		}
+	}
+}

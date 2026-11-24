@@ -196,11 +196,15 @@ reasoning summary 没有纯 Chat Completions 等价表示，必须返回 400，�
 
 候选的 `enabled` 是总运维开关：省略时默认开启，设为 `false` 时聚合路由和 `expose_as` 入口都会跳过它。`aggregate_enabled` 是独立的聚合开关，省略时默认开启；设为 `false` 后候选不参与父路由的轮转与故障切换，但仍可通过 `expose_as` 直接访问。父路由没有任何已启用且参与聚合的候选时，不会出现在 `/v1/models`，但其中已启用的公开候选仍会单独列出。
 
+`/v1/models` 的 `metadata` 只发布下游能据以调整行为的字段，且只发布整条路由都成立的结论：`context_length` 取所有聚合候选声明长度的最小值；`supported_reasoning_levels` 来自路由的 `reasoning_levels`；`messages: true` 表示**全部**聚合候选都是 `anthropic: true`，即 `/v1/messages` 的候选面与 `/v1/chat/completions` 完全相同。混合路由不发布该字段——`/v1/messages` 会过滤掉非 anthropic 候选（`candidateEligible`），下游若据此切到原生协议会在无提示的情况下丢掉整批 chat 上游的故障切换。`expose_as` 单候选入口按候选自身的 `anthropic` 判定，不受同路由其他候选影响。下游（如 dsh-nanorouter）只在见到 `messages: true` 时才优先原生 Messages 协议，因为只有该协议能携带 thinking 签名。
+
+`input_modalities: ["text","image"]` 的判断方向与 `messages` 相反：只要有**一个**已启用且参与聚合的候选声明 `vision: true` 就发布。原因在于候选面收缩发生在网关内部而不是协议层：带图请求由 `requestHasImages` 识别（覆盖 Chat 的 `image_url`、Responses 的 `input_image` 与嵌套 item、Messages 的 `image` 块），随后 `pick` 只在 `vision` 候选里轮转，因此同一路由的纯文本请求仍可落到全部候选，带图请求不会落到收不了图的上游。两个开关都要求"声明成立"才收窄：路由里没有任何 `vision` 候选时 `requireVision` 恒为假，网关照旧透明转发图片字段——否则升级会静默改变既有部署的行为。`vision` 只声明上游能力，不声明逐模型能力；`vibe_catalog` 拉到的模型还要求目录自身 `capabilities.vision` 为真（逐模型权威），两者取与。
+
 Cerebras `gpt-oss-120b` 与 Mistral 一样使用原生 Chat Completions 加 Responses 适配的组合。它的普通 Chat 路径可保留工具调用与结构化输出；若下游一定需要完整的 Responses 工具/状态语义，应优先路由到 Groq 或 OpenRouter 的原生 Responses 候选。
 
 Mistral 的 Chat Completions 响应不满足 OpenAI 形状：thinking 模型的 `message.content` 是 parts 数组，流式 chunk 带私有字段 `p`，usage 内联在最后一个内容帧且不补 `choices:[]` 独立帧，错误体是扁平对象。候选级 `mistral_compat: true` 在响应方向规整：content parts 折成字符串、thinking 写入 `reasoning_content`、剥离 `response_error` / 非流式 `tool_calls[].index` / `p`，并在下游请求 `stream_options.include_usage` 时补发标准 usage 尾帧。请求方向只做一处补齐：`temperature: 0` 是贪心采样，Mistral 要求同时给 `top_p: 1`，否则 400（code 3054），因此该开关在未显式指定 `top_p` 时补 1；其余请求字段不动，也不影响故障切换；`responses_via_chat_completions` 叠加时先规整成 OpenAI chunk，再进入 Responses 包装，流式规整器为此会强制补发 usage 帧供适配器采集。
 
-Mistral 的模型目录（`GET {base_url}/model-catalog?surface=vibe-code`）只作为**路由索引**接入，不新增协议路径：候选设 `vibe_catalog: true` 后，`runVibeCatalog` 在启动时拉一次、成功每 15 分钟 / 失败每 1 分钟刷新，解析结果整体替换 `vibeModels` + `vibeRoutes`（`vibeMu` 保护，与熔断用的 `mu` 分开）。索引只保留 `requires == null`、`capabilities.function_calling != false` 的条目，与官方 `_hide_reasons` 对齐；`publisher` 是模型作者（`mistral` / `zai` / `deepseek`）而非转发方，不参与过滤。解析顺序是显式路由名 → 显式 `expose_as` → 目录 id/别名，因此目录永远只是兜底；命中目录时把选中候选的 `model` 换成规范 id，`drop_*` 等候选级清洗照常生效。目录同时提供 `max_context_length` 与 `parameters.reasoning`，由 `/v1/models` 的 `metadata.context_length` / `supported_reasoning_levels` 发布；手写候选也可用 `context_length` 声明窗口。拉取失败是 fail-open：只记 warn 日志并沿用该候选上次成功的条目，网关照常服务已有路由。
+Mistral 的模型目录（`GET {base_url}/model-catalog?surface=vibe-code`）只作为**路由索引**接入，不新增协议路径：候选设 `vibe_catalog: true` 后，`runVibeCatalog` 在启动时拉一次、成功每 15 分钟 / 失败每 1 分钟刷新，解析结果整体替换 `vibeModels` + `vibeRoutes`（`vibeMu` 保护，与熔断用的 `mu` 分开）。索引只保留 `requires == null`、`capabilities.function_calling != false` 的条目，与官方 `_hide_reasons` 对齐；`publisher` 是模型作者（`mistral` / `zai` / `deepseek`）而非转发方，不参与过滤。解析顺序是显式路由名 → 显式 `expose_as` → 目录 id/别名，因此目录永远只是兜底；命中目录时把选中候选的 `model` 换成规范 id，`drop_*` 等候选级清洗照常生效。目录同时提供 `max_context_length`、`parameters.reasoning` 与 `capabilities.vision`，由 `/v1/models` 的 `metadata.context_length` / `supported_reasoning_levels` / `input_modalities` 发布；手写候选也可用 `context_length` 声明窗口。拉取失败是 fail-open：只记 warn 日志并沿用该候选上次成功的条目，网关照常服务已有路由。
 
 ## 上游参数清洗与客户端仿真
 
@@ -267,11 +271,11 @@ tool_calls 计数；工具榜聚合因 JSON 展开函数跨方言不统一（jso
 jsonb_array_elements_text），拉回 Go 侧归并。调用方 IP 直连记 TCP 对端地址，开启
 `trust_forwarded_for` 后取 `X-Forwarded-For` 首值（仅限可信反代后部署，否则来源可
 伪造）。统计、重置卡与 API Key 管理路径的认证在 Bearer/`X-Api-Key` 之外为浏览器放宽
-Basic（仅 `/stats`、`/v1/stats/summary`、`/v1/zcode/usage`、`/v1/zcode/reset/status`、
-`/v1/zcode/reset/use` 与 `/v1/api-keys*`），生成端点不放宽。
+Basic（仅 `/stats`、`/v1/stats/summary`、`/v1/zcode/usage`、`/v1/usage`、
+`/v1/zcode/reset/status`、`/v1/zcode/reset/use` 与 `/v1/api-keys*`），生成端点不放宽。
 `/healthz` 恒免鉴权：只回 200、无业务数据，k8s 存活/就绪探针无头可带，
 `auth_env` 下若拦截探针会把自己杀死；`/metrics` 不豁免（含调用量）。
-`stats_public: true` 时统计面三个路径整体豁免鉴权——为反代层或内网已自管访问控制的
+`stats_public: true` 时统计面四个路径（含 `/v1/usage`）整体豁免鉴权——为反代层或内网已自管访问控制的
 部署准备；豁免面不含任何生成端点，`/v1/zcode/usage` 的账户级数据公开与匿名外呼
 是开启者显式接受的取舍。重置卡面由独立开关 `zcode_reset.public` 控制，不随
 `stats_public` 一起放开：统计面公开不等于允许匿名花卡。
@@ -300,6 +304,25 @@ biz 主机的辅助路径：网关按 glm-usage 移植的八个只读端点（�
 短暂报错更有害。数据原样透传（`sections` 内为上游 `data`，biz 端点的 data
 可能是列表或布尔，缺省时回退整个信封体），不做字段猜测；生成请求路径零接触。
 该端点与统计页同在 Basic 回退白名单。
+
+账号额度聚合（`GET /v1/usage?days=7&providers=zcode,mistral-vibe&include=reset`）把
+上面这些账号面归一成一张卡，供下游插件直接画计量条：智谱取 `quota` 段的 `limits`
+映射成窗口（`unit 3 & number 5` → `five_hour`、`unit 6` → `weekly`、
+`unit 5 & number 1` → `monthly_tools`，其余 `other`），Mistral 取
+`{api_base}/billing/subscription`、`{api_base}/billing/budget` 与 console 的
+`/api/vibe/whoami`（与 dsh-mistral-vibe 的 `account.ts` 同一套解析与 fail-open 语义）。
+与 `/v1/zcode/usage` 的分工是形状：后者原样透传上游 `sections`，前者只输出归一化的
+`windows[{kind,limit,used,remaining,used_percent,reset_at}]` 与 `plan` 徽标，`sections`
+仅作为排障附带。三条纪律：`available` 只表示「有凭据」不表示上游健康；一个 provider
+失败不影响另一个（并发拉取，错误逐条进 `failures`）；`used_percent` 允许 >100，
+超支必须看得见。状态码按全失败形态选：全缺凭据 503、全被上游拒绝 401、其余全失败
+502，任一 provider 有数据（含 stale 降级旧值）即 200；未配置任何 provider 返回 200
+空数组。Mistral 段缓存键含凭据指纹（SHA-256 前 4 字节），重新登录换 key 后旧账号
+数字不会冒充新账号；billing 5 分钟、whoami 1 小时、stale 窗 10 分钟、冷失败退避
+30 秒，与 zcode 侧同构。403/404 视为「该账号没有这一项」（不上报），401 才记为
+凭据被拒；whoami 广告的租户域与请求域不一致时进 `failures` 提示改
+`usage.mistral_api_base`。重置卡库存只在 `include=reset` 时查询——它需要平台 JWT 与
+MaaS token 对，不是所有部署都有。
 
 额度重置卡是独立的第二条辅助路径（`GET /v1/zcode/reset/status`、
 `POST /v1/zcode/reset/use`）。它不走 bigmodel.cn 的 API key，而是 ZCode 平台的

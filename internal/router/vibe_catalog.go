@@ -32,15 +32,21 @@ type vibeModel struct {
 	contextLength   int
 	reasoningLevels []string
 	aliases         []string
+	// vision 来自目录的 capabilities.vision：目录是逐模型的权威声明，
+	// 而与它绑定的候选只表明"这个上游能收图"。两者都成立才发布图片能力。
+	vision bool
 }
 
 func (m vibeModel) metadata() map[string]any {
-	meta := make(map[string]any, 2)
+	meta := make(map[string]any, 3)
 	if m.contextLength > 0 {
 		meta["context_length"] = m.contextLength
 	}
 	if len(m.reasoningLevels) > 0 {
 		meta["supported_reasoning_levels"] = m.reasoningLevels
+	}
+	if m.vision {
+		meta["input_modalities"] = []string{"text", "image"}
 	}
 	return meta
 }
@@ -190,6 +196,7 @@ func parseVibeCatalog(body []byte) ([]vibeModel, error) {
 			} `json:"parameters"`
 			Capabilities struct {
 				FunctionCalling *bool `json:"function_calling"`
+				Vision          *bool `json:"vision"`
 			} `json:"capabilities"`
 		} `json:"models"`
 	}
@@ -210,7 +217,14 @@ func parseVibeCatalog(body []byte) ([]vibeModel, error) {
 			continue
 		}
 		seen[id] = true
-		model := vibeModel{id: id, contextLength: entry.MaxContextLength, aliases: entry.Aliases}
+		model := vibeModel{
+			id:            id,
+			contextLength: entry.MaxContextLength,
+			aliases:       entry.Aliases,
+			// 目录未声明 vision 时按不收图处理：这是安全方向，错误地声称能收图
+			// 会让下游把图片发给一个会 400 的上游。
+			vision: entry.Capabilities.Vision != nil && *entry.Capabilities.Vision,
+		}
 		for _, level := range entry.Parameters.Reasoning {
 			if level = strings.TrimSpace(level); level != "" {
 				model.reasoningLevels = append(model.reasoningLevels, level)
@@ -286,5 +300,9 @@ func (r *Router) vibeRouteForModel(name string) (Route, bool) {
 	if !ok {
 		return Route{}, false
 	}
-	return Route{Candidates: []Candidate{entry.candidate}}, true
+	// 目录逐模型声明 vision，候选只声明上游能收图；发布能力时必须两者都成立，
+	// 因此这里按目录结论改写副本，而不是把候选配置当成逐模型的事实。
+	candidate := entry.candidate
+	candidate.Vision = candidate.Vision && entry.model.vision
+	return Route{Candidates: []Candidate{candidate}}, true
 }

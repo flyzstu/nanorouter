@@ -29,34 +29,42 @@ const zcodeProbeStartupDelay = 3 * time.Second
 //   - 无凭据 → 发起登录（这是首次部署或凭据被清空后的正常路径）
 //   - 探测 401/403 → 凭据已失效，发起登录
 //   - 探测通过或网关不可达 → 沿用，不触发（瞬时故障不该引发登录风暴）
-func (r *Router) startZcodeCredentialCheck() {
-	if !r.hasZcodeTokenFileCandidate() {
+//
+// runZcodeCredentialCheck 是体检 goroutine 的本体，由 Router.Close 经
+// credentialCheckCancel 收束。ctx 取消后既不读库也不再触发登录。
+func (r *Router) runZcodeCredentialCheck(ctx context.Context) {
+	defer close(r.credentialCheckDone)
+	timer := time.NewTimer(zcodeProbeStartupDelay)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+	case <-ctx.Done():
 		return
 	}
-	go func() {
-		time.Sleep(zcodeProbeStartupDelay)
-		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
-		defer cancel()
+	probeCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
+	defer cancel()
 
-		channel := r.primaryZcodeChannel()
-		credential, haveCredential := r.currentZcodeCredential(ctx, channel)
+	channel := r.primaryZcodeChannel()
+	credential, haveCredential := r.currentZcodeCredential(probeCtx, channel)
+	if ctx.Err() != nil {
+		return
+	}
 
-		switch {
-		case !haveCredential:
-			r.logger.Info(r.logMessage("zcode_credential_missing"),
-				eventFields("zcode_credential_missing", zap.String("channel", channel))...)
-			r.triggerZcodeLogin(channel, "no credential at startup")
-		case r.probeZcodeCredential(ctx, credential) == errZcodeCredentialRefused:
-			r.logger.Warn(r.logMessage("zcode_credential_stale"),
-				eventFields("zcode_credential_stale", zap.String("channel", channel))...)
-			r.triggerZcodeLogin(channel, "credential rejected at startup")
-		default:
-			r.logger.Info(r.logMessage("zcode_credential_verified"),
-				eventFields("zcode_credential_verified",
-					zap.String("channel", channel),
-					zap.String("credential_updated_at", credential.LastVerified.Format(time.RFC3339)))...)
-		}
-	}()
+	switch {
+	case !haveCredential:
+		r.logger.Info(r.logMessage("zcode_credential_missing"),
+			eventFields("zcode_credential_missing", zap.String("channel", channel))...)
+		r.triggerZcodeLogin(channel, "no credential at startup")
+	case r.probeZcodeCredential(probeCtx, credential) == errZcodeCredentialRefused:
+		r.logger.Warn(r.logMessage("zcode_credential_stale"),
+			eventFields("zcode_credential_stale", zap.String("channel", channel))...)
+		r.triggerZcodeLogin(channel, "credential rejected at startup")
+	default:
+		r.logger.Info(r.logMessage("zcode_credential_verified"),
+			eventFields("zcode_credential_verified",
+				zap.String("channel", channel),
+				zap.String("credential_updated_at", credential.LastVerified.Format(time.RFC3339)))...)
+	}
 }
 
 // hasZcodeTokenFileCandidate 报告是否有候选会走凭据链。

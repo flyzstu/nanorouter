@@ -299,6 +299,11 @@ func chatMessagesToAnthropic(raw any) (string, []any, error) {
 				return "", nil, fmt.Errorf("tool message requires tool_call_id")
 			}
 			block := map[string]any{"type": "tool_result", "tool_use_id": callID, "content": toolResultContent(message["content"])}
+			// 工具结果里的图片必须原样升级为块数组：contentText 会把它们
+			// 折叠成文字，模型就只能看到"这里有张图"却看不到图。
+			if blocks, ok := toolResultBlocks(message["content"]); ok {
+				block["content"] = blocks
+			}
 			pendingToolResults = append(pendingToolResults, block)
 		case "user", "assistant":
 			flushTools()
@@ -474,12 +479,54 @@ func parseToolArgumentsString(args string) (map[string]any, error) {
 }
 
 // toolResultContent 把 tool 消息的 content 归一为字符串（Anthropic
-// tool_result 的 content 接受字符串或块数组）。
+// tool_result 的 content 接受字符串或块数组）。含图片时改用
+// toolResultBlocks，图片不能被折叠成文字。
 func toolResultContent(raw any) string {
 	if text, ok := raw.(string); ok {
 		return text
 	}
 	return contentText(raw)
+}
+
+// toolResultBlocks 在工具结果含图片时返回 Anthropic 块数组，纯文本时返回
+// false 让调用方继续用字符串形式。图片只在 user 轮次合法，而 tool_result
+// 本身就在 user 轮次里，因此这里不需要再判角色。
+func toolResultBlocks(raw any) ([]any, bool) {
+	parts, ok := raw.([]any)
+	if !ok {
+		return nil, false
+	}
+	hasImage := false
+	for _, rawPart := range parts {
+		if part, ok := rawPart.(map[string]any); ok && part["type"] == "image_url" {
+			hasImage = true
+			break
+		}
+	}
+	if !hasImage {
+		return nil, false
+	}
+	blocks := make([]any, 0, len(parts))
+	for _, rawPart := range parts {
+		part, ok := rawPart.(map[string]any)
+		if !ok {
+			continue
+		}
+		switch part["type"] {
+		case "text":
+			if text, _ := part["text"].(string); text != "" {
+				blocks = append(blocks, map[string]any{"type": "text", "text": text})
+			}
+		case "image_url":
+			if image, err := chatImageToAnthropic(part["image_url"]); err == nil {
+				blocks = append(blocks, image)
+			}
+		}
+	}
+	if len(blocks) == 0 {
+		return nil, false
+	}
+	return blocks, true
 }
 
 /* -------------------------------------------------------------------------- */

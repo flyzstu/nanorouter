@@ -34,6 +34,8 @@ type Config struct {
 	Backpressure      BackpressureConfig `yaml:"backpressure"`
 	Profiling         ProfilingConfig    `yaml:"profiling"`
 	HealthCheck       HealthCheckConfig  `yaml:"health_check"`
+	// Usage 控制账号额度聚合端点 /v1/usage 的读取参数。
+	Usage UsageConfig `yaml:"usage"`
 	// UserAgent 全局覆盖转发到上游的 User-Agent。候选的 user_agent 优先于全局值；
 	// 两者都未配置时使用 Go 默认的 Go-http-client/x.x。部分上游的 Cloudflare WAF
 	// 会拦截该默认 UA，可在此配置常规客户端 UA（例如 opencode/1.18.25）统一绕过。
@@ -509,6 +511,12 @@ type Candidate struct {
 	// metadata.context_length 发布；0 表示不声明。vibe_catalog 拉到的模型
 	// 用目录里的 max_context_length，无需配置本项。
 	ContextLength int `yaml:"context_length"`
+	// Vision 声明该上游接受图片输入。网关本来就透明转发图片字段，本项只负责
+	// 把"能收图"这一事实经 /v1/models 的 metadata.input_modalities 告诉下游：
+	// 不声明时下游按纯文本投影（图片在进入网关前就已被替换成占位文本），
+	// 声明后才真正把 base64 图片送到这里。聚合路由只发布所有候选都成立的
+	// 结论，因此混合路由仍是纯文本——切换到不能收图的上游会直接 400。
+	Vision bool `yaml:"vision"`
 	// Probe 显式控制该候选是否在熔断后开启后台异步探活；未配置时继承全局 health_check.enabled。
 	Probe *bool `yaml:"probe"`
 	// Headers 允许针对上游候选配置额外的自定义 HTTP 头（可覆盖默认头）。
@@ -648,6 +656,9 @@ func LoadConfig(path string) (Config, error) {
 		return c, err
 	}
 	if err := c.ProxyAuth.normalize(); err != nil {
+		return c, err
+	}
+	if err := c.Usage.normalize(); err != nil {
 		return c, err
 	}
 	if len(c.Routes) == 0 {

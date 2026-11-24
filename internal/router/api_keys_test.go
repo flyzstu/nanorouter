@@ -151,7 +151,7 @@ func TestAPIKeyHTTPLifecycle(t *testing.T) {
 	if anonymousAdmin.Code != http.StatusUnauthorized || anonymousAdmin.Header().Get("WWW-Authenticate") == "" {
 		t.Fatalf("anonymous admin = %d, challenge = %q", anonymousAdmin.Code, anonymousAdmin.Header().Get("WWW-Authenticate"))
 	}
-	for _, path := range []string{"/stats", "/v1/stats/summary", "/v1/zcode/usage", "/v1/zcode/reset/status", "/metrics"} {
+	for _, path := range []string{"/stats", "/v1/stats/summary", "/v1/zcode/usage", "/v1/usage", "/v1/zcode/reset/status", "/metrics"} {
 		if res := doAPIKeyRequest(handler, http.MethodGet, path, "", created.Key); res.Code != http.StatusForbidden {
 			t.Fatalf("managed key %s = %d, want 403", path, res.Code)
 		}
@@ -402,7 +402,7 @@ func TestAPIKeyPathClassification(t *testing.T) {
 		}
 	}
 	for _, path := range []string{
-		"/stats", "/v1/stats/summary", "/v1/zcode/usage",
+		"/stats", "/v1/stats/summary", "/v1/zcode/usage", "/v1/usage",
 		"/v1/zcode/reset/status", "/v1/zcode/reset/use",
 		"/v1/api-keys", "/v1/api-keys/abc",
 		"/metrics", "/zcode/login", "/debug/pprof/",
