@@ -138,11 +138,16 @@ func TestStatsPublicAuthMatrix(t *testing.T) {
 		{"stats_public exempts stats surface", true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			// 隔离凭据文件源：公开态下匿名打 /v1/zcode/usage 会进 handler，
-			// 无凭据应回 503，而不是读到开发机的真凭据去碰真上游。
+			// 隔离全部凭据源：公开态下匿名打 /v1/zcode/usage 与 /v1/usage
+			// 会进 handler，无凭据应回 503，而不是读到开发机的真凭据去碰
+			// 真上游。额度端点按「凭据是否存在」判定 provider，所以环境
+			// 变量与两个全局 token 缓存都必须清掉。
 			t.Setenv("HOME", t.TempDir())
+			t.Setenv("MISTRAL_API_KEY", "")
 			resetZcodeTokenCache()
 			t.Cleanup(resetZcodeTokenCache)
+			resetMistralTokenCache()
+			t.Cleanup(resetMistralTokenCache)
 			t.Setenv("NANOROUTER_STATS_PUBLIC_TEST_KEY", "secret-key")
 			r, err := New(Config{
 				AuthEnv:     "NANOROUTER_STATS_PUBLIC_TEST_KEY",

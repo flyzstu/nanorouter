@@ -377,6 +377,19 @@ func jsonBool(value any) *bool {
 	return &flag
 }
 
+// jsonFlag 读「布尔或 0/1」。智谱的 autoRenew 是整数而不是布尔，只认 bool
+// 会让套餐徽标丢掉续订状态。
+func jsonFlag(value any) *bool {
+	if flag := jsonBool(value); flag != nil {
+		return flag
+	}
+	if number, ok := jsonNumber(value); ok {
+		flag := number != 0
+		return &flag
+	}
+	return nil
+}
+
 // parseMistralSubscription 读 billing/subscription：只有 plan_name 是必需的。
 func parseMistralSubscription(data json.RawMessage) *mistralSubscription {
 	record, ok := parseJSONRecord(data)

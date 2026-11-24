@@ -510,7 +510,7 @@ curl "http://127.0.0.1:8080/v1/usage?days=7&include=reset" \
 | 参数 | 含义 |
 | --- | --- |
 | `days` | 1–366，缺省 7。只影响 zcode 的 windowed 段（`sections` 里带时间窗的聚合），不影响窗口计量条 |
-| `providers` | 逗号分隔，缺省为「已配置凭据的 provider」；显式点名未配置的会以 `available: false` 出现 |
+| `providers` | 逗号分隔，缺省为「当前真的能解析出凭据的 provider」——按数据库/环境变量/凭据文件判定，与有没有路由引用它无关；显式点名未配置的会以 `available: false` 出现 |
 | `include` | `reset` 时附带重置卡库存（额外读 `/api/v1/coding-plan/reset/status`，需双 token 凭据） |
 
 - `kind` 归一化：`five_hour`（unit 3 & number 5）、`weekly`（unit 6）、`monthly_tools`（unit 5 & number 1）、

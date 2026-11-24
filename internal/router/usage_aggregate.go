@@ -211,23 +211,45 @@ func (r *Router) mistralUsageCandidate() (Candidate, bool) {
 	return fallback, hasFallback
 }
 
-// hasZcodeUsageCandidate 与 primaryZcodeChannel 的判定同源。
-func (r *Router) hasZcodeUsageCandidate() bool {
-	for _, candidate := range r.allCandidates {
-		if candidate.ZcodeTokenFile && candidate.Anthropic && candidate.IsEnabled() {
-			return true
+// zcodeUsageCredential 选定渠道并解析 key，bigmodel 优先于 zai。
+//
+// 判定只看凭据本身是否存在，不看有没有路由候选引用它：额度是账号面的事实，
+// 凭据在库里就该读得到。早期版本用「候选配置了 zcode_token_file」反推，一条
+// zcode 路由都没配的网关就永远读不到额度——哪怕数据库里躺着新鲜凭据。
+func (r *Router) zcodeUsageCredential(ctx context.Context) (string, string) {
+	for _, channel := range []string{ZcodeChannelBigmodel, ZcodeChannelZai} {
+		key := r.resolveCandidateAPIKey(ctx, Candidate{ZcodeTokenFile: true, ZcodeChannel: channel})
+		if key != "" {
+			return channel, key
 		}
 	}
-	return false
+	return ZcodeChannelBigmodel, ""
 }
 
-// knownUsageProviders 是已配置凭据的 provider 列表，保持稳定顺序。
-func (r *Router) knownUsageProviders() []string {
+// mistralUsageCredential 解析 Mistral 账号 key。候选只影响 api_base 的默认值，
+// 凭据本身走完整条链（候选 → 环境变量 → 凭据文件）。
+func (r *Router) mistralUsageCredential(ctx context.Context) (Candidate, string, bool) {
+	candidate, _ := r.mistralUsageCandidate()
+	if token := r.resolveCandidateAPIKey(ctx, candidate); token != "" {
+		return candidate, token, true
+	}
+	if token := resolveAPIKey("MISTRAL_API_KEY"); token != "" {
+		return candidate, token, true
+	}
+	if token := mistralTokenFileKey(); token != "" {
+		return candidate, token, true
+	}
+	return Candidate{}, "", false
+}
+
+// knownUsageProviders 是当前真的能读出额度的 provider 列表，保持稳定顺序。
+// 这是默认 providers 的来源，因此必须按凭据判定而不是按路由配置。
+func (r *Router) knownUsageProviders(ctx context.Context) []string {
 	providers := make([]string, 0, 2)
-	if r.hasZcodeUsageCandidate() {
+	if _, token := r.zcodeUsageCredential(ctx); token != "" {
 		providers = append(providers, usageProviderZcode)
 	}
-	if _, ok := r.mistralUsageCandidate(); ok {
+	if _, _, ok := r.mistralUsageCredential(ctx); ok {
 		providers = append(providers, usageProviderMistral)
 	}
 	return providers
@@ -350,17 +372,17 @@ func (r *Router) usageHandler(w http.ResponseWriter, q *http.Request) {
 		writeJSONError(w, http.StatusBadRequest, err.Error(), "invalid_days")
 		return
 	}
-	known := r.knownUsageProviders()
+	// 页面请求不该被浏览器断开掐断缓存填充：脱离请求 ctx，只留超时。
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(q.Context()), zcodeUsageTimeout*2)
+	defer cancel()
+
+	known := r.knownUsageProviders(ctx)
 	requested, err := parseUsageProviders(q.URL.Query().Get("providers"), known)
 	if err != nil {
 		writeJSONError(w, http.StatusBadRequest, err.Error(), "unknown_usage_provider")
 		return
 	}
 	includeReset := q.URL.Query().Get("include") == "reset"
-
-	// 页面请求不该被浏览器断开掐断缓存填充：脱离请求 ctx，只留超时。
-	ctx, cancel := context.WithTimeout(context.WithoutCancel(q.Context()), zcodeUsageTimeout*2)
-	defer cancel()
 
 	disabled := r.cfg.Usage.disabledSet()
 	results := make([]usageProviderResult, len(requested))
@@ -457,14 +479,7 @@ func (r *Router) readZcodeUsage(ctx context.Context, window zcodeUsageWindow, in
 		Windows:  []usageWindow{},
 		Failures: []string{},
 	}
-	channel := ZcodeChannelBigmodel
-	token := r.resolveCandidateAPIKey(ctx, Candidate{ZcodeTokenFile: true, ZcodeChannel: channel})
-	if token == "" {
-		token = r.resolveCandidateAPIKey(ctx, Candidate{ZcodeTokenFile: true, ZcodeChannel: ZcodeChannelZai})
-		if token != "" {
-			channel = ZcodeChannelZai
-		}
-	}
+	channel, token := r.zcodeUsageCredential(ctx)
 	if token == "" {
 		result.Failures = append(result.Failures, "no zcode credential: run login zcode")
 		result.outcome = usageOutcomeMissing
@@ -539,13 +554,26 @@ func zcodeUsageEndpointByKey(key string) zcodeUsageEndpoint {
 	return zcodeUsageEndpoint{key: key}
 }
 
-// zcodePlanFromSubscription 从 subscription 段挑一条有效订阅填徽标。
-func zcodePlanFromSubscription(subscription, autoRenew json.RawMessage) *usagePlan {
-	record, ok := parseJSONRecord(subscription)
-	if !ok {
+// zcodeSubscriptionEntries 解出订阅列表。上游的 data 可能是裸数组，也可能
+// 包一层 {"list": [...]}；两种都要接，否则套餐徽标会静默消失。
+func zcodeSubscriptionEntries(subscription json.RawMessage) []any {
+	var value any
+	if json.Unmarshal(subscription, &value) != nil {
 		return nil
 	}
-	entries, _ := record["list"].([]any)
+	if entries, ok := value.([]any); ok {
+		return entries
+	}
+	if record, ok := asRecord(value); ok {
+		entries, _ := record["list"].([]any)
+		return entries
+	}
+	return nil
+}
+
+// zcodePlanFromSubscription 从 subscription 段挑一条有效订阅填徽标。
+func zcodePlanFromSubscription(subscription, autoRenew json.RawMessage) *usagePlan {
+	entries := zcodeSubscriptionEntries(subscription)
 	if len(entries) == 0 {
 		return nil
 	}
@@ -569,7 +597,7 @@ func zcodePlanFromSubscription(subscription, autoRenew json.RawMessage) *usagePl
 		BillingCycle: jsonString(chosen["billingCycle"]),
 		Valid:        jsonString(chosen["valid"]),
 	}
-	if renew := jsonBool(chosen["autoRenew"]); renew != nil {
+	if renew := jsonFlag(chosen["autoRenew"]); renew != nil {
 		plan.AutoRenew = renew
 	} else if len(autoRenew) > 0 {
 		var flag bool
@@ -615,14 +643,8 @@ func (r *Router) readMistralUsage(ctx context.Context) usageProviderResult {
 		Windows:  []usageWindow{},
 		Failures: []string{},
 	}
-	candidate, ok := r.mistralUsageCandidate()
+	candidate, token, ok := r.mistralUsageCredential(ctx)
 	if !ok {
-		result.Failures = append(result.Failures, "no mistral credential: run login mistral")
-		result.outcome = usageOutcomeMissing
-		return result
-	}
-	token := r.resolveCandidateAPIKey(ctx, candidate)
-	if token == "" {
 		result.Failures = append(result.Failures, "no mistral credential: run login mistral")
 		result.outcome = usageOutcomeMissing
 		return result
@@ -633,6 +655,11 @@ func (r *Router) readMistralUsage(ctx context.Context) usageProviderResult {
 	apiBase := r.cfg.Usage.MistralAPIBase
 	if apiBase == "" {
 		apiBase = candidate.BaseURL
+	}
+	if apiBase == "" {
+		// 没有 Mistral 候选时按官方端点读：凭据可能只存在于环境变量或
+		// 凭据文件里（CLI 登录留下的），账号面与路由配置无关。
+		apiBase = mistralChatBaseURL
 	}
 	consoleBase := r.cfg.Usage.MistralConsoleAPIBase
 	if consoleBase == "" {

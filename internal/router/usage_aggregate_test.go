@@ -179,12 +179,16 @@ func newUsageEnv(t *testing.T, opts usageEnvOptions) *usageEnv {
 			Anthropic: true, ZcodeTokenFile: true, ZcodeChannel: ZcodeChannelBigmodel,
 		})
 	}
+	// 显式清空再按需注入：t.Setenv 的还原发生在整个测试函数结束时，前一个
+	// fixture 设过的值会漏进后一个，让「没有凭据」的用例凭空多出一条 key。
 	if opts.withMistral {
 		t.Setenv("MISTRAL_API_KEY", usageMistralKey)
 		candidates = append(candidates, Candidate{
 			ID: "mistral", BaseURL: stub.server.URL + "/v1", Model: "mistral-large-latest",
 			APIKeyEnv: "MISTRAL_API_KEY",
 		})
+	} else {
+		t.Setenv("MISTRAL_API_KEY", "")
 	}
 	if len(candidates) == 0 {
 		candidates = append(candidates, Candidate{ID: "plain", BaseURL: stub.server.URL, Model: "m"})
@@ -193,6 +197,9 @@ func newUsageEnv(t *testing.T, opts usageEnvOptions) *usageEnv {
 	cfg := Config{
 		Routes: map[string]Route{"free": {Candidates: candidates}},
 		Usage: UsageConfig{
+			// 账号读取的 api_base 默认取候选的 base_url；这里显式指向桩，
+			// 让「没有 Mistral 候选」的用例也不会打到真实端点。
+			MistralAPIBase:        stub.server.URL + "/v1",
 			MistralConsoleAPIBase: stub.server.URL + "/console/api",
 		},
 	}
@@ -311,6 +318,37 @@ func TestZcodeWindowKindMapping(t *testing.T) {
 				t.Fatalf("kind = %q, want %q", got, tc.want)
 			}
 		})
+	}
+}
+
+// 上游的 subscription 段既可能是裸数组，也可能包一层 {"list": [...]}；
+// 只认后者会让套餐徽标在对端换形状后静默消失（实测 bigmodel 返回裸数组）。
+func TestZcodePlanAcceptsBothSubscriptionShapes(t *testing.T) {
+	bare := json.RawMessage(`[{"productName":"GLM Coding Lite","status":"VALID",` +
+		`"billingCycle":"annually","valid":"2027-09-11","autoRenew":0}]`)
+	wrapped := json.RawMessage(`{"list":[{"productName":"GLM Coding Lite","status":"VALID",` +
+		`"billingCycle":"annually","valid":"2027-09-11","autoRenew":0}]}`)
+	for name, body := range map[string]json.RawMessage{"bare": bare, "wrapped": wrapped} {
+		plan := zcodePlanFromSubscription(body, nil)
+		if plan == nil {
+			t.Fatalf("%s: plan = nil", name)
+		}
+		if plan.Name != "GLM Coding Lite" || plan.Status != "VALID" {
+			t.Fatalf("%s: plan = %#v", name, plan)
+		}
+		if plan.AutoRenew == nil || *plan.AutoRenew {
+			t.Fatalf("%s: autoRenew = %v, want false", name, plan.AutoRenew)
+		}
+	}
+	// 空数组与垃圾输入都必须返回 nil，而不是造一条空徽标。
+	for name, body := range map[string]json.RawMessage{
+		"empty":   json.RawMessage(`[]`),
+		"garbage": json.RawMessage(`"nope"`),
+		"nil":     nil,
+	} {
+		if plan := zcodePlanFromSubscription(body, nil); plan != nil {
+			t.Fatalf("%s: plan = %#v, want nil", name, plan)
+		}
 	}
 }
 
@@ -684,6 +722,54 @@ func TestUsageCachesPerProviderAndCredential(t *testing.T) {
 	if got := env.stub.hitCount("/v1/billing/subscription"); got != 2 {
 		t.Fatalf("billing hits after rotation = %d, want 2", got)
 	}
+}
+
+// 额度是账号面的事实：数据库里有凭据就该读得到，与是否配置了引用它的
+// 路由候选无关。早期实现用候选配置反推 provider 列表，一条 zcode 路由都
+// 没配的网关会永久读不到额度——哪怕凭据新鲜。
+func TestUsageFindsCredentialsWithoutARoute(t *testing.T) {
+	stripCandidates := func(keep func(Candidate) bool) func(*Config) {
+		return func(cfg *Config) {
+			for name, route := range cfg.Routes {
+				kept := make([]Candidate, 0, len(route.Candidates))
+				for _, candidate := range route.Candidates {
+					if keep(candidate) {
+						kept = append(kept, candidate)
+					}
+				}
+				route.Candidates = kept
+				cfg.Routes[name] = route
+			}
+		}
+	}
+
+	t.Run("zcode credential without a zcode route", func(t *testing.T) {
+		env := newUsageEnv(t, usageEnvOptions{
+			withZcode: true,
+			configure: stripCandidates(func(candidate Candidate) bool { return !candidate.ZcodeTokenFile }),
+		})
+		_, body := getUsage(t, env.router, "")
+		provider := providerByName(t, body, usageProviderZcode)
+		if available, _ := provider["available"].(bool); !available {
+			t.Fatalf("zcode not read from the credential store: %v", provider)
+		}
+		if windows := windowsOf(t, provider); len(windows) == 0 {
+			t.Fatalf("no windows for a stored zcode credential: %v", provider)
+		}
+	})
+
+	t.Run("mistral key without a mistral route", func(t *testing.T) {
+		env := newUsageEnv(t, usageEnvOptions{
+			withMistral: true,
+			configure:   stripCandidates(func(candidate Candidate) bool { return candidate.APIKeyEnv != "MISTRAL_API_KEY" }),
+		})
+		env.installMistral(usageMistralSubscriptionBody, usageMistralBudgetBody, env.mistralWhoAmI())
+		_, body := getUsage(t, env.router, "")
+		provider := providerByName(t, body, usageProviderMistral)
+		if available, _ := provider["available"].(bool); !available {
+			t.Fatalf("mistral not read from the environment: %v", provider)
+		}
+	})
 }
 
 func TestUsageMissingCredentialsIs503(t *testing.T) {
