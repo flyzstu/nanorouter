@@ -44,9 +44,15 @@ const (
 	// 无旧值可降级时的失败退避：统计页的 10 秒自动刷新不该在冷失败期间
 	// 以每 10 秒 4 个请求的节奏持续敲打故障中的上游。
 	zcodeUsageFailureRetry = 30 * time.Second
+
 	// 上游响应体上限：四个端点都是聚合 JSON，8 MiB 绰绰有余，防病态响应。
 	zcodeUsageMaxBodyBytes = 8 << 20
 )
+
+// errZcodeUsageStaleServe 标注一次降级读：数据可用但已过新鲜期，刷新
+// 结果未知。调用方应继续使用随行的旧数据，只把新鲜度问题如实写进
+// failures——丢弃旧值等于让计量条每分钟消失几秒。
+var errZcodeUsageStaleServe = errors.New("zcode usage 已过缓存新鲜期，刷新未完成")
 
 // zcodeUsageBaseURLFor 按凭据渠道选用量域。测试夹具直接改 cache.baseURL，
 // 传空渠道时回落默认域。
@@ -173,7 +179,7 @@ func (c *zcodeUsageCache) fetch(ctx context.Context, ep zcodeUsageEndpoint, wind
 		result := serve.err
 		if result == nil {
 			// 数据已过新鲜期但没有失败记录：本次刷新结果未知，如实标注降级。
-			result = errors.New("zcode usage 已过缓存新鲜期，刷新未完成")
+			result = errZcodeUsageStaleServe
 		}
 		go func() {
 			refreshCtx, cancel := context.WithTimeout(context.Background(), zcodeUsageTimeout)

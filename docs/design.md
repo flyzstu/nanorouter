@@ -315,7 +315,10 @@ biz 主机的辅助路径：网关按 glm-usage 移植的八个只读端点（�
 `windows[{kind,limit,used,remaining,used_percent,reset_at}]` 与 `plan` 徽标，`sections`
 仅作为排障附带。三条纪律：`available` 只表示「有凭据」不表示上游健康；一个 provider
 失败不影响另一个（并发拉取，错误逐条进 `failures`）；`used_percent` 允许 >100，
-超支必须看得见。状态码按全失败形态选：全缺凭据 503、全被上游拒绝 401、其余全失败
+超支必须看得见。第四条纪律：降级读的旧值必须随行渲染——quota 缓存 60 秒，过期后
+第一个请求拿的是「旧数据 + `已过缓存新鲜期` 标注」，aggregate 若因这条标注丢弃随行
+数据，计量条就会每分钟消失几秒；所以有数据就归一进 `windows`/`sections`，新鲜度
+问题只进 `failures`。状态码按全失败形态选：全缺凭据 503、全被上游拒绝 401、其余全失败
 502，任一 provider 有数据（含 stale 降级旧值）即 200；未配置任何 provider 返回 200
 空数组。默认 `providers` 按**凭据是否存在**判定（`zcodeUsageCredential` /
 `mistralUsageCredential` 实际解析一次 key：数据库、环境变量、凭据文件），不按路由

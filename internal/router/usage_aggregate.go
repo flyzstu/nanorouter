@@ -496,7 +496,11 @@ func (r *Router) readZcodeUsage(ctx context.Context, window zcodeUsageWindow, in
 		if isZcodeUsageAuthError(err) {
 			result.outcome = usageOutcomeRejected
 		}
-	} else {
+	}
+	// 有数据就归一，哪怕带着降级标注：stale-while-revalidate 的旧值
+	// 立即可用，新鲜度问题由 failures 如实呈现；硬失败时 data 为空，
+	// windows 保持空数组。
+	if len(quota) > 0 {
 		result.Windows = zcodeWindows(quota)
 	}
 
@@ -525,8 +529,8 @@ func (r *Router) readZcodeUsage(ctx context.Context, window zcodeUsageWindow, in
 	for section := range sections {
 		if section.err != nil {
 			result.Failures = append(result.Failures, fmt.Sprintf("%s: %s", section.key, section.err.Error()))
-			continue
 		}
+		// 降级旧值同样进 sections：套餐徽标不该跟着一分钟一次地闪没。
 		if len(section.data) > 0 {
 			result.Sections[section.key] = section.data
 		}
