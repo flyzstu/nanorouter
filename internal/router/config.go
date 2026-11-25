@@ -373,6 +373,9 @@ type Route struct {
 	// ReasoningLevels 声明该路由模型支持的 reasoning effort 阶梯，经 /v1/models
 	// 的 metadata.supported_reasoning_levels 对下游发布（空 = 不声明）。
 	ReasoningLevels []string `yaml:"reasoning_levels"`
+	// Label 是给下游选择器用的人类可读名称，经 /v1/models 的 name 发布。
+	// 路由名是下游填进 model 的 wire 值，通常不适合直接展示；留空时下游回退到 id。
+	Label string `yaml:"label"`
 }
 
 // RetryBudgetConfig 用令牌预算限制故障切换带来的请求放大。每个初始请求补充 Ratio 个令牌，
@@ -419,7 +422,10 @@ type Candidate struct {
 	LlamaServer bool `yaml:"llama_server"`
 	// ExposeAs 让候选仍属于父路由的故障切换池，同时以独立模型 ID 对下游暴露。
 	// 例如 free-fast 的候选可设为 groq-qwen；下游指定该 ID 时只会调用此候选。
-	ExposeAs  string `yaml:"expose_as"`
+	ExposeAs string `yaml:"expose_as"`
+	// Label 覆盖该候选以 expose_as 发布时的人类可读名称；留空时用父路由的 label，
+	// 两者都没有就不发布 name，下游回退到 id。
+	Label     string `yaml:"label"`
 	Weight    int    `yaml:"weight"`
 	Responses bool   `yaml:"responses"`
 	// ResponsesViaChatCompletions 将下游 Responses 请求适配到仅支持 Chat Completions 的上游。

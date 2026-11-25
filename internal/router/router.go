@@ -659,9 +659,21 @@ func (r *Router) models(w http.ResponseWriter, q *http.Request) {
 		modelIDs = append(modelIDs, id)
 	}
 	metadata := make(map[string]map[string]any)
+	// 显示名按 id 收集：路由用 route.label，expose_as 用候选 label 再回退父路由
+	// label，目录模型用目录自己的 label。下游选择器展示 name，model 字段仍传 id。
+	names := make(map[string]string)
+	setName := func(id, label string) {
+		if label = strings.TrimSpace(label); label == "" {
+			return
+		}
+		if _, ok := names[id]; !ok {
+			names[id] = label
+		}
+	}
 	for name, route := range r.cfg.Routes {
 		if hasEnabledAggregateCandidate(route) {
 			add(name)
+			setName(name, route.Label)
 			if meta := routeModelMetadata(route); len(meta) > 0 {
 				metadata[name] = meta
 			}
@@ -669,6 +681,13 @@ func (r *Router) models(w http.ResponseWriter, q *http.Request) {
 		for _, candidate := range route.Candidates {
 			if candidate.ExposeAs != "" && candidate.IsEnabled() {
 				add(candidate.ExposeAs)
+				// 候选标签优先，回退父路由标签：常见的 expose_as 配置是一条路由
+				// 只放一个候选，此时 label 写在路由上最省事。
+				if candidate.Label != "" {
+					setName(candidate.ExposeAs, candidate.Label)
+				} else {
+					setName(candidate.ExposeAs, route.Label)
+				}
 				if _, ok := metadata[candidate.ExposeAs]; !ok {
 					if meta := candidateModelMetadata(route, candidate); len(meta) > 0 {
 						metadata[candidate.ExposeAs] = meta
@@ -680,6 +699,7 @@ func (r *Router) models(w http.ResponseWriter, q *http.Request) {
 	// 目录模型只是补充：显式配置的同名条目已在上面占位，这里不覆盖其元数据。
 	for _, model := range r.vibeModelsSnapshot() {
 		add(model.id)
+		setName(model.id, model.label)
 		if _, ok := metadata[model.id]; !ok {
 			if meta := model.metadata(); len(meta) > 0 {
 				metadata[model.id] = meta
@@ -691,6 +711,9 @@ func (r *Router) models(w http.ResponseWriter, q *http.Request) {
 	created := time.Now().Unix()
 	for _, id := range modelIDs {
 		entry := map[string]any{"id": id, "object": "model", "created": created, "owned_by": "nanorouter"}
+		if name, ok := names[id]; ok {
+			entry["name"] = name
+		}
 		if meta, ok := metadata[id]; ok {
 			entry["metadata"] = meta
 		}

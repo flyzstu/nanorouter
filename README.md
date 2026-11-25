@@ -7,7 +7,7 @@
 - `POST /v1/chat/completions`
 - `POST /v1/responses`（包括 SSE 原样透传）
 - `POST /v1/messages`（Anthropic Messages 透传，含无 `/v1` 兼容形式）
-- `GET /v1/models`（`metadata` 发布 `context_length`、`supported_reasoning_levels`、`messages: true`（整条路由都是 Anthropic 候选时）与 `input_modalities`（路由里有候选声明 `vision` 时））
+- `GET /v1/models`（`name` 发布人类可读显示名，`metadata` 发布 `context_length`、`supported_reasoning_levels`、`messages: true`（整条路由都是 Anthropic 候选时）与 `input_modalities`（路由里有候选声明 `vision` 时））
 - `nanorouter login zcode`：ZCode Coding Plan 设备码登录子命令（`login` 命令组按供应商拆分，后续可扩展 `login openai` 等）
 - 每个上游的加权轮转、429/错误冷却与请求内指数退避重试
 - SQLite 调用账本、Prometheus `/metrics`
@@ -368,6 +368,37 @@ Model:    free-fast
 ```
 
 调用返回额外包含 `X-Nanorouter-Route`、`X-Nanorouter-Upstream` 和 `X-Nanorouter-Attempts`，可用于排障。
+
+### 显示名（`label`）
+
+`GET /v1/models` 的每条记录除了 `id` 还会带一个可选的 `name`：它是给选择器用的人类可读名称，`id` 仍然是下游要填进 `model` 的 wire 值。来源按优先级：
+
+1. 候选的 `label`（`expose_as` 条目优先用它）；
+2. 候选没有时回退父路由的 `label`——一条路由只放一个 `expose_as` 时，把名字写在路由上最省事；
+3. 目录模型（`vibe_catalog`）用目录自己的 `label`；
+4. 都没有就不发 `name`，下游回退到 `id`。
+
+```yaml
+routes:
+  zcode:
+    # 单候选时写在路由上，expose_as 条目继承它。
+    label: GLM-5.4 (Zcode)
+    candidates:
+      - id: zcode-bigmodel-glm54
+        base_url: https://zcode.z.ai
+        model: GLM-5.4
+        expose_as: glm-5.4
+        anthropic: true
+  mixed:
+    candidates:
+      - id: fast
+        base_url: https://up.test/v1
+        model: fast-model
+        expose_as: fast
+        label: Fast Model            # 候选标签覆盖父路由标签
+```
+
+`label` 只影响 `/v1/models` 的展示字段，不参与路由、鉴权、计费或统计口径。
 
 ## 会话亲和
 

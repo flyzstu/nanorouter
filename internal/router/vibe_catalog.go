@@ -28,7 +28,9 @@ const (
 
 // vibeModel 是目录里可路由的一个模型。contextLength 为 0 表示目录未声明。
 type vibeModel struct {
-	id              string
+	id string
+	// label 是目录给的人类可读名称，经 /v1/models 的 name 发布；为空时不发布。
+	label           string
 	contextLength   int
 	reasoningLevels []string
 	aliases         []string
@@ -188,6 +190,7 @@ func parseVibeCatalog(body []byte) ([]vibeModel, error) {
 	var payload struct {
 		Models []struct {
 			ID               string   `json:"id"`
+			Label            string   `json:"label"`
 			Aliases          []string `json:"aliases"`
 			Requires         any      `json:"requires"`
 			MaxContextLength int      `json:"max_context_length"`
@@ -219,6 +222,7 @@ func parseVibeCatalog(body []byte) ([]vibeModel, error) {
 		seen[id] = true
 		model := vibeModel{
 			id:            id,
+			label:         strings.TrimSpace(entry.Label),
 			contextLength: entry.MaxContextLength,
 			aliases:       entry.Aliases,
 			// 目录未声明 vision 时按不收图处理：这是安全方向，错误地声称能收图
