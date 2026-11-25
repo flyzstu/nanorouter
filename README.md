@@ -378,6 +378,8 @@ Model:    free-fast
 3. 目录模型（`vibe_catalog`）用目录自己的 `label`；
 4. 都没有就不发 `name`，下游回退到 `id`。
 
+顶层 `model_labels` 最后覆盖上述结果，键是下游填进 `model` 的 id。它存在的理由只有一个：目录的 `label` 来自上游，两个不同的 id 可能共用同一个名字（Mistral 目录就把 `zai-glm-5-3-flash` 与 `zai-glm-5-3-flash-vibe-free` 都叫 `GLM 5.3 Flash (Mistral Hosted)`），此时下游选择器只会显示两行无法区分的文字。键必须是确实会发布的 id——写错的 id 不会凭空多出一条模型。
+
 ```yaml
 routes:
   zcode:
@@ -396,9 +398,13 @@ routes:
         model: fast-model
         expose_as: fast
         label: Fast Model            # 候选标签覆盖父路由标签
+model_labels:
+  # 目录重名时的逐 id 覆盖：键是下游构造请求时填进 model 的 id。
+  zai-glm-5-3-flash: GLM 5.3 Flash (1M)
+  zai-glm-5-3-flash-vibe-free: GLM 5.3 Flash (Vibe Free)
 ```
 
-`label` 只影响 `/v1/models` 的展示字段，不参与路由、鉴权、计费或统计口径。
+`label` 与 `model_labels` 只影响 `/v1/models` 的展示字段，不参与路由、鉴权、计费或统计口径。
 
 ## 会话亲和
 

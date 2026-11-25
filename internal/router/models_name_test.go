@@ -1,10 +1,14 @@
 package router
 
 import (
+	"context"
+	"database/sql"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"testing"
+
+	"go.uber.org/zap"
 )
 
 // modelsNames 读一次 /v1/models 并返回 id → name，没有 name 的 id 不出现在结果里。
@@ -114,5 +118,52 @@ func TestCatalogLabelBecomesTheNameUnlessConfigOverridesIt(t *testing.T) {
 	}
 	if got, ok := names["no-label"]; ok {
 		t.Fatalf("no-label must not publish a name, got %q", got)
+	}
+}
+
+func TestModelLabelsOverridesCatalogLabelsForDistinctIDs(t *testing.T) {
+	// 上游目录给两个不同 id 同一个 label（Mistral 确实这么做），下游选择器就
+	// 只能看到两行同样的文字；model_labels 按 id 改名是唯一的区分手段。
+	db, err := sql.Open("sqlite3", ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := Migrate(context.Background(), db); err != nil {
+		t.Fatal(err)
+	}
+	r, err := NewWithLogger(Config{
+		ModelLabels: map[string]string{
+			"zai-glm-5-3-flash":           "GLM 5.3 Flash (1M)",
+			"zai-glm-5-3-flash-vibe-free": "GLM 5.3 Flash (Vibe Free)",
+			"absent":                      "Never Published",
+		},
+	}, db, zap.NewNop())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = r.Close(context.Background()) })
+
+	models, err := parseVibeCatalog([]byte(`{"models":[
+		{"id":"zai-glm-5-3-flash","label":"GLM 5.3 Flash (Mistral Hosted)"},
+		{"id":"zai-glm-5-3-flash-vibe-free","label":"GLM 5.3 Flash (Mistral Hosted)"}
+	]}`))
+	if err != nil {
+		t.Fatalf("parse catalog: %v", err)
+	}
+	r.vibeMu.Lock()
+	r.vibeModels = models
+	r.vibeRoutes = map[string]vibeRouteEntry{}
+	r.vibeMu.Unlock()
+
+	names := modelsNames(t, r)
+	if got := names["zai-glm-5-3-flash"]; got != "GLM 5.3 Flash (1M)" {
+		t.Fatalf("override missing, got %q", got)
+	}
+	if got := names["zai-glm-5-3-flash-vibe-free"]; got != "GLM 5.3 Flash (Vibe Free)" {
+		t.Fatalf("second override missing, got %q", got)
+	}
+	// 覆盖只对真的发布了的 id 生效：写错 id 不该凭空造出一条模型。
+	if got, ok := names["absent"]; ok {
+		t.Fatalf("absent id must not publish a name, got %q", got)
 	}
 }

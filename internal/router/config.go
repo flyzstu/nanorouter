@@ -41,6 +41,10 @@ type Config struct {
 	// 会拦截该默认 UA，可在此配置常规客户端 UA（例如 opencode/1.18.25）统一绕过。
 	UserAgent string           `yaml:"user_agent"`
 	Routes    map[string]Route `yaml:"routes"`
+	// ModelLabels 按模型 id 覆盖经 /v1/models 的 name 发布的显示名。目录模型
+	// （vibe_catalog）的名字来自上游，两个不同 id 可能共用同一个 label，此时
+	// 下游选择器无法区分；这里给它们各自一个名字。键是下游填进 model 的值。
+	ModelLabels map[string]string `yaml:"model_labels"`
 }
 
 // BackpressureConfig 对所有生成请求设置进程级准入上限，避免上游变慢时请求和请求体无限堆积。

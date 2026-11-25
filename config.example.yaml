@@ -91,6 +91,13 @@ health_check:
   interval: 2s
   max_backoff: 10m
 
+# 按模型 id 覆盖 /v1/models 的 name。目录（vibe_catalog）的名字来自上游，
+# 两个不同 id 可能共用同一个 label，下游选择器就无法区分；这里逐 id 改名。
+# 键是下游填进 model 的 id，未发布的 id 会被忽略。
+# model_labels:
+#   zai-glm-5-3-flash: GLM 5.3 Flash (1M)
+#   zai-glm-5-3-flash-vibe-free: GLM 5.3 Flash (Vibe Free)
+
 routes:
   # llama-server 使用服务根地址即可；llama_server: true 会自动补上 /v1。
   # 启动示例：llama-server -m ./model.gguf --alias local-llama --port 8081

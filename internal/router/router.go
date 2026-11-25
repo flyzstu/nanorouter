@@ -706,6 +706,16 @@ func (r *Router) models(w http.ResponseWriter, q *http.Request) {
 			}
 		}
 	}
+	// 配置覆盖最后执行：目录与路由都只是默认值，model_labels 的键就是下游填进
+	// model 的 id，因此它比任何来源都更清楚自己指的是哪一个。
+	for id, label := range r.cfg.ModelLabels {
+		if _, ok := seen[id]; !ok {
+			continue
+		}
+		if label = strings.TrimSpace(label); label != "" {
+			names[id] = label
+		}
+	}
 	sort.Strings(modelIDs)
 	data := make([]map[string]any, 0, len(modelIDs))
 	created := time.Now().Unix()
